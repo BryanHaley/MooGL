@@ -103,7 +103,7 @@ MooGL-SDK/
               libffx_fsr2_api.dylib (FSR 2 on MetalFX)
               cmake/MooGL/  cmake/SDL2/  cmake/SDL3/  cmake/SFML/  cmake/raylib/  cmake/glfw3/
   include/    GL/glcorearb.h  GL/freeglut.h  GL/glu.h  GLUT/glut.h  AGL/agl.h  KHR/khrplatform.h
-              GLFW/  SDL2/  SDL3/  SFML/  raylib.h  rlgl.h  imgui/  MGLContext.h  ffx-fsr2/
+              GLFW/  SDL2/  SDL3/  SFML/  raylib.h  raymath.h  rlgl.h  rcamera.h  imgui/  MGLContext.h  ffx-fsr2/
   sfml2/      SFML 2.6, with its own include/, lib/ and CMake package
   examples/   triangle/ (GLFW)  sdl2_triangle/ sdl3_triangle/ (SDL)  glut_teapot/ (GLUT)
               sfml_shapes/ (SFML 3)  raylib_shapes/ (raylib)  imgui/ imgui_sdl2/ (Dear ImGui)
@@ -155,10 +155,11 @@ the main one get their own shared-context window.
 Everything below is ordinary OpenGL. These are the few places where a Mac or MooGL needs
 something specific.
 
-### 1. Open a window with GLFW or SDL2
+### 1. Open a window with GLFW, SDL, SFML or raylib
 
-Use the `libglfw` or `libSDL2` from the SDK, not one from Homebrew: they are GLFW 3.4 and
-SDL 2.32 with a backend that creates MooGL contexts instead of Apple's. Any version request up
+Use the GLFW, SDL, SFML or raylib from the SDK, not one from Homebrew: they are GLFW 3.4,
+SDL 2.32 and 3.4, SFML 3.1 and 2.6, and raylib 6.2, built to make MooGL contexts instead of
+Apple's. Any version request up
 to 4.6 gets 4.6, so code that asks for 3.3 or 4.1 core, as most Mac code does, works unchanged.
 Asking for the core profile gets a core context. Asking for the compatibility profile, or for no
 profile at all as old code does, gets a compatibility context, which also has what the core
