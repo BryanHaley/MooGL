@@ -1766,6 +1766,18 @@ static const char *compat_extensions[] = {
     "GL_APPLE_ycbcr_422",
     "GL_APPLE_packed_pixels",
     "GL_EXT_framebuffer_object",
+    "GL_EXT_framebuffer_blit",
+    "GL_EXT_framebuffer_multisample",
+    "GL_EXT_packed_depth_stencil",
+    "GL_ARB_shader_objects",
+    "GL_ARB_vertex_shader",
+    "GL_ARB_fragment_shader",
+    "GL_ARB_shading_language_100",
+    "GL_EXT_blend_minmax",
+    "GL_EXT_blend_subtract",
+    "GL_EXT_blend_equation_separate",
+    "GL_EXT_blend_func_separate",
+    "GL_SGIS_texture_edge_clamp",
 };
 
 #define COMPAT_EXTENSIONS (GLuint)(sizeof(compat_extensions) / sizeof(compat_extensions[0]))

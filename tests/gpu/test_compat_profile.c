@@ -287,6 +287,41 @@ GPU_TEST(compat_profile, texture_environment_combines)
     closeCompat(c, &t);
 }
 
+// SFML leaves GL_TEXTURE_2D on with nothing bound
+GPU_TEST(compat_profile, an_incomplete_texture_leaves_the_vertex_colour)
+{
+    MGLTestTarget t;
+    unsigned char none[4], mip[4];
+    GLMContext c = openCompat(&t);
+    static const GLubyte white[4] = { 255, 255, 255, 255 };
+    GLuint tex;
+
+    CHECK(c != NULL);
+    if (!c)
+        return;
+
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glColor3f(0, 1, 0);
+    texturedQuad();
+    pixel(&t, 16, 16, none);
+    CHECK_MSG(IS(none, 0, 255, 0), "no texture %d %d %d", none[0], none[1], none[2]);
+
+    // a mipmapped filter with only level 0 is incomplete too
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 2, 2, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, white);
+    glColor3f(0, 0, 1);
+    texturedQuad();
+    pixel(&t, 16, 16, mip);
+    CHECK_MSG(IS(mip, 0, 0, 255), "incomplete %d %d %d", mip[0], mip[1], mip[2]);
+    CHECK_EQ_UINT(glGetError(), GL_NO_ERROR);
+
+    glDeleteTextures(1, &tex);
+    closeCompat(c, &t);
+}
+
 GPU_TEST(compat_profile, fog_blends_toward_its_colour)
 {
     MGLTestTarget t;
@@ -598,6 +633,64 @@ GPU_TEST(compat_profile, multitexture_is_advertised)
     CHECK(ext && strstr(ext, "GL_ARB_multitexture "));
     glGetIntegerv(GL_MAX_TEXTURE_UNITS, &units);
     CHECK(units >= 2);
+    CHECK_EQ_UINT(glGetError(), GL_NO_ERROR);
+
+    closeCompat(c, &t);
+}
+
+// what SFML checks before it uses shaders, and the calls it then makes
+GPU_TEST(compat_profile, arb_shader_objects_build_and_draw)
+{
+    MGLTestTarget t;
+    unsigned char px[4];
+    GLMContext c = openCompat(&t);
+    const char *vs = "void main() { gl_Position = gl_Vertex; }";
+    const char *fs = "uniform vec4 colour; void main() { gl_FragColor = colour; }";
+    GLint ok = 0, type = 0;
+    GLuint buf = 0;
+
+    CHECK(c != NULL);
+    if (!c)
+        return;
+
+    const char *ext = (const char *)glGetString(GL_EXTENSIONS);
+    CHECK(ext && strstr(ext, "GL_ARB_shader_objects ") && strstr(ext, "GL_ARB_vertex_shader ") &&
+          strstr(ext, "GL_ARB_fragment_shader ") && strstr(ext, "GL_ARB_shading_language_100 "));
+
+    GLhandleARB v = glCreateShaderObjectARB(GL_VERTEX_SHADER);
+    GLhandleARB f = glCreateShaderObjectARB(GL_FRAGMENT_SHADER);
+    glShaderSourceARB(v, 1, &vs, NULL);
+    glShaderSourceARB(f, 1, &fs, NULL);
+    glCompileShaderARB(v);
+    glCompileShaderARB(f);
+    glGetObjectParameterivARB(f, 0x8B81 /* GL_OBJECT_COMPILE_STATUS_ARB */, &ok);
+    CHECK(ok == GL_TRUE);
+    glGetObjectParameterivARB(f, 0x8B4E /* GL_OBJECT_TYPE_ARB */, &type);
+    CHECK_EQ_UINT((GLuint)type, 0x8B48 /* GL_SHADER_OBJECT_ARB */);
+
+    GLhandleARB p = glCreateProgramObjectARB();
+    glAttachObjectARB(p, v);
+    glAttachObjectARB(p, f);
+    glLinkProgramARB(p);
+    glGetObjectParameterivARB(p, 0x8B82 /* GL_OBJECT_LINK_STATUS_ARB */, &ok);
+    CHECK(ok == GL_TRUE);
+
+    glUseProgramObjectARB(p);
+    CHECK(glGetHandleARB(0x8B40 /* GL_PROGRAM_OBJECT_ARB */) == p);
+    glUniform4fARB(glGetUniformLocationARB(p, "colour"), 1, 0, 1, 1);
+    glRectf(-1, -1, 1, 1);
+    pixel(&t, 16, 16, px);
+    CHECK_MSG(IS(px, 255, 0, 255), "drawn %d %d %d", px[0], px[1], px[2]);
+
+    glGenBuffersARB(1, &buf);
+    glBindBufferARB(GL_ARRAY_BUFFER, buf);
+    CHECK(glIsBuffer(buf));
+
+    glUseProgramObjectARB(NULL);
+    glDeleteObjectARB(p);
+    glDeleteObjectARB(v);
+    glDeleteObjectARB(f);
+    glDeleteBuffers(1, &buf);
     CHECK_EQ_UINT(glGetError(), GL_NO_ERROR);
 
     closeCompat(c, &t);

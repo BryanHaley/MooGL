@@ -25,13 +25,11 @@
 extern GLuint textureIndexFromTarget(GLMContext ctx, GLenum target);
 extern Texture *currentTexture(GLMContext ctx, GLuint index);
 extern Texture *findTexture(GLMContext ctx, GLuint texture);
-extern Texture *newTexture(GLMContext ctx, GLenum target, GLuint texture);
 Texture *getTex(GLMContext ctx, GLuint name, GLenum target);
 GLenum mglProxyBase(GLenum target);
 
-// the texture a glTexture*() call names. A name handed out by glGenTextures
-// but never bound has no object yet, so make one, the same way a bind would;
-// a deleted name is not one of those.
+// the texture a glTexture*() call names. A name from glGenTextures that was
+// never bound is not a texture yet.
 static Texture *dsaTex(GLMContext ctx, GLuint texture)
 {
     Texture *tex;
@@ -39,14 +37,6 @@ static Texture *dsaTex(GLMContext ctx, GLuint texture)
     ERROR_CHECK_RETURN_VALUE(texture, GL_INVALID_OPERATION, NULL);
 
     tex = findTexture(ctx, texture);
-
-    if (!tex && texture < SHARED(texture_table.current_name) && !isFreeName(&SHARED(texture_table), texture))
-    {
-        tex = newTexture(ctx, GL_TEXTURE_2D, texture);
-
-        if (tex)
-            insertHashElement(&SHARED(texture_table), texture, tex);
-    }
 
     ERROR_CHECK_RETURN_VALUE(tex, GL_INVALID_OPERATION, NULL);
 

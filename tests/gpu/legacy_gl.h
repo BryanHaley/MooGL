@@ -102,4 +102,20 @@ void glEvalCoord2f(GLfloat u, GLfloat v);
 void glGetMapiv(GLenum target, GLenum query, GLint *v);
 void glGetMapfv(GLenum target, GLenum query, GLfloat *v);
 
+typedef void *GLhandleARB;
+GLhandleARB glCreateShaderObjectARB(GLenum type);
+void glShaderSourceARB(GLhandleARB obj, GLsizei count, const GLchar **string, const GLint *length);
+void glCompileShaderARB(GLhandleARB obj);
+GLhandleARB glCreateProgramObjectARB(void);
+void glAttachObjectARB(GLhandleARB container, GLhandleARB obj);
+void glLinkProgramARB(GLhandleARB obj);
+void glUseProgramObjectARB(GLhandleARB obj);
+void glGetObjectParameterivARB(GLhandleARB obj, GLenum pname, GLint *params);
+GLhandleARB glGetHandleARB(GLenum pname);
+GLint glGetUniformLocationARB(GLhandleARB obj, const GLchar *name);
+void glUniform4fARB(GLint location, GLfloat v0, GLfloat v1, GLfloat v2, GLfloat v3);
+void glDeleteObjectARB(GLhandleARB obj);
+void glBindBufferARB(GLenum target, GLuint buffer);
+void glGenBuffersARB(GLsizei n, GLuint *buffers);
+
 #endif /* legacy_gl_h */

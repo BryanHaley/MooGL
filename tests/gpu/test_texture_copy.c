@@ -5,6 +5,8 @@
  * Texture copy, clear, invalidate, mipmap generation and compressed uploads.
  */
 
+#include <math.h>
+
 #include "mgl_test.h"
 #include "harness.h"
 
@@ -258,6 +260,42 @@ GPU_TEST(texture_copy, copy_tex_image_2d_copies_from_framebuffer)
     // 0.25 -> 64, 0.5 -> 128, 0.75 -> 191, 1.0 -> 255
     CHECK_NEAR((int)px[0], 64, 2);
     CHECK_NEAR((int)px[1], 128, 2);
+
+    glDeleteTextures(1, &t);
+    mgl_target_destroy(&tt);
+}
+
+// a texture in another format than the framebuffer is converted, not
+// copied byte for byte
+GPU_TEST(texture_copy, copy_tex_sub_image_converts_the_format)
+{
+    MGLTestTarget tt;
+    GLuint t = 0;
+    float px[4 * 4 * 4] = { 0 };
+
+    if (!mgl_target_create(&tt, 8, 8, GL_RGBA8, 0)) { CHECK(0); return; }
+    mgl_target_bind(&tt);
+
+    glClearColor(0.25f, 0.5f, 0.75f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glGenTextures(1, &t);
+    glBindTexture(GL_TEXTURE_2D, t);
+    glTexStorage2D(GL_TEXTURE_2D, 2, GL_RGBA16F, 8, 8);
+
+    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 2, 2, 0, 0, 4, 4);
+    glCopyTexSubImage2D(GL_TEXTURE_2D, 1, 0, 0, 0, 0, 4, 4);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+
+    float level0[8 * 8 * 4] = { 0 };
+    glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_FLOAT, level0);
+    const float *in = &level0[(3 * 8 + 3) * 4];
+    CHECK(fabsf(in[0] - 0.25f) < 0.01f && fabsf(in[1] - 0.5f) < 0.01f && fabsf(in[2] - 0.75f) < 0.01f);
+    CHECK(level0[0] == 0.0f && level0[3] == 0.0f);
+
+    glGetTexImage(GL_TEXTURE_2D, 1, GL_RGBA, GL_FLOAT, px);
+    CHECK(fabsf(px[0] - 0.25f) < 0.01f && fabsf(px[2] - 0.75f) < 0.01f && fabsf(px[3] - 1.0f) < 0.01f);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
 
     glDeleteTextures(1, &t);
     mgl_target_destroy(&tt);

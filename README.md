@@ -14,7 +14,7 @@
 OpenGL has been deprecated for years on macOS, and was never updated past 4.1. MooGL is a complete
 OpenGL 4.6 Core implementation (along with the most important legacy features) written on top of Metal, so most OpenGL
 code (compute shaders, direct state access, SPIR-V, bindless textures, mesh shaders) builds and runs on a Mac. You link
-it like any other library and open a window with the GLFW or SDL2 it ships with.
+it like any other library and open a window with the GLFW, SDL2, SDL3, SFML or raylib it ships with.
 
 It also ships AMD FSR 2's API on top of Apple's MetalFX upscaler so a game that uses
 FSR 2 on Windows/Linux can be ported to Mac without touching its FSR 2 code.
@@ -85,6 +85,8 @@ profile covers. Old Mac code works too:
 - **Apple's extensions**: `GL_APPLE_client_storage`, `GL_APPLE_texture_range`, `GL_APPLE_ycbcr_422`,
   `GL_APPLE_packed_pixels` and `GL_EXT_texture_rectangle`.
 - **`SDL_Renderer`'s `opengl` backend**, and any texture border colour, exact even with linear filtering.
+- **SFML 3 and 2.6**: the graphics module, `sf::Shader` and text included, draws through a
+  compatibility context.
 
 ## Get the SDK
 
@@ -94,14 +96,17 @@ Download `MooGL-SDK-<version>-macos-arm64.tar.gz` from the
 ```
 MooGL-SDK/
   lib/        libmoogl.dylib (OpenGL)
-              libglfw.dylib  libSDL2-2.0.0.dylib  libglut.3.dylib (GLFW, SDL2 and GLUT for MooGL)
+              libglfw.dylib  libSDL2-2.0.0.dylib  libSDL3.0.dylib  libglut.3.dylib
+              libsfml-*.3.1.dylib  libraylib.620.dylib (GLFW, SDL, GLUT, SFML 3 and raylib for MooGL)
               libGLU.1.dylib (GLU)
               libimgui.a (Dear ImGui, drawing with MooGL)
               libffx_fsr2_api.dylib (FSR 2 on MetalFX)
-              cmake/MooGL/  cmake/SDL2/
+              cmake/MooGL/  cmake/SDL2/  cmake/SDL3/  cmake/SFML/  cmake/raylib/  cmake/glfw3/
   include/    GL/glcorearb.h  GL/freeglut.h  GL/glu.h  GLUT/glut.h  AGL/agl.h  KHR/khrplatform.h
-              GLFW/  SDL2/  imgui/  MGLContext.h  ffx-fsr2/
-  examples/   triangle/ (GLFW)  sdl2_triangle/ (SDL2)  glut_teapot/ (GLUT)  imgui/ imgui_sdl2/ (Dear ImGui)
+              GLFW/  SDL2/  SDL3/  SFML/  raylib.h  rlgl.h  imgui/  MGLContext.h  ffx-fsr2/
+  sfml2/      SFML 2.6, with its own include/, lib/ and CMake package
+  examples/   triangle/ (GLFW)  sdl2_triangle/ sdl3_triangle/ (SDL)  glut_teapot/ (GLUT)
+              sfml_shapes/ (SFML 3)  raylib_shapes/ (raylib)  imgui/ imgui_sdl2/ (Dear ImGui)
   nuget/      FFX_FSR2 for C# on macOS
   licenses/
 ```
@@ -189,7 +194,14 @@ SDL_GLContext context = SDL_GL_CreateContext(window);
 ```
 
 Link it with `find_package(SDL2)` and `SDL2::SDL2` plus `MooGL::GL`, or `-lSDL2 -lmoogl`. SDL2's
-debug and no-error flags work too. A few things differ from Apple's driver:
+debug and no-error flags work too. SDL3 is the same, with `find_package(SDL3)` and `SDL3::SDL3`.
+
+SFML 3 needs nothing extra: `find_package(SFML 3 COMPONENTS Graphics)` and `SFML::Graphics`. For
+SFML 2.6, add the SDK's `sfml2` folder to `CMAKE_PREFIX_PATH` and both `lib` and `sfml2/lib` to the
+program's rpath. raylib is stock raylib built on the SDK's GLFW: `find_package(raylib)` and link
+`raylib`. `find_package(glfw3)` finds the SDK's GLFW too, for anything else built against it.
+
+A few things differ from Apple's driver:
 
 - A MooGL context draws into the window it was created for, and can't be made current on another.
 - Contexts can share objects: `SDL_GL_SHARE_WITH_CURRENT_CONTEXT` in SDL2, or a share window in
@@ -270,9 +282,8 @@ Most bindings load GLFW or SDL2 as a dylib and get GL functions through it: Open
 SDL2-CS in C#, LWJGL in Java, pyGLFW and PySDL2 in Python, and others. Put the SDK's
 `libglfw.dylib` (as `libglfw.3.dylib`) or `libSDL2-2.0.0.dylib`, plus `libmoogl.dylib`, where the
 binding looks for them, and it runs on MooGL. That's how IDKEngine runs above. Use only one copy
-of `libmoogl.dylib` per process.
-
-SDL3, SFML 2.6 and 3, and raylib are on the roadmap.
+of `libmoogl.dylib` per process. Bindings for SDL3, SFML and raylib work the same way with the
+SDK's `libSDL3.0.dylib`, `libsfml-*` or `libraylib.620.dylib`.
 
 ## FSR 2 on MetalFX
 
@@ -594,9 +605,9 @@ All of OpenGL 4.6 core, plus:
 git clone --recursive https://github.com/BryanHaley/MGL.git
 cd MGL
 tools/build_deps.sh      # SPIRV-Cross, SPIRV-Tools, glslang and GLFW, built once
-make -j                  # build/libmoogl.dylib, libglfw, libSDL2 and the FSR 2 libraries
+make -j                  # build/libmoogl.dylib, GLFW, SDL, SFML, raylib and the FSR 2 libraries
 make test                # MooGL's own suite (needs a GPU and a logged-in session)
-make window-test         # GLFW and SDL2 in real windows
+make window-test         # GLFW, SDL, SFML, raylib and GLUT in real windows
 tools/make_sdk.sh        # the SDK, as dist/MooGL-SDK-<version>-macos-arm64.tar.gz
 ```
 

@@ -36,6 +36,8 @@
 - (NSUInteger) readPlane;
 - (void) applyPendingClears;
 - (bool) bindMTLTexture:(Texture *)tex;
+- (bool) shaderBlitFrom: (id<MTLTexture>) src origin: (MTLOrigin) srcOrigin size: (MTLSize) srcSize
+                     to: (id<MTLTexture>) dst origin: (MTLOrigin) dstOrigin size: (MTLSize) dstSize;
 - (bool) fillMultisample: (id<MTLTexture>) dst from: (id<MTLTexture>) src
                       sx: (NSUInteger) sx sy: (NSUInteger) sy
                       dx: (NSUInteger) dx dy: (NSUInteger) dy
@@ -78,6 +80,26 @@ void mtlCopyTexSubImage(GLMContext glm_ctx, Texture *tex, GLint level,
                                    dx:(NSUInteger)xoffset dy:(NSUInteger)yoffset
                                     w:(NSUInteger)width h:(NSUInteger)height
                                 depth:(from != GL_STENCIL_INDEX) stencil:(from != GL_DEPTH_COMPONENT)];
+            return;
+        }
+
+        // a blit copies bytes, so colour in another format -- the BGRA window
+        // into an RGBA texture -- is drawn across
+        if (from == GL_RGBA && srcTex.pixelFormat != dstTex.pixelFormat && fd->kind == MGL_FMT_COLOR_FLOAT &&
+            srcTex.textureType == MTLTextureType2D && srcTex.sampleCount == 1 && [renderer readPlane] == 0 &&
+            dstTex.textureType != MTLTextureType3D && dstTex.sampleCount == 1)
+        {
+            id<MTLTexture> target = dstTex;
+
+            if (level != 0 || slice != 0 || dstTex.textureType != MTLTextureType2D)
+                target = [dstTex newTextureViewWithPixelFormat:dstTex.pixelFormat textureType:MTLTextureType2D
+                                                        levels:NSMakeRange((NSUInteger)level, 1)
+                                                        slices:NSMakeRange((NSUInteger)slice, 1)];
+
+            [renderer shaderBlitFrom:srcTex origin:MTLOriginMake((NSUInteger)x, (NSUInteger)y, 0)
+                                size:MTLSizeMake((NSUInteger)width, (NSUInteger)height, 1)
+                                  to:target origin:MTLOriginMake((NSUInteger)xoffset, (NSUInteger)yoffset, 0)
+                                size:MTLSizeMake((NSUInteger)width, (NSUInteger)height, 1)];
             return;
         }
 

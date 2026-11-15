@@ -199,7 +199,16 @@ static void buildKey(GLMContext ctx, GLenum mode, FFKey *k)
         if (uk->target == T_NONE)
             continue;
 
+        // GL 4.6 compatibility 16.1: an incomplete texture leaves the unit as if
+        // texturing were off
         tex = unitTexture(ctx, u, uk->target);
+        if (tex == NULL || !mglTextureSamplingComplete(tex, STATE(texture_samplers[u]) ?
+                                                            &STATE(texture_samplers[u])->params : NULL))
+        {
+            uk->target = T_NONE;
+            continue;
+        }
+
         uk->format = (uint8_t)mglLegacyFormatClass(tex ? tex->internalformat : GL_RGBA);
         uk->mode = code(e->mode);
 
