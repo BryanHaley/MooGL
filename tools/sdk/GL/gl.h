@@ -14,7 +14,8 @@
  * limitations under the License.
  *
  * <GL/gl.h> for code written for other systems, and for <GL/glu.h>, which
- * includes it. The declarations are Apple's; the calls land in libmoogl.
+ * includes it. GL up to 2.1 is Apple's gl.h, the rest Khronos's glext.h, as
+ * Mesa's gl.h does; the calls land in libmoogl.
  */
 
 #ifndef MOOGL_GL_GL_H
@@ -24,14 +25,25 @@
 #define GL_SILENCE_DEPRECATION
 #endif
 
+// GL_GLEXT_LEGACY keeps Apple's glext.h out; it clashes with Khronos's
+#ifdef GL_GLEXT_LEGACY
 #include <OpenGL/gl.h>
-#include <OpenGL/glext.h>
+#else
+#define GL_GLEXT_LEGACY
+#include <OpenGL/gl.h>
+#undef GL_GLEXT_LEGACY
+#define MOOGL_GL_GLEXT
+#endif
 
 #ifndef APIENTRY
 #define APIENTRY
 #endif
 #ifndef APIENTRYP
 #define APIENTRYP APIENTRY *
+#endif
+
+#ifdef MOOGL_GL_GLEXT
+#include <GL/glext.h>
 #endif
 
 #endif

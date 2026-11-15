@@ -286,7 +286,7 @@ glu_srcs := $(filter-out %/priorityq-heap.c, $(wildcard $(glu_dir)/src/libutil/*
 	$(wildcard $(glu_dir)/src/libnurbs/*/*.cc)
 glu_objs := $(patsubst $(glu_dir)/src/%, $(build_dir)/glu/%.o, $(glu_srcs))
 glu_flags := -O2 -arch arm64 -w -fvisibility=hidden -DLIBRARYBUILD -DNDEBUG \
-	'-DGLAPI=__attribute__((visibility("default"))) extern' -Itools/sdk -I$(glu_dir)/include \
+	'-DGLAPI=__attribute__((visibility("default"))) extern' -Itools/sdk -Iinclude -I$(glu_dir)/include \
 	-I$(glu_dir)/src/include -I$(glu_dir)/src/libnurbs/internals -I$(glu_dir)/src/libnurbs/interface \
 	-I$(glu_dir)/src/libnurbs/nurbtess
 

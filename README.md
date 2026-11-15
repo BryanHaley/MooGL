@@ -77,8 +77,9 @@ profile covers. Old Mac code works too:
 
 - **GLUT**, as `libglut`: freeglut with a MooGL backend, from `<GLUT/glut.h>` or `<GL/freeglut.h>`.
 - **GLU**, as `libGLU`: Mesa's GLU, NURBS and tessellator included. Mac code keeps including
-  `<OpenGL/glu.h>` and links `libGLU` instead of `OpenGL.framework`; code from other systems can use
-  `<GL/glu.h>`.
+  `<OpenGL/glu.h>` and links `libGLU` instead of `OpenGL.framework`.
+- **`<GL/gl.h>` and `<GL/glext.h>`** for code from other systems: Apple's `gl.h` up to GL 2.1, and
+  Khronos's `glext.h` for the rest, with `GL_GLEXT_PROTOTYPES` declaring the calls as on Linux.
 - **CGL and AGL**: `CGLChoosePixelFormat`, `CGLCreateContext`, `aglCreateContext` and the rest make
   MooGL contexts in a program linked to `libmoogl` instead of `OpenGL.framework`. AGL left the SDK in
   macOS 10.14, so MooGL ships its own `<AGL/agl.h>`.
@@ -102,7 +103,8 @@ MooGL-SDK/
               libimgui.a (Dear ImGui, drawing with MooGL)
               libffx_fsr2_api.dylib (FSR 2 on MetalFX)
               cmake/MooGL/  cmake/SDL2/  cmake/SDL3/  cmake/SFML/  cmake/raylib/  cmake/glfw3/
-  include/    GL/glcorearb.h  GL/freeglut.h  GL/glu.h  GLUT/glut.h  AGL/agl.h  KHR/khrplatform.h
+  include/    GL/glcorearb.h  GL/gl.h  GL/glext.h  GL/glu.h  GL/freeglut.h  GLUT/glut.h  AGL/agl.h
+              KHR/khrplatform.h
               GLFW/  SDL2/  SDL3/  SFML/  raylib.h  raymath.h  rlgl.h  rcamera.h  imgui/  MGLContext.h  ffx-fsr2/
   sfml2/      SFML 2.6, with its own include/, lib/ and CMake package
   examples/   triangle/ (GLFW)  sdl2_triangle/ sdl3_triangle/ (SDL)  glut_teapot/ (GLUT)

@@ -93,7 +93,7 @@ cp submodules/glfw/include/GLFW/glfw3.h submodules/glfw/include/GLFW/glfw3native
 cp -R "$build/sdl2/install/include/SDL2" "$out/include/"
 cp submodules/freeglut/include/GL/*.h "$out/include/GL/"
 cp tools/sdk/GLUT/glut.h "$out/include/GLUT/"
-cp submodules/glu/include/GL/glu.h tools/sdk/GL/gl.h "$out/include/GL/"
+cp submodules/glu/include/GL/glu.h tools/sdk/GL/gl.h tools/sdk/GL/glext.h "$out/include/GL/"
 cp include/AGL/agl.h "$out/include/AGL/"
 cp -R "$build/sdl2/install/lib/cmake/SDL2" "$out/lib/cmake/"
 cp -R "$build/sdl3/install/include/SDL3" "$out/include/"
@@ -166,8 +166,8 @@ OpenGL 4.6 core on Metal, for Apple silicon Macs on macOS $MACOSX_DEPLOYMENT_TAR
 
 - \`lib/\`: libmoogl (OpenGL), and libglfw, libSDL2, libSDL3, SFML 3, raylib and libglut (freeglut), built to make
   MooGL contexts; libGLU, libimgui (Dear ImGui with docking, drawing with MooGL) and the FSR 2 libraries on MetalFX
-- \`include/\`: GL/glcorearb.h, GLFW, SDL2, SDL3, SFML, raylib, GLUT (\`GL/freeglut.h\`, \`GLUT/glut.h\`), \`GL/glu.h\`,
-  AGL/agl.h, Dear ImGui, MGLContext.h, and AMD's FSR 2 headers
+- \`include/\`: GL/glcorearb.h, GLFW, SDL2, SDL3, SFML, raylib, GLUT (\`GL/freeglut.h\`, \`GLUT/glut.h\`), \`GL/gl.h\`,
+  \`GL/glext.h\`, \`GL/glu.h\`, AGL/agl.h, Dear ImGui, MGLContext.h, and AMD's FSR 2 headers
 - \`lib/cmake\`: \`find_package(MooGL)\` with MooGL::GL, MooGL::glfw, MooGL::glut, MooGL::GLU, MooGL::imgui and MooGL::FSR2,
   and the packages of SDL2, SDL3, SFML, raylib and glfw3 (MooGL's GLFW)
 - \`sfml2/\`: SFML 2.6, with its own \`include/\`, \`lib/\` and CMake package
@@ -190,6 +190,22 @@ c++ -std=c++17 -O1 -o "$build/sfml_shapes" examples/sfml_shapes/main.cpp -I"$out
     -lsfml-graphics -lsfml-window -lsfml-system -Wl,-rpath,"$out/lib"
 cc -O1 -o "$build/raylib_shapes" examples/raylib_shapes/main.c -I"$out/include" -L"$out/lib" -lraylib \
     -Wl,-rpath,"$out/lib"
+# code from other systems: <GL/gl.h>, <GL/glext.h> and <GL/glu.h> together
+cc -std=c99 -Wall -Wextra -pedantic -Werror -DGL_GLEXT_PROTOTYPES -x c -o "$build/glext_check" - \
+    -I"$out/include" -L"$out/lib" -lGLU -lmoogl <<'EOF'
+#include <GL/gl.h>
+#include <GL/glext.h>
+#include <GL/glu.h>
+int main(void)
+{
+    GLuint b = 0;
+    PFNGLCREATEBUFFERSPROC create = glCreateBuffers;
+    create(1, &b);
+    glDispatchCompute(1, 1, 1);
+    gluPerspective(60.0, 1.0, 1.0, 10.0);
+    return 0;
+}
+EOF
 c++ -std=c++17 -O1 -o "$build/imgui_demo" examples/imgui/main.cpp -I"$out/include" -I"$out/include/imgui" \
     -L"$out/lib" -limgui -lglfw -lmoogl -Wl,-rpath,"$out/lib"
 c++ -std=c++17 -O1 -o "$build/imgui_sdl2_demo" examples/imgui_sdl2/main.cpp -I"$out/include" -I"$out/include/imgui" \

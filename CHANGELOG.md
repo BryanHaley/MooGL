@@ -5,6 +5,8 @@
   an example each. SDL3 and SFML make MooGL contexts in place of Apple's; raylib is stock,
   built on MooGL's GLFW. SDL3's `opengl` renderer works, and so does SFML's graphics module.
 - A `glfw3` CMake package for MooGL's GLFW.
+- Khronos's `<GL/glext.h>` in the SDK, which `<GL/gl.h>` now includes in place of Apple's
+  older `glext.h`, so code written for Linux or Windows builds unchanged.
 - In compatibility contexts, `GL_ARB_shader_objects`, `GL_ARB_vertex_shader`,
   `GL_ARB_fragment_shader` and `GL_ARB_shading_language_100` with their `ARB` calls, which
   SFML checks for before it uses shaders, and the `EXT` names for blending and framebuffer
