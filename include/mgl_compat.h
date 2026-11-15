@@ -24,32 +24,58 @@
 /*
  * Bits of the compatibility profile that shipped games still reach for.
  *
- * MGL is a core profile driver, but old engines and old ports keep using a
- * handful of removed features, and each one is cheap next to what it buys.
- * They are on by default. Build with -DMGL_NO_COMPAT_PROFILE for a driver
- * that answers only for core, which is what the conformance suite expects.
+ * The alpha test and GL_CLAMP answer in every context. Everything else the
+ * core profile removed (glBegin, the matrix stacks, fixed-function lighting
+ * and texturing, display lists, selection, the raster position) answers only
+ * in a compatibility profile context, so a core context keeps the errors the
+ * conformance suite expects. Build with -DMGL_NO_COMPAT_PROFILE for a driver
+ * with none of it.
  */
 
 #if !defined(MGL_NO_COMPAT_PROFILE) && !defined(MGL_COMPAT_PROFILE)
 #define MGL_COMPAT_PROFILE 1
 #endif
 
+#include "mgl_legacy_enums.h"
 
-#ifdef MGL_COMPAT_PROFILE
-/* Enums the core headers dropped, which MGL still has to recognise. */
-#ifndef GL_ALPHA_TEST
-#define GL_ALPHA_TEST      0x0BC0
+// compatibility profile contexts, which only the desktop library makes
+#if defined(MGL_COMPAT_PROFILE) && defined(MGL_GL_CORE)
+#define MGL_COMPAT_CONTEXTS 1
 #endif
-#ifndef GL_ALPHA_TEST_FUNC
-#define GL_ALPHA_TEST_FUNC 0x0BC1
-#endif
-#ifndef GL_ALPHA_TEST_REF
-#define GL_ALPHA_TEST_REF  0x0BC2
-#endif
-/* The old single clamp, which clamped to the border colour. */
-#ifndef GL_CLAMP
-#define GL_CLAMP           0x2900
-#endif
-#endif /* MGL_COMPAT_PROFILE */
+
+#ifdef MGL_COMPAT_CONTEXTS
+
+// The legacy arrays are generic attributes, at the slots NVIDIA's drivers
+// use, so glColor and glVertexAttrib(3) are the same value.
+#define MGL_ATTR_VERTEX     0
+#define MGL_ATTR_NORMAL     2
+#define MGL_ATTR_COLOR      3
+#define MGL_ATTR_SECONDARY  4
+#define MGL_ATTR_FOG        5
+#define MGL_ATTR_TEXCOORD0  8
+
+#define MGL_COMPAT_UNITS    8
+#define MGL_COMPAT_LIGHTS   8
+#define MGL_COMPAT_PLANES   8
+
+struct MGLCompat_t;
+typedef struct MGLCompat_t MGLCompat;
+
+// --- set up and tear down (compat_state.c) ---
+struct GLMContextRec_t;
+void mglCompatInit(struct GLMContextRec_t *ctx);
+void mglCompatFree(struct GLMContextRec_t *ctx);
+
+void mglCompatFreeListTable(void *table);
+
+// GLSL 1.10 to 1.30, or a compatibility profile shader, as GLSL 4.10 reading
+// the driver's own uniforms; NULL when the source needs no change
+char *mglCompatRewriteGLSL(const char *src, GLenum type);
+
+// a vertex array that may point into client memory: the default one, or
+// immediate mode's own
+GLboolean mglCompatClientArraysAllowed(struct GLMContextRec_t *ctx);
+
+#endif /* MGL_COMPAT_CONTEXTS */
 
 #endif /* mgl_compat_h */

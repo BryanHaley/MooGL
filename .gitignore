@@ -32,3 +32,6 @@ include/mgl.h
 *.o
 .llminal/
 dist/
+
+# game data used for testing, which cannot be committed
+games/

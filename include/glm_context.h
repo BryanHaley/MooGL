@@ -428,6 +428,14 @@ typedef struct TextureLevel_t {
     vm_address_t data;
 } TextureLevel;
 
+#define MGL_PROXY_LEVELS 16
+
+// a level of a proxy texture: the size it would have had, or zero
+typedef struct {
+    GLsizei width, height, depth;
+    GLenum internalformat;
+} MGLProxyLevel;
+
 enum {
     _CUBE_MAP_POSITIVE_X = 0,
     _CUBE_MAP_NEGATIVE_X,
@@ -522,6 +530,11 @@ typedef struct Texture_t {
     GLint   page_index;
     GLuint  sparse_levels;
     GLuint  *sparse_bits;       // a bit per committed page, level after level
+
+    // GL_APPLE_texture_range: kept and answered, as a hint
+    void    *apple_range_pointer;
+    GLsizei apple_range_length;
+    GLenum  apple_storage_hint;
 } Texture;
 
 #define MGL_MAX_SPARSE_SIZE     16384
@@ -1156,6 +1169,11 @@ typedef struct Program_t {
     GLint alpha_func_loc;
     GLint alpha_ref_loc;
 #endif
+#ifdef MGL_COMPAT_CONTEXTS
+    // where the old built-in uniforms (gl_ModelViewMatrix and the rest) live
+    // in this program, found at the first draw after a link
+    void *compat_cache;
+#endif
     // the subroutine index chosen per subroutine uniform location, per stage
     GLuint *subroutine_values[_MAX_SHADER_TYPES];
     // what the subroutine rewrite found, copied at link so the program keeps
@@ -1522,6 +1540,9 @@ void mglWriteNvMeshFirst(GLMContext ctx, Program *pptr, GLuint first);
 char *mglRewriteNvMesh(const char *src, bool task);
 GLint mglFindSampleMaskOffLocation(Program *pptr);
 void mglWriteSampleMaskOff(GLMContext ctx, Program *pptr, GLint off);
+#ifdef MGL_COMPAT_CONTEXTS
+void mglCompatForgetBuiltins(Program *prog);
+#endif
 #ifdef MGL_COMPAT_PROFILE
 void mglFindAlphaTestLocations(Program *pptr);
 void mglWriteAlphaTest(GLMContext ctx, Program *pptr, GLint func, GLfloat ref);
@@ -1627,6 +1648,7 @@ typedef struct {
     // texture 0: one per target for the whole context, made the first time
     // something asks for it
     Texture *default_textures[_MAX_TEXTURE_TYPES];
+    MGLProxyLevel proxy_levels[_MAX_TEXTURE_TYPES][MGL_PROXY_LEVELS];
     HashTable program_pipeline_table;
     HashTable transform_feedback_table;
     HashTable framebuffer_table;
@@ -1707,6 +1729,9 @@ typedef struct MGLShareGroup_t {
     // objects one context deleted while another still uses them
     struct { GLenum type; void *obj; } *held;
     GLuint held_count;
+
+    // display lists, which compatibility contexts share
+    void *compat_lists;
 } MGLShareGroup;
 
 // sparse_texture.c
@@ -1825,7 +1850,12 @@ typedef struct GLMContextRec_t {
 #ifdef MGL_GL_CORE
     struct GLMDispatchTable dispatch;
 #endif
-    
+
+#ifdef MGL_COMPAT_CONTEXTS
+    // a compatibility profile context's legacy state; NULL in a core one
+    struct MGLCompat_t *compat;
+#endif
+
 #ifdef MGL_GL_ES
     struct GLM_ES_DispatchTable dispatch;
 #endif
@@ -1868,6 +1898,7 @@ typedef struct GLMContextRec_t {
         GLuint cpu_expansions;
         GLuint program_rebuilds;
         GLuint attrib_conversions;
+        GLuint frames_presented;
     } stats;
 
     void (* error_func)(GLMContext ctx, const char *func, GLenum type);
@@ -1881,6 +1912,10 @@ GLMContext createGLMContextShared(GLenum format, GLenum type,
                                   GLenum depth_format, GLenum depth_type,
                                   GLenum stencil_format, GLenum stencil_type,
                                   GLMContext share);
+GLMContext createGLMContextProfile(GLenum format, GLenum type,
+                                   GLenum depth_format, GLenum depth_type,
+                                   GLenum stencil_format, GLenum stencil_type,
+                                   GLMContext share, GLbitfield profile);
 
 // share_group.c
 void mglFreeHeldObjects(GLMContext ctx);
@@ -1916,7 +1951,8 @@ enum {
     MGL_STAT_BUFFER_REBINDS,        // stage buffer lists rebound on the encoder
     MGL_STAT_CPU_EXPANSIONS,        // draws whose indices were expanded on the CPU
     MGL_STAT_PROGRAM_REBUILDS,      // times a program's Metal functions were remade
-    MGL_STAT_ATTRIB_CONVERSIONS     // vertex attributes converted to a format Metal reads
+    MGL_STAT_ATTRIB_CONVERSIONS,    // vertex attributes converted to a format Metal reads
+    MGL_STAT_FRAMES_PRESENTED       // swaps that showed a frame in the window
 };
 
 #ifdef __cplusplus

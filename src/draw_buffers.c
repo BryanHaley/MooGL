@@ -261,8 +261,7 @@ bool processVAO(GLMContext ctx)
                 break;
         }
 
-        // clear buffer base dirty bits as we have mapped buffers to attribs
-        vao->dirty_bits &= ~DIRTY_VAO_BUFFER_BASE;
+        // the renderer clears it once it has rebound the buffers
     }
 
     return true;

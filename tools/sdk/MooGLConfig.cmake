@@ -3,6 +3,9 @@
 # find_package(MooGL) for the MooGL SDK. Targets:
 #   MooGL::GL    OpenGL 4.6 (libmoogl), with GL/glcorearb.h
 #   MooGL::glfw  GLFW built to make MooGL contexts; links MooGL::GL
+#   MooGL::glut  GLUT (freeglut) built to make MooGL contexts, with
+#                GL/freeglut.h and GLUT/glut.h; links MooGL::GLU
+#   MooGL::GLU   GLU (Mesa's), with GL/glu.h; links MooGL::GL
 #   MooGL::FSR2  AMD FSR 2's API on MetalFX, with AMD's headers
 #   MooGL::imgui Dear ImGui (docking) with its GLFW, SDL2 and OpenGL 3
 #                backends, the last one drawing with MooGL. Link MooGL::glfw
@@ -26,6 +29,22 @@ if(NOT TARGET MooGL::GL)
         IMPORTED_SONAME "@rpath/libglfw.dylib"
         INTERFACE_INCLUDE_DIRECTORIES "${MooGL_INCLUDE_DIR}"
         INTERFACE_LINK_LIBRARIES MooGL::GL)
+
+    add_library(MooGL::GLU SHARED IMPORTED)
+    set_target_properties(MooGL::GLU PROPERTIES
+        IMPORTED_LOCATION "${MooGL_LIBRARY_DIR}/libGLU.1.dylib"
+        IMPORTED_SONAME "@rpath/libGLU.1.dylib"
+        INTERFACE_INCLUDE_DIRECTORIES "${MooGL_INCLUDE_DIR}"
+        INTERFACE_COMPILE_DEFINITIONS GL_SILENCE_DEPRECATION
+        INTERFACE_LINK_LIBRARIES MooGL::GL)
+
+    add_library(MooGL::glut SHARED IMPORTED)
+    set_target_properties(MooGL::glut PROPERTIES
+        IMPORTED_LOCATION "${MooGL_LIBRARY_DIR}/libglut.3.dylib"
+        IMPORTED_SONAME "@rpath/libglut.3.dylib"
+        INTERFACE_INCLUDE_DIRECTORIES "${MooGL_INCLUDE_DIR}"
+        INTERFACE_COMPILE_DEFINITIONS GL_SILENCE_DEPRECATION
+        INTERFACE_LINK_LIBRARIES MooGL::GLU)
 
     add_library(MooGL::FSR2 SHARED IMPORTED)
     set_target_properties(MooGL::FSR2 PROPERTIES

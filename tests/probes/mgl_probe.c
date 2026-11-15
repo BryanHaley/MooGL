@@ -11,6 +11,7 @@
  * remaining; the exit code is the number of gates still standing.
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <GL/glcorearb.h>
 
@@ -52,6 +53,62 @@
 #endif
 
 /* --- the slice of GL this file drives ------------------------------------ */
+/* the compatibility profile, which phase 11 runs in */
+#include "mgl_legacy_enums.h"
+typedef struct GLMContextRec_t *GLMContext;
+extern GLMContext createGLMContextProfile(GLenum, GLenum, GLenum, GLenum, GLenum, GLenum, GLMContext, GLbitfield);
+extern void MGLsetCurrentContext(GLMContext);
+extern GLMContext MGLgetCurrentContext(void);
+/* CGL and AGL as libmoogl exports them; their headers would bring Apple's GL types */
+typedef struct _CGLPixelFormatObject *CGLPixelFormatObj;
+typedef struct _CGLContextObject *CGLContextObj;
+extern int CGLChoosePixelFormat(const int *, CGLPixelFormatObj *, GLint *);
+extern int CGLCreateContext(CGLPixelFormatObj, CGLContextObj, CGLContextObj *);
+extern int CGLSetCurrentContext(CGLContextObj);
+extern int CGLDestroyContext(CGLContextObj);
+extern int CGLDestroyPixelFormat(CGLPixelFormatObj);
+typedef struct __AGLPixelFormatRec *AGLPixelFormat;
+typedef struct __AGLContextRec *AGLContext;
+extern AGLPixelFormat aglChoosePixelFormat(const void *, GLint, const GLint *);
+extern AGLContext aglCreateContext(AGLPixelFormat, AGLContext);
+extern GLboolean aglSetCurrentContext(AGLContext);
+extern GLboolean aglDestroyContext(AGLContext);
+extern void aglDestroyPixelFormat(AGLPixelFormat);
+extern void *CppCreateMGLRendererHeadless(void *);
+extern void glBegin(GLenum);
+extern void glEnd(void);
+extern void glVertex2f(GLfloat, GLfloat);
+extern void glColor3f(GLfloat, GLfloat, GLfloat);
+extern void glNormal3f(GLfloat, GLfloat, GLfloat);
+extern void glTexCoord2f(GLfloat, GLfloat);
+extern void glRectf(GLfloat, GLfloat, GLfloat, GLfloat);
+extern void glMatrixMode(GLenum);
+extern void glLoadIdentity(void);
+extern void glPushMatrix(void);
+extern void glPopMatrix(void);
+extern void glTranslatef(GLfloat, GLfloat, GLfloat);
+extern void glOrtho(GLdouble, GLdouble, GLdouble, GLdouble, GLdouble, GLdouble);
+extern void glEnableClientState(GLenum);
+extern void glDisableClientState(GLenum);
+extern void glVertexPointer(GLint, GLenum, GLsizei, const void *);
+extern void glLightfv(GLenum, GLenum, const GLfloat *);
+extern void glTexEnvi(GLenum, GLenum, GLint);
+extern void glPushAttrib(GLbitfield);
+extern void glPopAttrib(void);
+extern void glEdgeFlag(GLboolean);
+extern GLuint glGenLists(GLsizei);
+extern void glNewList(GLuint, GLenum);
+extern void glEndList(void);
+extern void glCallList(GLuint);
+extern GLint glRenderMode(GLenum);
+extern void glSelectBuffer(GLsizei, GLuint *);
+extern void glInitNames(void);
+extern void glPushName(GLuint);
+extern void glLoadName(GLuint);
+extern void glWindowPos2i(GLint, GLint);
+extern void glDrawPixels(GLsizei, GLsizei, GLenum, GLenum, const void *);
+extern void glBitmap(GLsizei, GLsizei, GLfloat, GLfloat, GLfloat, GLfloat, const GLubyte *);
+extern void glAlphaFunc(GLenum, GLfloat);
 extern const GLubyte *glGetString(GLenum);
 extern const GLubyte *glGetStringi(GLenum, GLuint);
 extern void  glGetIntegerv(GLenum, GLint *);
@@ -61,6 +118,7 @@ extern void  glGenTextures(GLsizei, GLuint *);
 extern void  glBindTexture(GLenum, GLuint);
 extern void  glTexImage2D(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *);
 extern void  glGetTexImage(GLenum, GLint, GLenum, GLenum, void *);
+extern void  glTextureRangeAPPLE(GLenum, GLsizei, const void *);
 extern void  glPixelStorei(GLenum, GLint);
 extern GLuint glCreateShader(GLenum);
 extern void  glShaderSource(GLuint, GLsizei, const GLchar *const *, const GLint *);
@@ -639,7 +697,6 @@ static void phase4(void)
 static void phase5(void)
 {
     GLuint tex, q, tf;
-    GLint unhandled;
 
     phase("PHASE 5  the features Metal has no answer for");
 
@@ -1213,20 +1270,75 @@ static void phase11(void)
              "shadow maps and old UI code still set it");
     }
 
-    /* --- the rest of the list, none of it built yet --- */
-    gate("a border colour Metal does not hold is exact", 0,
-         "Metal keeps three; anything else snaps to the nearest");
-
+    /* --- a border colour Metal's sampler cannot hold, filtered linearly --- */
     {
-        /* a client pointer with no array buffer bound is still an error */
-        GLfloat verts[6] = { 0 };
+        /* at the left edge a linear filter takes half the edge texel and half the border */
+        static const char *bfs =
+            "#version 460 core\n"
+            "uniform sampler2D t;\n"
+            "out vec4 o;\n"
+            "void main() { o = texture(t, vec2(0.0, 0.5)); }\n";
+        static const GLfloat border[4] = { 0.25f, 0.5f, 0.75f, 1.0f };
+        static const GLubyte red[8] = { 255, 0, 0, 255,  255, 0, 0, 255 };
+        GLuint btex, bfbo, bprog;
+        GLubyte px[4] = { 0 };
 
         drain();
-        glBindBuffer(GL_ARRAY_BUFFER, 0);
-        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, verts);
+        bfbo = probeTarget(NULL);
+        probeQuadVAO();
+        bprog = buildProgram(vs, NULL, NULL, NULL, bfs);
 
-        gate("a vertex array in client memory draws", glGetError() == GL_NO_ERROR,
+        glGenTextures(1, &btex);
+        glBindTexture(GL_TEXTURE_2D, btex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 2, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, red);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
+        glTexParameterfv(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, border);
+
+        if (bprog)
+        {
+            glViewport(0, 0, 64, 64);
+            glUseProgram(bprog);
+            glDrawArrays(GL_TRIANGLES, 0, 6);
+            glFinish();
+            glReadPixels(32, 32, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+            glUseProgram(0);
+        }
+
+        gate("a border colour Metal does not hold is exact",
+             bprog && abs(px[0] - 159) <= 3 && abs(px[1] - 64) <= 3 && abs(px[2] - 96) <= 3,
+             "Metal keeps three; the shader adds any other by how much of the filter fell outside");
+
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glDeleteTextures(1, &btex);
+        glDeleteFramebuffers(1, &bfbo);
+        if (bprog)
+            glDeleteProgram(bprog);
+    }
+
+    drain();
+    {
+        /* a quad straight out of malloc'd memory, no buffer anywhere */
+        static const GLfloat verts[8] = { -1,-1, 1,-1, 1,1, -1,1 };
+
+        glBindVertexArray(0);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glUseProgram(0);
+        glColor3f(0, 1, 0);
+        glEnableClientState(GL_VERTEX_ARRAY);
+        glVertexPointer(2, GL_FLOAT, 0, verts);
+        glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDrawArrays(GL_QUADS, 0, 4);
+        glDisableClientState(GL_VERTEX_ARRAY);
+
+        gate("a vertex array in client memory draws",
+             glGetError() == GL_NO_ERROR && greenPixels() == 64 * 64,
              "engines written before VBOs stream straight out of malloc");
+
+        probeQuadVAO();
     }
 
     {
@@ -1271,14 +1383,51 @@ static void phase11(void)
              "console ports and UI layers used it to dodge power of two sizes");
     }
 
-    drain();
-    glEnable(0x0B50 /* GL_LIGHTING */);
-    gate("fixed function lighting has an uber shader behind it",
-         glGetError() == GL_NO_ERROR,
-         "retro titles and modding tools light geometry this way");
+    {
+        /* a green light on a white surface facing it, through the generated program */
+        static const GLfloat green[4] = { 0, 1, 0, 1 }, toward[4] = { 0, 0, 1, 0 };
 
-    gate("the modelview and projection matrix stacks are emulated", 0,
-         "glPushMatrix, glLoadIdentity, glMultMatrixf and the rest");
+        drain();
+        glUseProgram(0);
+        glEnable(GL_LIGHTING);
+        glEnable(GL_LIGHT0);
+        glLightfv(GL_LIGHT0, GL_DIFFUSE, green);
+        glLightfv(GL_LIGHT0, GL_POSITION, toward);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glNormal3f(0, 0, 1);
+        glRectf(-1, -1, 1, 1);
+        glDisable(GL_LIGHTING);
+
+        gate("fixed function lighting has an uber shader behind it",
+             glGetError() == GL_NO_ERROR && greenPixels() == 64 * 64,
+             "retro titles and modding tools light geometry this way");
+    }
+
+    {
+        /* the right half only: an ortho projection, then a pushed translate */
+        GLint depth = 0;
+
+        drain();
+        glMatrixMode(GL_PROJECTION);
+        glLoadIdentity();
+        glOrtho(0, 64, 0, 64, -1, 1);
+        glMatrixMode(GL_MODELVIEW);
+        glLoadIdentity();
+        glPushMatrix();
+        glTranslatef(32, 0, 0);
+        glGetIntegerv(GL_MODELVIEW_STACK_DEPTH, &depth);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glColor3f(0, 1, 0);
+        glRectf(0, 0, 32, 64);
+        glPopMatrix();
+        glMatrixMode(GL_PROJECTION);
+        glLoadIdentity();
+        glMatrixMode(GL_MODELVIEW);
+
+        gate("the modelview and projection matrix stacks are emulated",
+             glGetError() == GL_NO_ERROR && depth == 2 && greenPixels() == 32 * 64,
+             "glPushMatrix, glLoadIdentity, glMultMatrixf and the rest");
+    }
 
     glDeleteProgram(prog);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -1302,47 +1451,109 @@ static void phase11A(void)
          glGetError() == GL_NO_ERROR,
          "GL_FRONT, GL_BACK, GL_AUXi and the stereo pair, for overlays");
 
+    probeTarget(NULL);
+    glViewport(0, 0, 64, 64);
+    glUseProgram(0);
+    glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
+
     drain();
-    glBegin(GL_TRIANGLES);
-    glVertex3f(0.0f, 0.0f, 0.0f);
-    glVertex3f(1.0f, 0.0f, 0.0f);
-    glVertex3f(0.0f, 1.0f, 0.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glColor3f(0, 1, 0);
+    glBegin(GL_QUADS);
+    glVertex2f(-1, -1); glVertex2f(1, -1); glVertex2f(1, 1); glVertex2f(-1, 1);
     glEnd();
     gate("glBegin and glEnd gather into a buffer and draw",
-         glGetError() == GL_NO_ERROR,
+         glGetError() == GL_NO_ERROR && greenPixels() == 64 * 64,
          "one feature unlocks a graveyard of internal tools");
 
     drain();
+    glClear(GL_COLOR_BUFFER_BIT);
     glEnable(GL_POINT_SPRITE);
-    glPointSize(4.0f);
+    glPointSize(16.0f);
+    glBegin(GL_POINTS);
+    glVertex2f(0, 0);
+    glEnd();
+    glDisable(GL_POINT_SPRITE);
+    glPointSize(1.0f);
     gate("point sprites size and texture themselves",
-         glGetError() == GL_NO_ERROR,
+         glGetError() == GL_NO_ERROR && greenPixels() == 16 * 16,
          "particles and sparks drawn without building quads");
 
-    drain();
-    glPushAttrib(GL_ALL_ATTRIB_BITS);
-    glPopAttrib();
-    gate("glPushAttrib and glPopAttrib save and restore state",
-         glGetError() == GL_NO_ERROR,
-         "GUI toolkits wrap every custom widget in one");
+    {
+        GLfloat color[4] = { 0 };
 
-    drain();
-    glPolygonMode(GL_FRONT, GL_FILL);
-    glPolygonMode(GL_BACK, GL_LINE);
-    gate("front and back rasterise differently",
-         glGetError() == GL_NO_ERROR,
-         "wireframe over shaded, which CAD draws in a single pass");
+        drain();
+        glColor3f(0, 1, 0);
+        glPushAttrib(GL_ALL_ATTRIB_BITS);
+        glColor3f(1, 0, 0);
+        glEnable(GL_DEPTH_TEST);
+        glPopAttrib();
+        glGetFloatv(GL_CURRENT_COLOR, color);
+        gate("glPushAttrib and glPopAttrib save and restore state",
+             glGetError() == GL_NO_ERROR && color[1] == 1.0f && !glIsEnabled(GL_DEPTH_TEST),
+             "GUI toolkits wrap every custom widget in one");
+    }
 
-    drain();
-    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
-    gate("glTexEnv combines a texture with the fragment colour",
-         glGetError() == GL_NO_ERROR,
-         "lightmaps and detail maps without a shader of their own");
+    {
+        /* a filled front face and a back face in outline, in one draw each */
+        int filled, outlined;
 
-    drain();
-    glEdgeFlag(1);
-    gate("glEdgeFlag is accepted", glGetError() == GL_NO_ERROR,
-         "modelling tools mark which polygon edges a wireframe draws");
+        drain();
+        glPolygonMode(GL_FRONT, GL_FILL);
+        glPolygonMode(GL_BACK, GL_LINE);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glBegin(GL_QUADS);
+        glVertex2f(-1, -1); glVertex2f(1, -1); glVertex2f(1, 1); glVertex2f(-1, 1);
+        glEnd();
+        filled = greenPixels();
+        glClear(GL_COLOR_BUFFER_BIT);
+        glBegin(GL_QUADS);
+        glVertex2f(-0.5f, -0.5f); glVertex2f(-0.5f, 0.5f); glVertex2f(0.5f, 0.5f); glVertex2f(0.5f, -0.5f);
+        glEnd();
+        outlined = greenPixels();
+        glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+
+        gate("front and back rasterise differently",
+             glGetError() == GL_NO_ERROR && filled == 64 * 64 && outlined > 0 && outlined < 32 * 32,
+             "wireframe over shaded, which CAD draws in a single pass");
+    }
+
+    {
+        /* a white texel times a green vertex colour */
+        static const GLubyte white[4] = { 255, 255, 255, 255 };
+        GLuint t;
+
+        drain();
+        glGenTextures(1, &t);
+        glBindTexture(GL_TEXTURE_2D, t);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, white);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glEnable(GL_TEXTURE_2D);
+        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glColor3f(0, 1, 0);
+        glBegin(GL_QUADS);
+        glTexCoord2f(0, 0); glVertex2f(-1, -1); glTexCoord2f(1, 0); glVertex2f(1, -1);
+        glTexCoord2f(1, 1); glVertex2f(1, 1); glTexCoord2f(0, 1); glVertex2f(-1, 1);
+        glEnd();
+        glDisable(GL_TEXTURE_2D);
+        glDeleteTextures(1, &t);
+
+        gate("glTexEnv combines a texture with the fragment colour",
+             glGetError() == GL_NO_ERROR && greenPixels() == 64 * 64,
+             "lightmaps and detail maps without a shader of their own");
+    }
+
+    {
+        GLboolean flag = GL_TRUE;
+
+        drain();
+        glEdgeFlag(GL_FALSE);
+        glGetBooleanv(GL_EDGE_FLAG, &flag);
+        glEdgeFlag(GL_TRUE);
+        gate("glEdgeFlag is accepted", glGetError() == GL_NO_ERROR && flag == GL_FALSE,
+             "modelling tools mark which polygon edges a wireframe draws");
+    }
 
     gate("GL_ARB_multitexture advertised", hasExt("GL_ARB_multitexture"),
          "GoldSrc looks for the extension string, not the core entry point");
@@ -1363,8 +1574,6 @@ static void phase11B(void)
         "#version 460 core\n"
         "out vec4 o;\n"
         "void main() { o = vec4(0.0, 1.0, 0.0, 1.0); }\n";
-    static const GLubyte one_pixel[4] = { 255, 255, 255, 255 };
-    static const GLubyte one_bit[1] = { 0x80 };
     GLuint list, query = 0, prog;
     GLuint passed = 0;
     int quads_drew = 0;
@@ -1373,7 +1582,18 @@ static void phase11B(void)
 
     /* a real draw, so the gate answers about the mode and not the setup */
     probeTarget(NULL);
-    probeQuadVAO();
+    {
+        static const GLfloat quad[8] = { -1,-1, 1,-1, 1,1, -1,1 };
+        GLuint vao, vbo;
+
+        glGenVertexArrays(1, &vao);
+        glBindVertexArray(vao);
+        glGenBuffers(1, &vbo);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferData(GL_ARRAY_BUFFER, sizeof quad, quad, GL_STATIC_DRAW);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
+        glEnableVertexAttribArray(0);
+    }
     prog = buildProgram(vs, NULL, NULL, NULL, fs);
 
     if (prog)
@@ -1385,7 +1605,7 @@ static void phase11B(void)
         drain();
         glDrawArrays(GL_QUADS, 0, 4);
         glFinish();
-        quads_drew = (glGetError() == GL_NO_ERROR) && greenPixels() > 0;
+        quads_drew = (glGetError() == GL_NO_ERROR) && greenPixels() == 64 * 64;
         glUseProgram(0);
         glDeleteProgram(prog);
     }
@@ -1394,28 +1614,74 @@ static void phase11B(void)
          quads_drew,
          "level geometry and flat UI built four vertices at a time");
 
-    drain();
-    list = glGenLists(1);
-    glNewList(list, GL_COMPILE);
-    glEndList();
-    glCallList(list);
-    gate("a display list records commands and replays them",
-         list != 0 && glGetError() == GL_NO_ERROR,
-         "terrain chunks, fonts and models compiled once");
+    {
+        /* a green quad compiled once, drawn only when the list is called */
+        int before, after;
 
-    drain();
-    glRenderMode(GL_SELECT);
-    glRenderMode(GL_RENDER);
-    gate("glRenderMode(GL_SELECT) answers what the cursor is over",
-         glGetError() == GL_NO_ERROR,
-         "how every legacy editor handles a click on 3D geometry");
+        drain();
+        glUseProgram(0);
+        glColor3f(0, 1, 0);
+        list = glGenLists(1);
+        glNewList(list, GL_COMPILE);
+        glRectf(-1, -1, 1, 1);
+        glEndList();
+        glClear(GL_COLOR_BUFFER_BIT);
+        before = greenPixels();
+        glCallList(list);
+        after = greenPixels();
 
-    drain();
-    glDrawPixels(1, 1, GL_RGBA, GL_UNSIGNED_BYTE, one_pixel);
-    glBitmap(1, 1, 0.0f, 0.0f, 0.0f, 0.0f, one_bit);
-    gate("glDrawPixels and glBitmap reach the framebuffer",
-         glGetError() == GL_NO_ERROR,
-         "debug text and HUDs written straight to the screen");
+        gate("a display list records commands and replays them",
+             list != 0 && glGetError() == GL_NO_ERROR && before == 0 && after == 64 * 64,
+             "terrain chunks, fonts and models compiled once");
+    }
+
+    {
+        /* one quad inside the view volume and one outside it */
+        GLuint buf[16];
+        GLint hits;
+
+        drain();
+        glSelectBuffer(16, buf);
+        glRenderMode(GL_SELECT);
+        glInitNames();
+        glPushName(5);
+        glRectf(-0.5f, -0.5f, 0.5f, 0.5f);
+        glLoadName(6);
+        glRectf(2.0f, 2.0f, 3.0f, 3.0f);
+        hits = glRenderMode(GL_RENDER);
+
+        gate("glRenderMode(GL_SELECT) answers what the cursor is over",
+             glGetError() == GL_NO_ERROR && hits == 1 && buf[0] == 1 && buf[3] == 5,
+             "how every legacy editor handles a click on 3D geometry");
+    }
+
+    {
+        /* a 4x4 block of green pixels, then a 4x4 bitmap in the raster colour */
+        static GLubyte block[4 * 4 * 4];
+        static const GLubyte bits[4] = { 0xF0, 0xF0, 0xF0, 0xF0 };
+        int drawn, stamped;
+
+        for (int i = 0; i < 16; i++)
+        {
+            block[i * 4] = 0; block[i * 4 + 1] = 255; block[i * 4 + 2] = 0; block[i * 4 + 3] = 255;
+        }
+
+        drain();
+        glClear(GL_COLOR_BUFFER_BIT);
+        glWindowPos2i(8, 8);
+        glDrawPixels(4, 4, GL_RGBA, GL_UNSIGNED_BYTE, block);
+        drawn = greenPixels();
+        glClear(GL_COLOR_BUFFER_BIT);
+        glColor3f(0, 1, 0);
+        glWindowPos2i(8, 8);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glBitmap(4, 4, 0, 0, 0, 0, bits);
+        stamped = greenPixels();
+
+        gate("glDrawPixels and glBitmap reach the framebuffer",
+             glGetError() == GL_NO_ERROR && drawn == 16 && stamped == 16,
+             "debug text and HUDs written straight to the screen");
+    }
 
     /* queries are core in 4.6, so this asks whether MGL services them */
     drain();
@@ -1440,21 +1706,47 @@ static void phase11C(void)
 
     phase("PHASE 11C  early Mac OS X");
 
-    gate("GL_EXT_texture_rectangle aliases the core rectangle target",
-         hasExt("GL_EXT_texture_rectangle"),
-         "the spelling early Mac code checks for before it will run");
+    GLubyte back[8] = { 0 };
+    GLboolean on = GL_FALSE;
+    GLint length = 0;
+    static GLubyte range[16];
+    // Y, Cb, Cr for red, as '2vuy': Cb Y0 Cr Y1
+    static const GLubyte red422[4] = { 90, 81, 240, 81 };
+    // opaque blue in 1:5:5:5, read as BGRA
+    static const GLushort blue1555 = 0x801f;
 
-    gate("GL_APPLE_client_storage", hasExt("GL_APPLE_client_storage"),
+    drain();
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_RECTANGLE_EXT, tex);
+    glTexImage2D(GL_TEXTURE_RECTANGLE_EXT, 0, GL_RGBA8, 1, 1, 0, GL_BGRA, GL_UNSIGNED_BYTE, bgra);
+    gate("GL_EXT_texture_rectangle aliases the core rectangle target",
+         hasExt("GL_EXT_texture_rectangle") && glGetError() == GL_NO_ERROR,
+         "the spelling early Mac code checks for before it will run");
+    glDeleteTextures(1, &tex);
+
+    glPixelStorei(GL_UNPACK_CLIENT_STORAGE_APPLE, GL_TRUE);
+    glGetBooleanv(GL_UNPACK_CLIENT_STORAGE_APPLE, &on);
+    glPixelStorei(GL_UNPACK_CLIENT_STORAGE_APPLE, GL_FALSE);
+    gate("GL_APPLE_client_storage", hasExt("GL_APPLE_client_storage") && on == GL_TRUE && glGetError() == GL_NO_ERROR,
          "a texture kept in the application's own memory");
 
-    gate("GL_APPLE_texture_range", hasExt("GL_APPLE_texture_range"),
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTextureRangeAPPLE(GL_TEXTURE_2D, sizeof range, range);
+    glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_RANGE_LENGTH_APPLE, &length);
+    gate("GL_APPLE_texture_range", hasExt("GL_APPLE_texture_range") && length == (GLint)sizeof range,
          "and the hint saying how that memory will be read");
 
-    gate("GL_APPLE_ycbcr_422", hasExt("GL_APPLE_ycbcr_422"),
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 2, 1, 0, GL_YCBCR_422_APPLE, GL_UNSIGNED_SHORT_8_8_REV_APPLE, red422);
+    glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, back);
+    gate("GL_APPLE_ycbcr_422", hasExt("GL_APPLE_ycbcr_422") && back[0] > 240 && back[1] < 16 && back[2] < 16,
          "QuickTime handed video frames to GL in their own colour space");
 
-    gate("GL_APPLE_packed_pixels", hasExt("GL_APPLE_packed_pixels"),
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_BGRA, GL_UNSIGNED_SHORT_1_5_5_5_REV, &blue1555);
+    glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, back);
+    gate("GL_APPLE_packed_pixels", hasExt("GL_APPLE_packed_pixels") && back[0] < 16 && back[2] > 240,
          "the tokens alone; the unpacking is already core");
+    glDeleteTextures(1, &tex);
 
     drain();
     glGenTextures(1, &tex);
@@ -1464,9 +1756,38 @@ static void phase11C(void)
          "the order the old window server already had the pixels in");
     glDeleteTextures(1, &tex);
 
-    gate("AGL and CGL context creation is translated", 0,
-         "aglCreateContext and CGLChoosePixelFormat, which this probe "
-         "cannot reach from inside a context");
+    /* a second context made the old way, then this one back */
+    {
+        static const int cgl_attribs[] = { 5 /* kCGLPFADoubleBuffer */, 0 };
+        static const GLint agl_attribs[] = { 4 /* AGL_RGBA */, 5 /* AGL_DOUBLEBUFFER */, 0 };
+        GLMContext probe = MGLgetCurrentContext();
+        CGLPixelFormatObj pix = NULL;
+        CGLContextObj cgl = NULL;
+        GLint npix = 0;
+        int cgl_ok, agl_ok;
+
+        cgl_ok = CGLChoosePixelFormat(cgl_attribs, &pix, &npix) == 0 && pix &&
+                 CGLCreateContext(pix, NULL, &cgl) == 0 && CGLSetCurrentContext(cgl) == 0 &&
+                 glGetString(GL_VERSION) != NULL;
+        CGLSetCurrentContext(NULL);
+        if (cgl)
+            CGLDestroyContext(cgl);
+        if (pix)
+            CGLDestroyPixelFormat(pix);
+
+        AGLPixelFormat apix = aglChoosePixelFormat(NULL, 0, agl_attribs);
+        AGLContext agl = apix ? aglCreateContext(apix, NULL) : NULL;
+        agl_ok = agl && aglSetCurrentContext(agl) && glGetString(GL_VERSION) != NULL;
+        aglSetCurrentContext(NULL);
+        if (agl)
+            aglDestroyContext(agl);
+        if (apix)
+            aglDestroyPixelFormat(apix);
+
+        MGLsetCurrentContext(probe);
+        gate("AGL and CGL context creation is translated", cgl_ok && agl_ok,
+             "aglCreateContext and CGLChoosePixelFormat; build/test_cgl draws through both");
+    }
 }
 
 int main(void)
@@ -1478,6 +1799,20 @@ int main(void)
     phase5();
     phase6();
     phase8();
+
+    /* what the core profile removed answers only in a compatibility context */
+    {
+        GLMContext compat = createGLMContextProfile(GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, GL_DEPTH_COMPONENT,
+                                                    GL_FLOAT, GL_STENCIL_INDEX8, GL_UNSIGNED_BYTE, NULL,
+                                                    GL_CONTEXT_COMPATIBILITY_PROFILE_BIT);
+
+        if (compat)
+        {
+            MGLsetCurrentContext(compat);
+            CppCreateMGLRendererHeadless(compat);
+        }
+    }
+
     phase11();
     phase11A();
     phase11B();

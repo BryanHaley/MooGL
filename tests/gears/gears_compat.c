@@ -10,11 +10,9 @@
  * Original copyright (C) 1999-2001 Brian Paul, MIT licence. Ported to GLX by
  * Brian Paul, to Win32 by Ben Skeggs, to macOS/MGL here.
  *
- * Note that none of the fixed-function entry points exist in an OpenGL 4.6
- * core profile, so MGL answers all of them with GL_INVALID_OPERATION and this
- * draws nothing. That is the point of --check: it proves MGL turns the whole
- * compatibility profile away cleanly instead of crashing. gears_gl46 is the
- * version that actually renders.
+ * It needs a compatibility profile context, which MGL makes when a program
+ * asks for no profile, as this one does. --check renders a few frames in one
+ * and checks that the three gears come out, with no GL errors.
  */
 
 #include <stdio.h>
@@ -38,6 +36,7 @@ extern void *CppCreateMGLRendererHeadless(void *glm_ctx);
 
 /* glcorearb.h is core only, so the compatibility entry points MGL exports have
    to be declared by hand. */
+#define GL_CONTEXT_COMPATIBILITY_PROFILE_BIT 0x00000002
 #define GL_QUADS            0x0007
 #define GL_QUAD_STRIP       0x0008
 #define GL_COMPILE          0x1300
@@ -302,6 +301,31 @@ init(void)
     glEnable(GL_NORMALIZE);                   note_call("glEnable(NORMALIZE)");
 }
 
+/* the three gears in their colours, over a dark background */
+static int check_frame(const unsigned char *px, int w, int h)
+{
+    size_t n = (size_t)w * h, lit = 0, reddish = 0, greenish = 0, bluish = 0;
+
+    for (size_t i = 0; i < n; i++)
+    {
+        const unsigned char *p = px + i * 4;
+        int r = p[0], g = p[1], b = p[2];
+
+        if (r + g + b < 24)
+            continue;
+
+        lit++;
+
+        if (r > g + 20 && r > b + 20) reddish++;
+        else if (g > r + 20 && g > b + 20) greenish++;
+        else if (b > r + 20 && b > g + 20) bluish++;
+    }
+
+    printf("coverage %.1f%%  red=%zu green=%zu blue=%zu\n", 100.0 * lit / n, reddish, greenish, bluish);
+
+    return lit > n / 20 && lit < n * 19 / 20 && reddish && greenish && bluish;
+}
+
 static void key_callback(GLFWwindow *w, int key, int sc, int action, int mods)
 {
     (void)sc; (void)mods;
@@ -330,7 +354,7 @@ static void usage(const char *prog)
     printf("usage: %s [options]\n", prog);
     printf("  -info        print GL implementation information\n");
     printf("  --frames N   render N frames then exit\n");
-    printf("  --check      report which compatibility calls MGL rejects, then exit\n");
+    printf("  --check      render a few frames without a window and check the gears\n");
     printf("  --headless   run without a window\n");
     printf("  --size W H   window size (default 300x300)\n");
     printf("  -h           this help\n");
@@ -364,9 +388,10 @@ int main(int argc, char **argv)
 
     if (opt_headless)
     {
-        GLMContext ctx = createGLMContext(GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV,
-                                          GL_DEPTH_COMPONENT, GL_FLOAT,
-                                          GL_STENCIL_INDEX8, GL_UNSIGNED_BYTE);
+        GLMContext ctx = createGLMContextProfile(GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV,
+                                                 GL_DEPTH_COMPONENT, GL_FLOAT,
+                                                 GL_STENCIL_INDEX8, GL_UNSIGNED_BYTE, NULL,
+                                                 GL_CONTEXT_COMPATIBILITY_PROFILE_BIT);
         if (!ctx || !CppCreateMGLRendererHeadless(ctx))
         {
             fprintf(stderr, "gears_compat: headless context failed\n");
@@ -386,8 +411,7 @@ int main(int argc, char **argv)
             return 77;                        /* skip: no window server */
         }
 
-        // MGL only offers 4.6; GLFW defaults to 1.0 and its MGL backend
-        // refuses anything lower
+        // no profile asked for, so a compatibility context
         glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_API);
         glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
         glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 6);
@@ -412,9 +436,6 @@ int main(int argc, char **argv)
         printf("GL_VERSION  = %s\n", (char *)glGetString(GL_VERSION));
         printf("GL_VENDOR   = %s\n", (char *)glGetString(GL_VENDOR));
     }
-
-    if (opt_check)
-        printf("compatibility-profile calls rejected by MGL:\n");
 
     reshape(opt_width, opt_height);
     init();
@@ -461,10 +482,19 @@ int main(int argc, char **argv)
 
     if (opt_check)
     {
-        printf("\n%d compatibility calls made, %d GL errors raised\n", call_count, err_count);
-        printf("no crash: MGL turned the fixed-function pipeline away cleanly\n");
-        printf("(OpenGL 4.6 core has none of these; see gears_gl46 for the real renderer)\n");
-        return err_count > 0 ? 0 : 1;    /* we expect it to reject them */
+        unsigned char *px = (unsigned char *)calloc((size_t)opt_width * opt_height, 4);
+        int ok;
+
+        if (px == NULL)
+            return 1;
+
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glReadPixels(0, 0, opt_width, opt_height, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        ok = check_frame(px, opt_width, opt_height);
+        free(px);
+
+        printf("%d compatibility calls made, %d GL errors raised\n", call_count, err_count);
+        return ok && err_count == 0 ? 0 : 1;
     }
 
     return 0;

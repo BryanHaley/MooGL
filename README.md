@@ -12,8 +12,9 @@
 </p>
 
 OpenGL has been deprecated for years on macOS, and was never updated past 4.1. MooGL is a complete
-OpenGL 4.6 Core implementation written on top of Metal, so modern GL code (compute shaders,
-direct state access, SPIR-V, bindless textures, mesh shaders) builds and runs on a Mac. You link it like any other library and open a window with the GLFW or SDL2 it ships with.
+OpenGL 4.6 Core implementation (along with the most important legacy features) written on top of Metal, so most OpenGL
+code (compute shaders, direct state access, SPIR-V, bindless textures, mesh shaders) builds and runs on a Mac. You link
+it like any other library and open a window with the GLFW or SDL2 it ships with.
 
 It also ships AMD FSR 2's API on top of Apple's MetalFX upscaler so a game that uses
 FSR 2 on Windows/Linux can be ported to Mac without touching its FSR 2 code.
@@ -25,7 +26,7 @@ FSR 2 on Windows/Linux can be ported to Mac without touching its FSR 2 code.
 | Khronos KHR-GL46 (the OpenGL 4.6 conformance tests) | 17,482 | **0** |
 | Khronos KHR-Single | 8,836 | **0** |
 | Khronos `texture_swizzle` | 505 | **0** |
-| MooGL's own suite | 1,369 | **0** |
+| MooGL's own suite | 1,408 | **0** |
 
 The 1,536 KHR-GL46 cases MooGL does not run are ones the conformance suite lets a driver
 decline (mostly optional extensions). These are local runs; MooGL has not been submitted to Khronos and is not an officially conformant product.
@@ -54,6 +55,37 @@ drawing 1600×900 pixels at about 130 fps. The frame shows:
 MooGL's build of the engine also turns on its subgroup, SPIR-V, debug-output and mesh shader
 paths, which stock macOS can't run, and its path tracer works too.
 
+## Legacy OpenGL
+
+<p align="center">
+  <img src="docs/images/half-life.webp" alt="Half-Life's resonance cascade drawn by MooGL" width="900">
+</p>
+
+MooGL also supports the vast majority of legacy OpenGL code. A program that asks for the compatibility profile,
+or for no profile at all as old code does, gets a 4.6 context that still has what the core profile removed. Here is 
+[Xash3D FWGS](https://github.com/FWGS/xash3d-fwgs), whose renderer is
+written for OpenGL 1.x, on an M1 Max MacBook Pro. It uses:
+
+- **`glBegin` and `glEnd`** for the world, models and HUD, and **client-side vertex arrays** for
+  the models.
+- **The matrix stacks** and **`glTexEnv`** for texturing and lightmaps.
+- **The alpha test** for see-through textures such as grates and railings, and **blending** for
+  the green beams and sprites.
+
+The vast majority of legacy applications should be supported; see known limits for what the compatibility
+profile covers. Old Mac code works too:
+
+- **GLUT**, as `libglut`: freeglut with a MooGL backend, from `<GLUT/glut.h>` or `<GL/freeglut.h>`.
+- **GLU**, as `libGLU`: Mesa's GLU, NURBS and tessellator included. Mac code keeps including
+  `<OpenGL/glu.h>` and links `libGLU` instead of `OpenGL.framework`; code from other systems can use
+  `<GL/glu.h>`.
+- **CGL and AGL**: `CGLChoosePixelFormat`, `CGLCreateContext`, `aglCreateContext` and the rest make
+  MooGL contexts in a program linked to `libmoogl` instead of `OpenGL.framework`. AGL left the SDK in
+  macOS 10.14, so MooGL ships its own `<AGL/agl.h>`.
+- **Apple's extensions**: `GL_APPLE_client_storage`, `GL_APPLE_texture_range`, `GL_APPLE_ycbcr_422`,
+  `GL_APPLE_packed_pixels` and `GL_EXT_texture_rectangle`.
+- **`SDL_Renderer`'s `opengl` backend**, and any texture border colour, exact even with linear filtering.
+
 ## Get the SDK
 
 Download `MooGL-SDK-<version>-macos-arm64.tar.gz` from the
@@ -62,12 +94,14 @@ Download `MooGL-SDK-<version>-macos-arm64.tar.gz` from the
 ```
 MooGL-SDK/
   lib/        libmoogl.dylib (OpenGL)
-              libglfw.dylib  libSDL2-2.0.0.dylib (GLFW and SDL2 for MooGL)
+              libglfw.dylib  libSDL2-2.0.0.dylib  libglut.3.dylib (GLFW, SDL2 and GLUT for MooGL)
+              libGLU.1.dylib (GLU)
               libimgui.a (Dear ImGui, drawing with MooGL)
               libffx_fsr2_api.dylib (FSR 2 on MetalFX)
               cmake/MooGL/  cmake/SDL2/
-  include/    GL/glcorearb.h  KHR/khrplatform.h  GLFW/  SDL2/  imgui/  MGLContext.h  ffx-fsr2/
-  examples/   triangle/ (GLFW)  sdl2_triangle/ (SDL2)  imgui/ imgui_sdl2/ (Dear ImGui)
+  include/    GL/glcorearb.h  GL/freeglut.h  GL/glu.h  GLUT/glut.h  AGL/agl.h  KHR/khrplatform.h
+              GLFW/  SDL2/  imgui/  MGLContext.h  ffx-fsr2/
+  examples/   triangle/ (GLFW)  sdl2_triangle/ (SDL2)  glut_teapot/ (GLUT)  imgui/ imgui_sdl2/ (Dear ImGui)
   nuget/      FFX_FSR2 for C# on macOS
   licenses/
 ```
@@ -120,8 +154,11 @@ something specific.
 
 Use the `libglfw` or `libSDL2` from the SDK, not one from Homebrew: they are GLFW 3.4 and
 SDL 2.32 with a backend that creates MooGL contexts instead of Apple's. Any version request up
-to 4.6 gets a 4.6 core context, so code that asks for 3.3 or 4.1 core, as most Mac code does,
-works unchanged. With GLFW:
+to 4.6 gets 4.6, so code that asks for 3.3 or 4.1 core, as most Mac code does, works unchanged.
+Asking for the core profile gets a core context. Asking for the compatibility profile, or for no
+profile at all as old code does, gets a compatibility context, which also has what the core
+profile removed: `glBegin`, the matrix stacks, fixed-function lighting and texturing, display
+lists and the rest (see Known limits). With GLFW:
 
 ```c
 #include <GL/glcorearb.h>
@@ -161,8 +198,8 @@ debug and no-error flags work too. A few things differ from Apple's driver:
   transform feedback objects, program pipelines and queries. They can be current on different
   threads at once, for example a loading thread. Order work between them with a fence:
   `glFenceSync` and `glFlush` in one, `glWaitSync` or `glClientWaitSync` in the other.
-- `SDL_Renderer` has no `opengl` backend, which needs legacy GL. It uses Metal, its default on
-  macOS anyway.
+- `SDL_Renderer` uses Metal by default, as on any Mac. Its `opengl` backend works too, through a
+  compatibility context: set `SDL_HINT_RENDER_DRIVER` to `"opengl"`.
 
 OpenGL ES contexts aren't offered yet; they're on the roadmap.
 
@@ -235,7 +272,7 @@ SDL2-CS in C#, LWJGL in Java, pyGLFW and PySDL2 in Python, and others. Put the S
 binding looks for them, and it runs on MooGL. That's how IDKEngine runs above. Use only one copy
 of `libmoogl.dylib` per process.
 
-SDL3, SFML 2.6 and 3, raylib and GLUT are on the roadmap.
+SDL3, SFML 2.6 and 3, and raylib are on the roadmap.
 
 ## FSR 2 on MetalFX
 
@@ -546,7 +583,8 @@ All of OpenGL 4.6 core, plus:
 
 ## Known limits
 
-- Core profile only. The compatibility profile is partly there (the alpha test, rectangle textures and a few others old games need) but `glBegin`, display lists and the fixed-function pipeline are not (more compatibility features are on the roadmap).
+- The compatibility profile covers what old programs mostly use: `glBegin` and `glEnd`, client-side vertex arrays, quads and polygons, the matrix stacks, fixed-function lighting, `glTexEnv` (including `GL_COMBINE`), texture coordinate generation, fog, point sprites, `glPushAttrib`, front and back polygon modes, display lists, evaluators (`glMap`, `glEvalMesh`), selection with `glRenderMode(GL_SELECT)`, `glRasterPos`, `glDrawPixels`, `glBitmap`, `glCopyPixels`, the luminance and alpha texture formats, and old GLSL (1.10 to 1.30) that reads `gl_ModelViewMatrix` and the other built-ins. Missing: feedback mode (it returns nothing), the accumulation buffer, colour-index mode, and depth or stencil through `glDrawPixels` and `glCopyPixels`. Line and polygon stipple and edge flags are accepted but not drawn. `GL_APPLE_client_storage` copies the texture rather than reading the application's memory, which the extension allows.
+- CGL and AGL contexts draw offscreen, into framebuffer objects. Putting one in a window, which is what `NSOpenGLView` and `NSOpenGLContext` do through Apple's private `CGLSetSurface`, isn't done yet; neither are AGL's Carbon windows, which no longer exist.
 - Apps built for Apple's OpenGL need relinking against MooGL. Drop-in replacement of the system framework is on the roadmap.
 - Mesh shaders with per-primitive `gl_Layer`: IDKEngine's mesh-shader point shadows drop a few triangles, differently from run to run. Seven smaller tests of the same pattern pass, so it looks like a Metal driver issue. The vertex-shader path is not affected.
 

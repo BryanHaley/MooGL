@@ -25,9 +25,17 @@
 
 #include "MGLContext.h"
 
+#include <dlfcn.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
+
+// the compatibility profile calls this test makes; libmoogl exports them
+#define GL_QUADS 0x0007
+void glBegin(GLenum mode);
+void glEnd(void);
+void glVertex2f(GLfloat x, GLfloat y);
+void glColor3f(GLfloat r, GLfloat g, GLfloat b);
 
 static int fails;
 
@@ -105,6 +113,10 @@ int main(void)
 {
     unsigned char a[4], b[4];
     int w, h;
+
+    // AppKit's application object; the toolkit has to be the one to make it
+    void **app = (void **)dlsym(RTLD_DEFAULT, "NSApp");
+    check(app == NULL || *app == NULL, "loading MooGL leaves the application object to the toolkit");
 
     if (!glfwInit())
         return 77;
@@ -193,6 +205,19 @@ int main(void)
         }
         MGLget(NULL, MGL_STAT_RENDER_PASSES, &after);
         check(after - before == 3, "a clear, a draw and a swap make one render pass");
+
+        // GL_BACK is what double-buffered code draws to; a swap still presents
+        glDrawBuffer(GL_BACK);
+        MGLget(NULL, MGL_STAT_FRAMES_PRESENTED, &before);
+        for (int frame = 0; frame < 3; frame++)
+        {
+            glClear(GL_COLOR_BUFFER_BIT);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+            glfwSwapBuffers(window);
+        }
+        MGLget(NULL, MGL_STAT_FRAMES_PRESENTED, &after);
+        check(after - before == 3, "with glDrawBuffer(GL_BACK) every swap shows the frame");
+        glDrawBuffer(GL_FRONT);
     }
 
     check(glGetError() == GL_NO_ERROR, "no GL errors");
@@ -216,6 +241,35 @@ int main(void)
 
         glfwMakeContextCurrent(window);
         glfwDestroyWindow(shared);
+    }
+
+    // a window that asks for no profile, the way GLUT-era programs do, gets
+    // the old calls
+    glfwDefaultWindowHints();
+    glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+    GLFWwindow *legacy = glfwCreateWindow(64, 64, "legacy", NULL, NULL);
+    check(legacy != NULL, "a window with the default hints makes a context");
+    if (legacy)
+    {
+        GLint mask = 0;
+        unsigned char p[4];
+
+        glfwMakeContextCurrent(legacy);
+        glGetIntegerv(GL_CONTEXT_PROFILE_MASK, &mask);
+        check(mask == GL_CONTEXT_COMPATIBILITY_PROFILE_BIT, "it is a compatibility context");
+
+        glClearColor(1, 0, 0, 1);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glColor3f(0, 1, 0);
+        glBegin(GL_QUADS);
+        glVertex2f(-1, -1); glVertex2f(1, -1); glVertex2f(1, 1); glVertex2f(-1, 1);
+        glEnd();
+        pixel(32, 32, p);
+        check(green(p), "glBegin and glEnd draw in it");
+        check(glGetError() == GL_NO_ERROR, "no GL errors in it");
+
+        glfwMakeContextCurrent(window);
+        glfwDestroyWindow(legacy);
     }
 
     glfwTerminate();

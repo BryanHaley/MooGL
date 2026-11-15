@@ -509,6 +509,13 @@ static void prepareCPURead(GLMContext ctx, Buffer *ptr)
         ctx->mtl_funcs.mtlFlush(ctx, true);
 }
 
+// the buffer's contents, safe to read on the CPU
+const void *mglBufferCPUData(GLMContext ctx, Buffer *ptr)
+{
+    prepareCPURead(ctx, ptr);
+    return (const void *)ptr->data.buffer_data;
+}
+
 static bool clearBufferData(GLMContext ctx, Buffer *ptr, GLenum internalformat, GLintptr offset, GLsizeiptr size, GLenum format, GLenum type, const void *data)
 {
     ERROR_CHECK_RETURN_VALUE(checkClearInternalFormat(internalformat), GL_INVALID_ENUM, false);

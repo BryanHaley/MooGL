@@ -47,10 +47,9 @@ static GLMContext _last_ctx = NULL;
 /* Declared in MGLRenderer.m */
 extern void* CppCreateMGLRendererHeadless(void *glm_ctx);
 
-/* Auto-initialize MGL with headless renderer when library loads.
- * Headless = offscreen rendering, QEMU blits the framebuffer to screen.
+/* A headless context for GL calls made with none current. Not made at load:
+ * its NSView would create NSApp before SDL or GLFW can make the app foreground.
  */
-__attribute__((constructor))
 static void mgl_auto_init(void) {
     if (_ctx == NULL) {
         _ctx = createGLMContext(GL_RGBA, GL_UNSIGNED_BYTE,
@@ -179,6 +178,15 @@ GLMContext createGLMContextShared(GLenum format, GLenum type,
                                   GLenum depth_format, GLenum depth_type,
                                   GLenum stencil_format, GLenum stencil_type,
                                   GLMContext share)
+{
+    return createGLMContextProfile(format, type, depth_format, depth_type, stencil_format, stencil_type, share,
+                                   GL_CONTEXT_CORE_PROFILE_BIT);
+}
+
+GLMContext createGLMContextProfile(GLenum format, GLenum type,
+                                   GLenum depth_format, GLenum depth_type,
+                                   GLenum stencil_format, GLenum stencil_type,
+                                   GLMContext share, GLbitfield profile)
 {
     GLMContext ctx = (GLMContext)malloc(sizeof(GLMContextRec));
     GLMContext save = _ctx;
@@ -448,7 +456,18 @@ GLMContext createGLMContextShared(GLenum format, GLenum type,
 
     if (!err)
         MGL_ERR("MGL Error: glslang would not initialise; shader compilation will fail\n");
-    
+
+#ifdef MGL_COMPAT_CONTEXTS
+    if (profile & GL_CONTEXT_COMPATIBILITY_PROFILE_BIT)
+    {
+        mglCompatInit(ctx);
+        if (ctx->compat)
+            STATE_VAR(context_profile_mask) = GL_CONTEXT_COMPATIBILITY_PROFILE_BIT;
+    }
+#else
+    (void)profile;
+#endif
+
     _ctx = save;
 
     return ctx;
@@ -493,6 +512,7 @@ void MGLget(GLMContext ctx, GLenum param, GLuint *data)
         case MGL_STAT_CPU_EXPANSIONS: *data = ctx->stats.cpu_expansions; break;
         case MGL_STAT_PROGRAM_REBUILDS: *data = ctx->stats.program_rebuilds; break;
         case MGL_STAT_ATTRIB_CONVERSIONS: *data = ctx->stats.attrib_conversions; break;
+        case MGL_STAT_FRAMES_PRESENTED: *data = ctx->stats.frames_presented; break;
 
         default:
             // MGLget is an MGL entry point, not GL, so there is no error to set
@@ -616,6 +636,10 @@ void destroyGLMContext(GLMContext ctx)
     if (ctx->state.program)
         mglUseProgram(ctx, 0);
 
+#ifdef MGL_COMPAT_CONTEXTS
+    mglCompatFree(ctx);
+#endif
+
     bool last = leaveShareGroup(ctx);
     MGLShareGroup *group = ctx->state.share;
 
@@ -648,6 +672,11 @@ void destroyGLMContext(GLMContext ctx)
     freeTable(ctx, &ctx->state.share->sampler_table, freeSamplerObj);
 
     mglFreeHeldObjects(ctx);
+
+#ifdef MGL_COMPAT_CONTEXTS
+    mglCompatFreeListTable(ctx->state.share->compat_lists);
+    ctx->state.share->compat_lists = NULL;
+#endif
 
     while (ctx->state.share->sync_list)
     {

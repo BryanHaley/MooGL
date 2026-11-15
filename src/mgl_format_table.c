@@ -21,6 +21,7 @@
  */
 
 #include "mgl_format_table.h"
+#include "mgl_legacy_enums.h"
 #include "pixel_utils.h"
 #include <stdlib.h>
 #include <string.h>
@@ -45,7 +46,7 @@
 #define GL_LUMINANCE8                     0x8040
 #endif
 #ifndef GL_LUMINANCE16
-#define GL_LUMINANCE16                    0x8048
+#define GL_LUMINANCE16                    0x8042
 #endif
 #ifndef GL_LUMINANCE8_ALPHA8
 #define GL_LUMINANCE8_ALPHA8              0x8045
@@ -518,6 +519,10 @@ static const MGLFormatDesc gl_table[] = {
     { GL_LUMINANCE8_ALPHA8,        _INV, MTLPixelFormatRG8Unorm,   1,1, 2, _CF, {8,0,0,8,0,0}, _BRG,  GL_RG,               GL_UNSIGNED_BYTE, false, true, true, "GL_LUMINANCE8_ALPHA8" },
     { GL_LUMINANCE_ALPHA16F_ARB,   _INV, MTLPixelFormatRG16Float,  1,1, 4, _CF, {16,0,0,16,0,0}, _BRG, GL_RG,              GL_HALF_FLOAT,     false, true, true, "GL_LUMINANCE_ALPHA16F_ARB" },
     { GL_LUMINANCE_ALPHA32F_ARB,   _INV, MTLPixelFormatRG32Float,  1,1, 8, _CF, {32,0,0,32,0,0}, _BRG, GL_RG,              GL_FLOAT,          false, true, true, "GL_LUMINANCE_ALPHA32F_ARB" },
+    { GL_LUMINANCE16_ALPHA16,      _INV, MTLPixelFormatRG16Unorm,  1,1, 4, _CF, {16,0,0,16,0,0}, _BRG, GL_RG,              GL_UNSIGNED_SHORT, false, true, true, "GL_LUMINANCE16_ALPHA16" },
+    { GL_INTENSITY,                _INV, MTLPixelFormatR8Unorm,    1,1, 1, _CF, {8,0,0,0,0,0}, _BR,   GL_RED,              GL_UNSIGNED_BYTE, false, true, true, "GL_INTENSITY" },
+    { GL_INTENSITY8,               _INV, MTLPixelFormatR8Unorm,    1,1, 1, _CF, {8,0,0,0,0,0}, _BR,   GL_RED,              GL_UNSIGNED_BYTE, false, true, true, "GL_INTENSITY8" },
+    { GL_INTENSITY16,              _INV, MTLPixelFormatR16Unorm,   1,1, 2, _CF, {16,0,0,0,0,0}, _BR,  GL_RED,              GL_UNSIGNED_SHORT, false, true, true, "GL_INTENSITY16" },
 
     /* alternate integer enums */
     { GL_ALPHA8UI_EXT,             MTLPixelFormatR8Uint,          _INV, 1,1, 1, _CU, {0,0,0,8,0,0},  _BR, GL_RED_INTEGER, GL_UNSIGNED_BYTE, false, true, false, "GL_ALPHA8UI_EXT" },
@@ -670,6 +675,33 @@ const MGLFormatDesc *mglFormatDesc(GLenum gl_internal_format)
             return &gl_table[i];
     }
     return &_unknown_gl;
+}
+
+int mglLegacyFormatClass(GLenum internalformat)
+{
+    switch (internalformat)
+    {
+        case GL_ALPHA: case GL_ALPHA4: case GL_ALPHA8: case GL_ALPHA12: case GL_ALPHA16:
+        case GL_ALPHA16F_ARB: case GL_ALPHA32F_ARB:
+            return 2;
+        case GL_LUMINANCE: case GL_LUMINANCE4: case GL_LUMINANCE8: case GL_LUMINANCE12: case GL_LUMINANCE16:
+        case GL_LUMINANCE16F_ARB: case GL_LUMINANCE32F_ARB:
+            return 3;
+        case GL_LUMINANCE_ALPHA: case GL_LUMINANCE4_ALPHA4: case GL_LUMINANCE6_ALPHA2: case GL_LUMINANCE8_ALPHA8:
+        case GL_LUMINANCE12_ALPHA4: case GL_LUMINANCE12_ALPHA12: case GL_LUMINANCE16_ALPHA16:
+        case GL_LUMINANCE_ALPHA16F_ARB: case GL_LUMINANCE_ALPHA32F_ARB:
+            return 4;
+        case GL_INTENSITY: case GL_INTENSITY4: case GL_INTENSITY8: case GL_INTENSITY12: case GL_INTENSITY16:
+            return 5;
+    }
+
+    switch (mglFormatDesc(internalformat)->base_format)
+    {
+        case GL_RGBA: case GL_BGRA:
+            return 0;
+    }
+
+    return 1;
 }
 
 const MGLMetalFormatDesc *mglMetalFormatDesc(uint16_t mtl_format)

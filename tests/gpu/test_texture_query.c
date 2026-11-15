@@ -723,3 +723,41 @@ GPU_TEST(texture_query, target_setters_check_their_arguments)
 
     glDeleteTextures(2, tex);
 }
+
+GPU_TEST(texture_query, proxy_textures_report_what_would_fit)
+{
+    GLint w = -1, h = -1, fmt = -1, max = 0, real_w = -1;
+    GLuint tex = 0;
+
+    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max);
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 4, 4, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    mgl_drain_errors();
+
+    glTexImage2D(GL_PROXY_TEXTURE_2D, 0, GL_RGBA8, 64, 32, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    CHECK_EQ_UINT(glGetError(), GL_NO_ERROR);
+    glGetTexLevelParameteriv(GL_PROXY_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
+    glGetTexLevelParameteriv(GL_PROXY_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
+    glGetTexLevelParameteriv(GL_PROXY_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &fmt);
+    CHECK_EQ_UINT(glGetError(), GL_NO_ERROR);
+    CHECK(w == 64 && h == 32 && fmt == GL_RGBA8);
+
+    // the bound texture is not touched
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &real_w);
+    CHECK_EQ_INT(real_w, 4);
+
+    // too big: no error, and the proxy reads as zero
+    glTexImage2D(GL_PROXY_TEXTURE_2D, 0, GL_RGBA8, max + 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    CHECK_EQ_UINT(glGetError(), GL_NO_ERROR);
+    glGetTexLevelParameteriv(GL_PROXY_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
+    glGetTexLevelParameteriv(GL_PROXY_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &fmt);
+    CHECK(w == 0 && fmt == 0);
+
+    glTexStorage2D(GL_PROXY_TEXTURE_2D, 3, GL_RGBA8, 64, 64);
+    glGetTexLevelParameteriv(GL_PROXY_TEXTURE_2D, 2, GL_TEXTURE_WIDTH, &w);
+    CHECK_EQ_UINT(glGetError(), GL_NO_ERROR);
+    CHECK_EQ_INT(w, 16);
+
+    glDeleteTextures(1, &tex);
+}

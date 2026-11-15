@@ -50,7 +50,7 @@ make -j"$(sysctl -n hw.ncpu)" build_dir=build/sdk MOOGL_VERSION="$version" lib
 otool -L "$build/libSDL2-2.0.0.dylib" | grep -q libmoogl ||
     { echo "libSDL2 is not linked to MooGL: submodules/SDL2 is not MooGL's SDL2 fork" >&2; exit 1; }
 
-libs="libmoogl.dylib libglfw.dylib libSDL2-2.0.0.dylib libffx_fsr2_api.dylib"
+libs="libmoogl.dylib libglfw.dylib libSDL2-2.0.0.dylib libglut.3.dylib libGLU.1.dylib libffx_fsr2_api.dylib"
 
 if [ -n "${MOOGL_SIGN_IDENTITY:-}" ]; then
     for lib in $libs; do
@@ -66,7 +66,7 @@ done
 rm -rf "$out"
 mkdir -p "$out/lib/cmake/MooGL" "$out/include/GL" "$out/include/KHR" "$out/include/GLFW" \
     "$out/include/ffx-fsr2/gl" "$out/include/ffx-fsr2/shaders" "$out/include/ffx-fsr2/glad" \
-    "$out/include/imgui" "$out/examples" "$out/licenses"
+    "$out/include/imgui" "$out/include/GLUT" "$out/include/AGL" "$out/examples" "$out/licenses"
 
 for lib in $libs; do
     cp "$build/$lib" "$out/lib/"
@@ -76,12 +76,18 @@ cp "$build/libimgui.a" "$out/lib/"
 ln -s libglfw.dylib "$out/lib/libglfw.3.dylib"
 ln -s libSDL2-2.0.0.dylib "$out/lib/libSDL2-2.0.dylib"
 ln -s libSDL2-2.0.0.dylib "$out/lib/libSDL2.dylib"
+ln -s libglut.3.dylib "$out/lib/libglut.dylib"
+ln -s libGLU.1.dylib "$out/lib/libGLU.dylib"
 
 cp include/GL/glcorearb.h "$out/include/GL/"
 cp include/KHR/khrplatform.h "$out/include/KHR/"
 cp include/MGLContext.h "$out/include/"
 cp submodules/glfw/include/GLFW/glfw3.h submodules/glfw/include/GLFW/glfw3native.h "$out/include/GLFW/"
 cp -R "$build/sdl2/install/include/SDL2" "$out/include/"
+cp submodules/freeglut/include/GL/*.h "$out/include/GL/"
+cp tools/sdk/GLUT/glut.h "$out/include/GLUT/"
+cp submodules/glu/include/GL/glu.h tools/sdk/GL/gl.h "$out/include/GL/"
+cp include/AGL/agl.h "$out/include/AGL/"
 cp -R "$build/sdl2/install/lib/cmake/SDL2" "$out/lib/cmake/"
 cp "$build/sdl2/install/lib/libSDL2main.a" "$out/lib/"
 
@@ -105,7 +111,7 @@ else()
     endif()
 endif()
 EOF
-cp -R examples/triangle examples/sdl2_triangle examples/imgui examples/imgui_sdl2 "$out/examples/"
+cp -R examples/triangle examples/sdl2_triangle examples/imgui examples/imgui_sdl2 examples/glut_teapot "$out/examples/"
 rm -rf "$out"/examples/*/build
 
 cp LICENSE "$out/licenses/MooGL.txt"
@@ -117,6 +123,9 @@ cp submodules/glslang/LICENSE.txt "$out/licenses/glslang.txt"
 cp submodules/FidelityFX-FSR2-OpenGL/LICENSE.txt "$out/licenses/FidelityFX-FSR2.txt"
 cp submodules/SDL2/LICENSE.txt "$out/licenses/SDL2.txt"
 cp submodules/imgui/LICENSE.txt "$out/licenses/DearImGui.txt"
+cp submodules/freeglut/COPYING "$out/licenses/freeglut.txt"
+# GLU has no licence file; it is the comment at the top of each source
+sed -n '2,/^ \*\//s/^ \*\{0,1\} \{0,1\}//p' submodules/glu/src/libutil/project.c | sed '$d' > "$out/licenses/GLU.txt"
 
 if command -v dotnet >/dev/null; then
     BUILD_DIR="$build" tools/fsr2_csharp/build.sh
@@ -129,10 +138,11 @@ cat > "$out/README.md" <<EOF
 
 OpenGL 4.6 core on Metal, for Apple silicon Macs on macOS $MACOSX_DEPLOYMENT_TARGET or later.
 
-- \`lib/\`: libmoogl (OpenGL), libglfw and libSDL2 (built to make MooGL contexts),
+- \`lib/\`: libmoogl (OpenGL), libglfw, libSDL2 and libglut (freeglut), built to make MooGL contexts, libGLU,
   libimgui (Dear ImGui with docking, drawing with MooGL) and the FSR 2 libraries on MetalFX
-- \`include/\`: GL/glcorearb.h, GLFW, SDL2, Dear ImGui, MGLContext.h, and AMD's FSR 2 headers
-- \`lib/cmake\`: \`find_package(MooGL)\` with MooGL::GL, MooGL::glfw, MooGL::imgui and MooGL::FSR2, and
+- \`include/\`: GL/glcorearb.h, GLFW, SDL2, GLUT (\`GL/freeglut.h\`, \`GLUT/glut.h\`), \`GL/glu.h\`, AGL/agl.h, Dear ImGui,
+  MGLContext.h, and AMD's FSR 2 headers
+- \`lib/cmake\`: \`find_package(MooGL)\` with MooGL::GL, MooGL::glfw, MooGL::glut, MooGL::GLU, MooGL::imgui and MooGL::FSR2, and
   \`find_package(SDL2)\`
 - \`examples/\`: \`cmake -B build -DCMAKE_PREFIX_PATH=\$PWD/../.. && cmake --build build\`
 - \`nuget/\`: the FFX_FSR2 C# package for macOS, if present
@@ -144,6 +154,8 @@ EOF
 cc -O1 -o "$build/triangle" examples/triangle/main.c -I"$out/include" -L"$out/lib" -lglfw -lmoogl \
     -Wl,-rpath,"$out/lib"
 cc -O1 -o "$build/sdl2_triangle" examples/sdl2_triangle/main.c -I"$out/include" -L"$out/lib" -lSDL2 -lmoogl \
+    -Wl,-rpath,"$out/lib"
+cc -O1 -o "$build/glut_teapot" examples/glut_teapot/main.c -I"$out/include" -L"$out/lib" -lglut -lmoogl \
     -Wl,-rpath,"$out/lib"
 c++ -std=c++17 -O1 -o "$build/imgui_demo" examples/imgui/main.cpp -I"$out/include" -I"$out/include/imgui" \
     -L"$out/lib" -limgui -lglfw -lmoogl -Wl,-rpath,"$out/lib"

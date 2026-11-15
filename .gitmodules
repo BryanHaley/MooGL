@@ -44,3 +44,18 @@
 	path = submodules/imgui
 	url = https://github.com/ocornut/imgui.git
 	branch = docking
+[submodule "submodules/quake"]
+	path = submodules/quake
+	url = https://github.com/BryanHaley/Quake.git
+	branch = mgl
+[submodule "submodules/xash3d-fwgs"]
+	path = submodules/xash3d-fwgs
+	url = https://github.com/BryanHaley/xash3d-fwgs.git
+	branch = mgl
+[submodule "submodules/hlsdk-portable"]
+	path = submodules/hlsdk-portable
+	url = https://github.com/FWGS/hlsdk-portable.git
+[submodule "submodules/freeglut"]
+	path = submodules/freeglut
+	url = https://github.com/BryanHaley/freeglut.git
+	branch = mgl

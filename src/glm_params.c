@@ -41,6 +41,8 @@ void getMacOSDefaults(GLMContext glm_ctx)
     CGLError (*CGLDestroyPixelFormat)(CGLPixelFormatObj pix);
     CGLError (*CGLCreateContext)(CGLPixelFormatObj pix, CGLContextObj OPENGL_NULLABLE share, CGLContextObj OPENGL_NULLABLE * OPENGL_NONNULL ctx);
     CGLError (*CGLDestroyContext)(CGLContextObj ctx);
+    // libmoogl has its own CGL, so Apple's is looked up by name
+    CGLError (*CGLSetCurrentContext)(CGLContextObj ctx);
     void (*glGetIntegerv)(GLenum param, GLuint *params);
     void (*glGetDoublev)(GLenum param, GLdouble *params);
     void (*glGetFloatv)(GLenum param, GLfloat *params);
@@ -62,6 +64,7 @@ void getMacOSDefaults(GLMContext glm_ctx)
     CGLDestroyPixelFormat = dlsym(OpenGL, "CGLDestroyPixelFormat"); assert(CGLDestroyPixelFormat);
     CGLCreateContext = dlsym(OpenGL, "CGLCreateContext"); assert(CGLCreateContext);
     CGLDestroyContext = dlsym(OpenGL, "CGLDestroyContext"); assert(CGLDestroyContext);
+    CGLSetCurrentContext = dlsym(OpenGL, "CGLSetCurrentContext"); assert(CGLSetCurrentContext);
     glGetIntegerv = dlsym(libGL, "glGetIntegerv"); assert(glGetIntegerv);
     glGetDoublev = dlsym(libGL, "glGetDoublev"); assert(glGetDoublev);
     glGetFloatv = dlsym(libGL, "glGetFloatv"); assert(glGetFloatv);

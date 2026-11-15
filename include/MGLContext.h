@@ -32,7 +32,8 @@ enum {
     MGL_STAT_BUFFER_REBINDS,        // stage buffer lists rebound on the encoder
     MGL_STAT_CPU_EXPANSIONS,        // draws whose indices were expanded on the CPU
     MGL_STAT_PROGRAM_REBUILDS,      // times a program's Metal functions were remade
-    MGL_STAT_ATTRIB_CONVERSIONS     // vertex attributes converted to a format Metal reads
+    MGL_STAT_ATTRIB_CONVERSIONS,    // vertex attributes converted to a format Metal reads
+    MGL_STAT_FRAMES_PRESENTED       // swaps that showed a frame in the window
 };
 
 #ifdef __cplusplus
@@ -52,6 +53,15 @@ GLMContext createGLMContextShared(GLenum format, GLenum type,
                                   GLenum depth_format, GLenum depth_type,
                                   GLenum stencil_format, GLenum stencil_type,
                                   GLMContext share);
+
+// As createGLMContextShared, with the profile: GL_CONTEXT_CORE_PROFILE_BIT,
+// or GL_CONTEXT_COMPATIBILITY_PROFILE_BIT for a context that also takes what
+// the core profile removed, from glBegin and the matrix stacks to fixed-
+// function lighting, display lists and selection.
+GLMContext createGLMContextProfile(GLenum format, GLenum type,
+                                   GLenum depth_format, GLenum depth_type,
+                                   GLenum stencil_format, GLenum stencil_type,
+                                   GLMContext share, GLbitfield profile);
 
 GLuint sizeForFormatType(GLenum format, GLenum type);
 GLuint bicountForFormatType(GLenum format, GLenum type, GLenum component);

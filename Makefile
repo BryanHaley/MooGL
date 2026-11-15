@@ -236,7 +236,7 @@ $(mgl_toolchain_lib): $(mgl_toolchain_obj)
 
 # GLFW's own build, made by tools/build_deps.sh; rebuilt when its sources change
 $(glfw_dir)/build/src/libglfw3.a: $(wildcard $(glfw_dir)/src/*.c $(glfw_dir)/src/*.m $(glfw_dir)/src/*.h)
-	cmake --build $(glfw_dir)/build
+	env -u MAKEFLAGS -u MFLAGS -u MAKELEVEL cmake --build $(glfw_dir)/build
 
 # Build GLFW shared library from pre-built static library
 $(build_dir)/libglfw.dylib: $(glfw_dir)/build/src/libglfw3.a $(mgl_lib)
@@ -266,6 +266,43 @@ $(fsr2_lib): src/fsr2/ffx_fsr2_metalfx.mm include/MGLContext.h $(mgl_lib)
 fsr2: $(fsr2_lib)
 
 # SDL2 with a MooGL backend in place of NSOpenGL (submodules/SDL2, branch mgl),
+# GLUT: freeglut's Cocoa backend, with MooGL in place of NSOpenGL
+glut_dir := submodules/freeglut
+glut_lib := $(build_dir)/libglut.3.dylib
+
+$(glut_lib): $(mgl_lib) $(wildcard $(glut_dir)/src/cocoa/*.m) $(glut_dir)/CMakeLists.txt
+	cmake -S $(glut_dir) -B $(build_dir)/freeglut -Wno-dev -DCMAKE_BUILD_TYPE=Release \
+		-DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_C_FLAGS=-w -DCMAKE_OBJC_FLAGS=-w \
+		-DFREEGLUT_COCOA=ON -DFREEGLUT_BUILD_STATIC_LIBS=OFF -DFREEGLUT_BUILD_DEMOS=OFF -DCMAKE_SKIP_BUILD_RPATH=ON \
+		-DCMAKE_SHARED_LINKER_FLAGS=-Wl,-rpath,@loader_path -DMOOGL_LIBRARY=$(abspath $(mgl_lib))
+	env -u MAKEFLAGS -u MFLAGS -u MAKELEVEL cmake --build $(build_dir)/freeglut -j8
+	cp -L $(build_dir)/freeglut/lib/libglut.3.dylib $@
+	ln -sf libglut.3.dylib $(build_dir)/libglut.dylib
+
+# GLU: Mesa's, linked to libmoogl in place of OpenGL.framework
+glu_dir := submodules/glu
+glu_lib := $(build_dir)/libGLU.1.dylib
+glu_srcs := $(filter-out %/priorityq-heap.c, $(wildcard $(glu_dir)/src/libutil/*.c $(glu_dir)/src/libtess/*.c)) \
+	$(wildcard $(glu_dir)/src/libnurbs/*/*.cc)
+glu_objs := $(patsubst $(glu_dir)/src/%, $(build_dir)/glu/%.o, $(glu_srcs))
+glu_flags := -O2 -arch arm64 -w -fvisibility=hidden -DLIBRARYBUILD -DNDEBUG \
+	'-DGLAPI=__attribute__((visibility("default"))) extern' -Itools/sdk -I$(glu_dir)/include \
+	-I$(glu_dir)/src/include -I$(glu_dir)/src/libnurbs/internals -I$(glu_dir)/src/libnurbs/interface \
+	-I$(glu_dir)/src/libnurbs/nurbtess
+
+$(build_dir)/glu/%.c.o: $(glu_dir)/src/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(glu_flags) -c $< -o $@
+
+$(build_dir)/glu/%.cc.o: $(glu_dir)/src/%.cc
+	@mkdir -p $(dir $@)
+	$(CXX) $(glu_flags) -c $< -o $@
+
+$(glu_lib): $(glu_objs) $(mgl_lib)
+	$(CXX) -dynamiclib -arch arm64 -o $@ $(glu_objs) -install_name @rpath/libGLU.1.dylib \
+		-compatibility_version 5.0.0 -current_version 5.1.0 -L$(build_dir) -lmoogl -Wl,-rpath,@loader_path
+	ln -sf libGLU.1.dylib $(build_dir)/libGLU.dylib
+
 # installed into build/sdl2/install for its headers and CMake package
 sdl2_dir := submodules/SDL2
 sdl2_install := $(build_dir)/sdl2/install
@@ -298,7 +335,7 @@ $(imgui_lib): $(imgui_srcs) $(sdl2_lib)
 	done
 	libtool -static -o $@ $(build_dir)/imgui/*.o
 
-lib: $(mgl_lib) $(mgl_es_lib) $(build_dir)/libglfw.dylib $(fsr2_lib) $(sdl2_lib) $(imgui_lib)
+lib: $(mgl_lib) $(mgl_es_lib) $(build_dir)/libglfw.dylib $(fsr2_lib) $(sdl2_lib) $(imgui_lib) $(glut_lib) $(glu_lib)
 
 toolchain: $(mgl_toolchain_lib)
 
@@ -374,15 +411,31 @@ $(build_dir)/sdl2_triangle: examples/sdl2_triangle/main.c $(mgl_lib) $(sdl2_lib)
 $(build_dir)/test_sdl_share: tests/window/test_sdl_share.c $(mgl_lib) $(sdl2_lib)
 	$(CC) -o $@ $< -Iinclude -I$(sdl2_install)/include -L$(build_dir) -lSDL2-2.0.0 $(window_libs)
 
+$(build_dir)/test_cgl: tests/window/test_cgl.c $(mgl_lib)
+	$(CC) -o $@ $< -Iinclude $(window_libs)
+
+$(build_dir)/test_glut: tests/window/test_glut.c $(mgl_lib) $(glut_lib)
+	$(CC) -o $@ $< -I$(glut_dir)/include -L$(build_dir) -lglut $(window_libs)
+
+$(build_dir)/test_glu: tests/window/test_glu.c $(mgl_lib) $(glu_lib)
+	$(CC) -o $@ $< -L$(build_dir) -lGLU $(window_libs)
+
+$(build_dir)/test_sdl_renderer: tests/window/test_sdl_renderer.c $(mgl_lib) $(sdl2_lib)
+	$(CC) -o $@ $< -Iinclude -I$(sdl2_install)/include -L$(build_dir) -lSDL2-2.0.0 $(window_libs)
+
 $(build_dir)/test_imgui_viewports: tests/window/test_imgui_viewports.cpp $(imgui_lib) $(mgl_lib) $(build_dir)/libglfw.dylib
 	$(CXX) -std=c++17 -o $@ $< $(imgui_cflags) -L$(build_dir) -limgui -lglfw $(window_libs)
 
 $(build_dir)/test_imgui_viewports_sdl2: tests/window/test_imgui_viewports.cpp $(imgui_lib) $(mgl_lib) $(sdl2_lib)
 	$(CXX) -std=c++17 -DMGL_TEST_SDL2 -o $@ $< $(imgui_cflags) -L$(build_dir) -limgui -lSDL2-2.0.0 $(window_libs)
 
-window-test: $(build_dir)/test_window $(build_dir)/test_sdl_share $(build_dir)/test_imgui_viewports $(build_dir)/test_imgui_viewports_sdl2 $(build_dir)/triangle $(build_dir)/sdl2_triangle
+window-test: $(build_dir)/test_window $(build_dir)/test_sdl_share $(build_dir)/test_sdl_renderer $(build_dir)/test_glut $(build_dir)/test_glu $(build_dir)/test_cgl $(build_dir)/test_imgui_viewports $(build_dir)/test_imgui_viewports_sdl2 $(build_dir)/triangle $(build_dir)/sdl2_triangle
 	$(build_dir)/test_window
 	$(build_dir)/test_sdl_share
+	$(build_dir)/test_sdl_renderer
+	$(build_dir)/test_glut
+	$(build_dir)/test_glu
+	$(build_dir)/test_cgl
 	$(build_dir)/test_imgui_viewports
 	$(build_dir)/test_imgui_viewports_sdl2
 	$(build_dir)/triangle --frames 60

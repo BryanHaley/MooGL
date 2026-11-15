@@ -162,6 +162,9 @@ typedef struct {
 /*  lookups — never return NULL                                      */
 /* ---------------------------------------------------------------- */
 const MGLFormatDesc      *mglFormatDesc(GLenum gl_internal_format);
+// how the fixed-function texture environment treats a format: 0 RGBA, 1 RGB,
+// 2 ALPHA, 3 LUMINANCE, 4 LUMINANCE_ALPHA, 5 INTENSITY
+int mglLegacyFormatClass(GLenum internalformat);
 const MGLMetalFormatDesc *mglMetalFormatDesc(uint16_t mtl_format);
 const MGLFormatDesc      *mglFormatDescForMetal(uint16_t mtl_format);
 

@@ -93,6 +93,7 @@ VertexArray *newVAO(GLMContext ctx, GLuint vao)
     bzero((void *)ptr, sizeof(VertexArray));
 
     ptr->name = vao;
+    ptr->dirty_bits = DIRTY_VAO_ATTRIB | DIRTY_VAO_BUFFER_BASE;
     for(int i=0; i<MAX_BINDABLE_BUFFERS; i++) {
         ptr->bindings[i].stride = 16;
     }
@@ -417,7 +418,11 @@ void mglVertexAttribPointer(GLMContext ctx, GLuint index, GLint size, GLenum typ
 
         ptr = STATE(buffers[_ARRAY_BUFFER]);
 
+#ifdef MGL_COMPAT_CONTEXTS
+        ERROR_CHECK_RETURN(ptr || mglCompatClientArraysAllowed(ctx), GL_INVALID_OPERATION);
+#else
         ERROR_CHECK_RETURN(ptr, GL_INVALID_OPERATION);
+#endif
     }
 
     switch(type)
@@ -1048,10 +1053,12 @@ static void setAttribConstant(GLMContext ctx, GLuint index, AttribConstType type
         }
     }
 
-    ac->type = type;
+    // the type picks the vertex format; the values go up with the next draw
+    if (ac->type != type)
+        ctx->state.dirty_bits |= DIRTY_STATE;
 
+    ac->type = type;
     ctx->state.attrib_constant_dirty |= (1 << index);
-    ctx->state.dirty_bits |= DIRTY_STATE;
 }
 
 static void setAttribFloats(GLMContext ctx, GLuint index, const GLfloat *v, int comps)

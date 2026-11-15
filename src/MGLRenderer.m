@@ -261,6 +261,12 @@ static size_t metalUniformLayout(const BufferMap *map, const Buffer *buf, GLubyt
     return vectors * 16;
 }
 
+// a Metal vertex descriptor as plain data, so two can be compared cheaply
+typedef struct {
+    struct { uint64_t offset; uint32_t format, buffer; } attr[31];
+    struct { uint64_t stride; uint32_t rate; uint16_t step, used; } layout[31];
+} MGLVertexLayout;
+
 @implementation MGLRenderer
 {
     NSView *_view;
@@ -485,6 +491,18 @@ static size_t metalUniformLayout(const BufferMap *map, const Buffer *buf, GLubyt
     // the shader blit, for copies Metal's own cannot make
     id<MTLLibrary>             _blitLibrary;
     NSMapTable                *_clipVariants;
+
+    // what the last draw used, on which encoder
+    id<MTLRenderCommandEncoder> _seenEncoder;
+    Program                   *_seenProgram;
+    id                         _seenVS, _seenFS;
+    VertexArray               *_seenVAO;
+
+    // what _pipelineState was built from
+    id<MTLRenderPipelineState> _builtPipeline;
+    Program                   *_builtProgram;
+    id                         _builtVS, _builtFS;
+    MGLVertexLayout            _builtLayout;
     NSMutableDictionary        *_blitPipelines;
 
     // one slice of a 3D texture bound as a 2D image, copied out for each
@@ -1148,6 +1166,10 @@ static inline int mglDebugCompute(void)
                         (map_buffer->target != gl_buffer->target))
                         continue;
 
+                    // the driver's own unnamed buffers all share name zero
+                    if (gl_buffer->name == 0 && map_buffer != gl_buffer)
+                        continue;
+
                     if (buffer_map->buffers[map].stride != stride)
                         continue;
 
@@ -1456,6 +1478,18 @@ static bool bufferSizesFor(Program *program, int stage, const BufferMapList *lis
     free(table);
 }
 
+- (void) bindAttribConstants
+{
+    uint8_t constants[MGL_CONSTANT_ATTRIB_STRIDE];
+
+    fillAttribConstants(ctx, constants);
+
+    [_currentRenderEncoder setVertexBytes:constants
+                                   length:MGL_CONSTANT_ATTRIB_STRIDE
+                                  atIndex:MGL_CONSTANT_ATTRIB_BUFFER_INDEX];
+    ctx->state.attrib_constant_dirty = 0;
+}
+
 - (bool) bindVertexBuffersToCurrentRenderEncoder
 {
     BufferMap *map;
@@ -1466,15 +1500,7 @@ static bool bufferSizesFor(Program *program, int stage, const BufferMapList *lis
     
     MTL_CHECK_RETURN_FALSE(_currentRenderEncoder, GL_INVALID_OPERATION);
 
-    {
-        uint8_t constants[MGL_CONSTANT_ATTRIB_STRIDE];
-
-        fillAttribConstants(ctx, constants);
-
-        [_currentRenderEncoder setVertexBytes:constants
-                                       length:MGL_CONSTANT_ATTRIB_STRIDE
-                                      atIndex:MGL_CONSTANT_ATTRIB_BUFFER_INDEX];
-    }
+    [self bindAttribConstants];
 
     {
         uint32_t sizes[31];
@@ -3296,21 +3322,21 @@ static bool isRGB32BufferFormat(GLenum f)
         }
     }
 
-    // GL takes any RGBA border colour and Metal offers three, so anything
-    // else snaps to the nearest. Refusing the sampler instead would lose the
-    // whole draw over the colour of pixels outside the texture.
+    // GL takes any RGBA border colour and Metal offers three. Any other one
+    // is added in the shader (spvTexBorderF) on top of a transparent black
+    // border, which leaves just the texels inside.
     {
         float r = tex_param->border_color[0];
         float g = tex_param->border_color[1];
         float b = tex_param->border_color[2];
         float a = tex_param->border_color[3];
 
-        if (a < 0.5f)
-            samplerDescriptor.borderColor = MTLSamplerBorderColorTransparentBlack;
-        else if ((r + g + b) / 3.0f < 0.5f)
+        if (r == 0 && g == 0 && b == 0 && a == 1)
             samplerDescriptor.borderColor = MTLSamplerBorderColorOpaqueBlack;
-        else
+        else if (r == 1 && g == 1 && b == 1 && a == 1)
             samplerDescriptor.borderColor = MTLSamplerBorderColorOpaqueWhite;
+        else
+            samplerDescriptor.borderColor = MTLSamplerBorderColorTransparentBlack;
     }
 
     if (target == GL_TEXTURE_RECTANGLE)
@@ -3652,6 +3678,26 @@ static void formatChannels(Texture *tex, id<MTLTexture> base, MTLTextureSwizzle 
     out[1] = MTLTextureSwizzleGreen;
     out[2] = MTLTextureSwizzleBlue;
     out[3] = MTLTextureSwizzleAlpha;
+
+    // the old one- and two-channel formats live in R and RG
+    switch (mglLegacyFormatClass(tex->internalformat))
+    {
+        case 2: // alpha
+            out[0] = out[1] = out[2] = MTLTextureSwizzleZero;
+            out[3] = MTLTextureSwizzleRed;
+            return;
+        case 3: // luminance
+            out[0] = out[1] = out[2] = MTLTextureSwizzleRed;
+            out[3] = MTLTextureSwizzleOne;
+            return;
+        case 4: // luminance and alpha
+            out[0] = out[1] = out[2] = MTLTextureSwizzleRed;
+            out[3] = MTLTextureSwizzleGreen;
+            return;
+        case 5: // intensity
+            out[0] = out[1] = out[2] = out[3] = MTLTextureSwizzleRed;
+            return;
+    }
 
     switch (gl->kind)
     {
@@ -4203,6 +4249,18 @@ static bool isUnsignedSampler(GLenum t)
 
 // The LOD bias and border colour a texture unit's sampling needs and Metal's
 // sampler cannot hold
+static bool isRectSampler(GLenum t)
+{
+    switch (t)
+    {
+        case GL_SAMPLER_2D_RECT: case GL_SAMPLER_2D_RECT_SHADOW: case GL_INT_SAMPLER_2D_RECT:
+        case GL_UNSIGNED_INT_SAMPLER_2D_RECT:
+            return true;
+    }
+
+    return false;
+}
+
 static bool isCubeSampler(GLenum t)
 {
     switch (t)
@@ -4236,6 +4294,16 @@ static MGLTexParam texParamFor(GLMContext ctx, const TextureParameter *p, GLenum
     {
         tp.border = (p->wrap_s == GL_CLAMP_TO_BORDER ? 1u : 0u) | (p->wrap_t == GL_CLAMP_TO_BORDER ? 2u : 0u) |
                     (p->wrap_r == GL_CLAMP_TO_BORDER ? 4u : 0u);
+
+        // how the sampler filters, for working out how much of a float
+        // texture's footprint is border
+        bool mip_near = p->min_filter == GL_NEAREST_MIPMAP_NEAREST || p->min_filter == GL_LINEAR_MIPMAP_NEAREST;
+        bool mip_lin = p->min_filter == GL_NEAREST_MIPMAP_LINEAR || p->min_filter == GL_LINEAR_MIPMAP_LINEAR;
+        bool min_lin = p->min_filter == GL_LINEAR || p->min_filter == GL_LINEAR_MIPMAP_NEAREST ||
+                       p->min_filter == GL_LINEAR_MIPMAP_LINEAR;
+
+        tp.border |= (p->mag_filter == GL_LINEAR ? 16u : 0u) | (min_lin ? 32u : 0u) |
+                     (mip_lin ? 2u << 6 : mip_near ? 1u << 6 : 0u) | (isRectSampler(sampler_type) ? 512u : 0u);
 
         if (is_int)
             memcpy(tp.border_bits, p->border_color_i, sizeof tp.border_bits);
@@ -10061,16 +10129,22 @@ static MTLWinding mtlWindingFor(const Program *p)
 // taken from the descriptor built the usual way.
 #define MGL_PIPELINE_CACHE_MAX 1024
 
-- (id<MTLRenderPipelineState>) cachedPipelineFor: (MTLRenderPipelineDescriptor *) d error: (NSError **) error
+// With a layout, d has no vertex descriptor yet; it gets one only when the
+// pipeline has to be built.
+- (id<MTLRenderPipelineState>) cachedPipelineFor: (MTLRenderPipelineDescriptor *) d
+                                          layout: (const MGLVertexLayout *) layout
+                                           error: (NSError **) error
 {
     Program *p = ctx->state.program;
     bool mesh = mglProgramIsMesh(p);
     id<MTLFunction> fns[4] = { d.vertexFunction, d.fragmentFunction, nil, nil };
-    NSMutableData *key = [NSMutableData dataWithCapacity: 512];
+    uint64_t words[128];
+    int nwords = 0;
+    NSMutableData *key;
     id<MTLRenderPipelineState> pipeline;
     NSArray *hit;
 
-#define KEY(v) do { uint64_t k_ = (uint64_t)(v); [key appendBytes: &k_ length: sizeof k_]; } while (0)
+#define KEY(v) (words[nwords++] = (uint64_t)(v))
 
     if (mesh)
     {
@@ -10088,22 +10162,29 @@ static MTLWinding mtlWindingFor(const Program *p)
     {
         MTLRenderPipelineColorAttachmentDescriptor *c = d.colorAttachments[i];
 
-        KEY(c.pixelFormat); KEY(c.writeMask); KEY(c.blendingEnabled);
+        KEY(c.pixelFormat);
+        if (c.pixelFormat == MTLPixelFormatInvalid)
+            continue;
+        KEY(c.writeMask); KEY(c.blendingEnabled);
         KEY(c.sourceRGBBlendFactor); KEY(c.destinationRGBBlendFactor); KEY(c.rgbBlendOperation);
         KEY(c.sourceAlphaBlendFactor); KEY(c.destinationAlphaBlendFactor); KEY(c.alphaBlendOperation);
     }
     KEY(d.maxTessellationFactor); KEY(d.tessellationPartitionMode); KEY(d.tessellationFactorStepFunction);
     KEY(d.tessellationOutputWindingOrder); KEY(d.tessellationControlPointIndexType);
     KEY(d.tessellationFactorFormat); KEY(d.tessellationFactorScaleEnabled);
-    KEY(d.vertexDescriptor != nil);
-    if (d.vertexDescriptor)
+    KEY(layout ? 2 : d.vertexDescriptor != nil);
+    key = [NSMutableData dataWithBytes: words length: nwords * sizeof words[0]];
+    if (layout)
+        [key appendBytes: layout length: sizeof *layout];
+    else if (d.vertexDescriptor)
         for (int i = 0; i < 31; i++)
         {
             MTLVertexAttributeDescriptor *a = d.vertexDescriptor.attributes[i];
             MTLVertexBufferLayoutDescriptor *l = d.vertexDescriptor.layouts[i];
 
-            KEY(a.format); KEY(a.offset); KEY(a.bufferIndex);
-            KEY(l.stride); KEY(l.stepFunction); KEY(l.stepRate);
+            uint64_t v[6] = { a.format, a.offset, a.bufferIndex, l.stride, l.stepFunction, l.stepRate };
+
+            [key appendBytes: v length: sizeof v];
         }
 #undef KEY
 
@@ -10114,6 +10195,8 @@ static MTLWinding mtlWindingFor(const Program *p)
         return hit[0];
 
     ctx->stats.pipelines_built++;
+    if (layout)
+        d.vertexDescriptor = [self vertexDescriptorFrom: layout];
     pipeline = mesh ? [self meshPipelineFrom: d error: error]
                     : [_device newRenderPipelineStateWithDescriptor: d error: error];
 
@@ -10440,12 +10523,9 @@ static MTLWinding mtlWindingFor(const Program *p)
 }
 
 #pragma mark vertex descriptor
-- (MTLVertexDescriptor *)generateVertexDescriptor
+- (bool) fillVertexLayout: (MGLVertexLayout *) vl
 {
-    MTLVertexDescriptor *vertexDescriptor = [[MTLVertexDescriptor alloc] init];
-    MTL_CHECK_RETURN_VALUE(vertexDescriptor, GL_OUT_OF_MEMORY, NULL);
-
-    [vertexDescriptor reset]; // ??? debug
+    memset(vl, 0, sizeof *vl);
 
     // we can bind a new vertex descriptor without creating a new renderbuffer
     for(int i=0;i<ctx->state.max_vertex_attribs; i++)
@@ -10457,7 +10537,7 @@ static MTLWinding mtlWindingFor(const Program *p)
             if (VAO_ATTRIB_BINDING(i)->buffer == NULL)
             {
                 MGL_NSERR(@"Error: Invalid VAO defined enabled but no buffer bound\n");
-                return NULL;
+                return false;
             }
 
             // Metal has no double vertex format, so the shader reads each GL
@@ -10485,16 +10565,16 @@ static MTLWinding mtlWindingFor(const Program *p)
             mapped_buffer_index = [self getVertexBufferIndexWithAttributeSet: i];
 
             if (mapped_buffer_index < 0)
-                return NULL;
+                return false;
 
             BufferMap *slot = &ctx->state.vertex_buffer_map_list.buffers[mapped_buffer_index];
 
             GLintptr attrib_base = VAO_ATTRIB_BINDING(i)->offset + VAO_ATTRIB_STATE(i).relativeoffset;
 
-            vertexDescriptor.attributes[i].bufferIndex = slot->buffer_base_index;
+            vl->attr[i].buffer = (uint32_t)(slot->buffer_base_index);
             // the slot is bound at its own offset, so this is the rest of the way in
-            vertexDescriptor.attributes[i].offset = attrib_base - slot->offset;
-            vertexDescriptor.attributes[i].format = format;
+            vl->attr[i].offset = (uint64_t)(attrib_base - slot->offset);
+            vl->attr[i].format = (uint32_t)(format);
 
             // a dvec3 or dvec4 is still one GL location; its last doubles
             // come in at doubleHighAttribute(), where the shader looks for them
@@ -10505,41 +10585,41 @@ static MTLWinding mtlWindingFor(const Program *p)
                 ;
             else if (is_double && doubleInputRowsAt(ctx->state.program, (GLuint)i) > 2 && VAO_ATTRIB_STATE(i).size > 2)
             {
-                vertexDescriptor.attributes[high].bufferIndex = slot->buffer_base_index;
-                vertexDescriptor.attributes[high].offset = attrib_base - slot->offset + 16;
-                vertexDescriptor.attributes[high].format = VAO_ATTRIB_STATE(i).size == 4 ? MTLVertexFormatUInt4
-                                                                                         : MTLVertexFormatUInt2;
+                vl->attr[high].buffer = (uint32_t)(slot->buffer_base_index);
+                vl->attr[high].offset = (uint64_t)(attrib_base - slot->offset + 16);
+                vl->attr[high].format = (uint32_t)(VAO_ATTRIB_STATE(i).size == 4 ? MTLVertexFormatUInt4
+                                                                                         : MTLVertexFormatUInt2);
             }
             // the shader wants more than the array gives: z and w are 0 and 1
             else if (is_double && doubleInputRowsAt(ctx->state.program, (GLuint)i) > 2)
             {
                 GLuint rows = doubleInputRowsAt(ctx->state.program, (GLuint)i);
 
-                vertexDescriptor.attributes[high].bufferIndex = MGL_CONSTANT_ATTRIB_BUFFER_INDEX;
-                vertexDescriptor.attributes[high].offset = MGL_CONSTANT_ATTRIB_DEFAULT_D + 16;
-                vertexDescriptor.attributes[high].format = rows == 4 ? MTLVertexFormatUInt4 : MTLVertexFormatUInt2;
-                vertexDescriptor.layouts[MGL_CONSTANT_ATTRIB_BUFFER_INDEX].stride = MGL_CONSTANT_ATTRIB_STRIDE;
-                vertexDescriptor.layouts[MGL_CONSTANT_ATTRIB_BUFFER_INDEX].stepRate = 0;
-                vertexDescriptor.layouts[MGL_CONSTANT_ATTRIB_BUFFER_INDEX].stepFunction = MTLVertexStepFunctionConstant;
+                vl->attr[high].buffer = (uint32_t)(MGL_CONSTANT_ATTRIB_BUFFER_INDEX);
+                vl->attr[high].offset = (uint64_t)(MGL_CONSTANT_ATTRIB_DEFAULT_D + 16);
+                vl->attr[high].format = (uint32_t)(rows == 4 ? MTLVertexFormatUInt4 : MTLVertexFormatUInt2);
+                vl->layout[MGL_CONSTANT_ATTRIB_BUFFER_INDEX].stride = (uint64_t)(MGL_CONSTANT_ATTRIB_STRIDE); vl->layout[MGL_CONSTANT_ATTRIB_BUFFER_INDEX].used = 1;
+                vl->layout[MGL_CONSTANT_ATTRIB_BUFFER_INDEX].rate = (uint32_t)(0);
+                vl->layout[MGL_CONSTANT_ATTRIB_BUFFER_INDEX].step = (uint16_t)(MTLVertexStepFunctionConstant);
             }
 
-            vertexDescriptor.layouts[slot->buffer_base_index].stride = slot->layout_stride;
+            vl->layout[slot->buffer_base_index].stride = (uint64_t)(slot->layout_stride); vl->layout[slot->buffer_base_index].used = 1;
 
             if (slot->constant_step)
             {
                 // GL's stride of zero: every vertex reads the same element
-                vertexDescriptor.layouts[slot->buffer_base_index].stepRate = 0;
-                vertexDescriptor.layouts[slot->buffer_base_index].stepFunction = MTLVertexStepFunctionConstant;
+                vl->layout[slot->buffer_base_index].rate = (uint32_t)(0);
+                vl->layout[slot->buffer_base_index].step = (uint16_t)(MTLVertexStepFunctionConstant);
             }
             else if (slot->divisor)
             {
-                vertexDescriptor.layouts[slot->buffer_base_index].stepRate = slot->divisor;
-                vertexDescriptor.layouts[slot->buffer_base_index].stepFunction = MTLVertexStepFunctionPerInstance;
+                vl->layout[slot->buffer_base_index].rate = (uint32_t)(slot->divisor);
+                vl->layout[slot->buffer_base_index].step = (uint16_t)(MTLVertexStepFunctionPerInstance);
             }
             else
             {
-                vertexDescriptor.layouts[slot->buffer_base_index].stepRate = 1;
-                vertexDescriptor.layouts[slot->buffer_base_index].stepFunction = MTLVertexStepFunctionPerVertex;
+                vl->layout[slot->buffer_base_index].rate = (uint32_t)(1);
+                vl->layout[slot->buffer_base_index].step = (uint16_t)(MTLVertexStepFunctionPerVertex);
             }
         }
 
@@ -10554,38 +10634,73 @@ static MTLWinding mtlWindingFor(const Program *p)
                 default:                 format = MTLVertexFormatFloat4; break;
             }
 
-            vertexDescriptor.attributes[i].bufferIndex = MGL_CONSTANT_ATTRIB_BUFFER_INDEX;
-            vertexDescriptor.attributes[i].offset = i * 16;
-            vertexDescriptor.attributes[i].format = format;
+            vl->attr[i].buffer = (uint32_t)(MGL_CONSTANT_ATTRIB_BUFFER_INDEX);
+            vl->attr[i].offset = (uint64_t)(i * 16);
+            vl->attr[i].format = (uint32_t)(format);
 
             // a double input reads the exact value, as raw bits
             GLuint rows = doubleInputRowsAt(ctx->state.program, (GLuint)i);
 
             if (rows)
             {
-                vertexDescriptor.attributes[i].offset = MGL_CONSTANT_ATTRIB_FLOATS + i * 32;
-                vertexDescriptor.attributes[i].format = rows >= 2 ? MTLVertexFormatUInt4 : MTLVertexFormatUInt2;
+                vl->attr[i].offset = (uint64_t)(MGL_CONSTANT_ATTRIB_FLOATS + i * 32);
+                vl->attr[i].format = (uint32_t)(rows >= 2 ? MTLVertexFormatUInt4 : MTLVertexFormatUInt2);
 
                 if (rows > 2 && doubleHighAttribute(ctx->state.program, (GLuint)i) <= 30)
                 {
                     GLuint high = doubleHighAttribute(ctx->state.program, (GLuint)i);
 
-                    vertexDescriptor.attributes[high].bufferIndex = MGL_CONSTANT_ATTRIB_BUFFER_INDEX;
-                    vertexDescriptor.attributes[high].offset = MGL_CONSTANT_ATTRIB_FLOATS + i * 32 + 16;
-                    vertexDescriptor.attributes[high].format = rows == 4 ? MTLVertexFormatUInt4 : MTLVertexFormatUInt2;
+                    vl->attr[high].buffer = (uint32_t)(MGL_CONSTANT_ATTRIB_BUFFER_INDEX);
+                    vl->attr[high].offset = (uint64_t)(MGL_CONSTANT_ATTRIB_FLOATS + i * 32 + 16);
+                    vl->attr[high].format = (uint32_t)(rows == 4 ? MTLVertexFormatUInt4 : MTLVertexFormatUInt2);
                 }
             }
 
-            vertexDescriptor.layouts[MGL_CONSTANT_ATTRIB_BUFFER_INDEX].stride = MGL_CONSTANT_ATTRIB_STRIDE;
-            vertexDescriptor.layouts[MGL_CONSTANT_ATTRIB_BUFFER_INDEX].stepRate = 0;
-            vertexDescriptor.layouts[MGL_CONSTANT_ATTRIB_BUFFER_INDEX].stepFunction = MTLVertexStepFunctionConstant;
+            vl->layout[MGL_CONSTANT_ATTRIB_BUFFER_INDEX].stride = (uint64_t)(MGL_CONSTANT_ATTRIB_STRIDE); vl->layout[MGL_CONSTANT_ATTRIB_BUFFER_INDEX].used = 1;
+            vl->layout[MGL_CONSTANT_ATTRIB_BUFFER_INDEX].rate = (uint32_t)(0);
+            vl->layout[MGL_CONSTANT_ATTRIB_BUFFER_INDEX].step = (uint16_t)(MTLVertexStepFunctionConstant);
         }
     }
 
     // clear all dirty bits as they have been translated into a vertex descriptor
     ctx->state.vao->dirty_bits = 0;
 
-    return vertexDescriptor;
+    return true;
+}
+
+- (MTLVertexDescriptor *) vertexDescriptorFrom: (const MGLVertexLayout *) vl
+{
+    MTLVertexDescriptor *vd = [[MTLVertexDescriptor alloc] init];
+    MTL_CHECK_RETURN_VALUE(vd, GL_OUT_OF_MEMORY, NULL);
+
+    for (int i = 0; i < 31; i++)
+    {
+        if (vl->attr[i].format)
+        {
+            vd.attributes[i].format = (MTLVertexFormat)vl->attr[i].format;
+            vd.attributes[i].offset = vl->attr[i].offset;
+            vd.attributes[i].bufferIndex = vl->attr[i].buffer;
+        }
+
+        if (vl->layout[i].used)
+        {
+            vd.layouts[i].stride = vl->layout[i].stride;
+            vd.layouts[i].stepFunction = (MTLVertexStepFunction)vl->layout[i].step;
+            vd.layouts[i].stepRate = vl->layout[i].rate;
+        }
+    }
+
+    return vd;
+}
+
+- (MTLVertexDescriptor *)generateVertexDescriptor
+{
+    MGLVertexLayout vl;
+
+    if (![self fillVertexLayout: &vl])
+        return NULL;
+
+    return [self vertexDescriptorFrom: &vl];
 }
 
 #pragma mark utility funcs for processGLState
@@ -11856,6 +11971,25 @@ static bool unitTakesAtomics(GLMContext ctx, int unit)
     if (draw_command && usesBindless(ctx->state.program, _VERTEX_SHADER, _MAX_SHADER_TYPES - 1))
         [self refreshBindless];
 
+    // A program or vertex array bound away and back again before this draw is
+    // no change; glBegin and glEnd do that on every draw.
+    if (draw_command && _currentRenderEncoder && _currentRenderEncoder == _seenEncoder)
+    {
+        Program *p = ctx->state.program;
+        VertexArray *vao = ctx->state.vao;
+
+        if ((ctx->state.dirty_bits & DIRTY_PROGRAM) && p && p == _seenProgram &&
+            ctx->state.program_pipeline == NULL && !(p->dirty_bits & DIRTY_PROGRAM) &&
+            (__bridge id)p->spirv[_VERTEX_SHADER].mtl_function == _seenVS &&
+            (__bridge id)p->spirv[_FRAGMENT_SHADER].mtl_function == _seenFS)
+            ctx->state.dirty_bits &= ~DIRTY_PROGRAM;
+
+        // a new program's buffers are only bound on the encoder with DIRTY_VAO
+        if ((ctx->state.dirty_bits & DIRTY_VAO) && !(ctx->state.dirty_bits & DIRTY_PROGRAM) &&
+            vao && vao == _seenVAO && vao->dirty_bits == 0)
+            ctx->state.dirty_bits &= ~DIRTY_VAO;
+    }
+
     // A pass cannot gain a depth or stencil attachment once it is open, so a
     // draw that needs one where the pass has none starts a new pass
     if (draw_command && _currentRenderEncoder &&
@@ -12022,8 +12156,25 @@ static bool unitTakesAtomics(GLMContext ctx, int unit)
         // with a fragment shader, and Metal refuses that combination.
         bool gs_program = mglProgramHasGeometry(ctx->state.program);
 
-        if (!gs_program &&
-            (dirty_on_entry & (DIRTY_PROGRAM | DIRTY_VAO | DIRTY_FBO | DIRTY_ALPHA_STATE | DIRTY_STATE)))
+        Program *prog = ctx->state.program;
+        bool rebuild = !gs_program &&
+            (dirty_on_entry & (DIRTY_PROGRAM | DIRTY_VAO | DIRTY_FBO | DIRTY_ALPHA_STATE | DIRTY_STATE));
+        bool plain = rebuild && prog && !mglProgramIsMesh(prog) && !prog->tess.active;
+        MGLVertexLayout layout;
+
+        if (plain)
+            RETURN_FALSE_ON_FAILURE([self fillVertexLayout: &layout]);
+
+        // only where the vertex buffers sit moved, which the pipeline doesn't see
+        if (plain && !(dirty_on_entry & (DIRTY_PROGRAM | DIRTY_FBO | DIRTY_ALPHA_STATE | DIRTY_STATE | DIRTY_ALL_BIT)) &&
+            _pipelineState && _pipelineState == _builtPipeline && prog == _builtProgram &&
+            (__bridge id)prog->spirv[_VERTEX_SHADER].mtl_function == _builtVS &&
+            (__bridge id)prog->spirv[_FRAGMENT_SHADER].mtl_function == _builtFS &&
+            !memcmp(&layout, &_builtLayout, sizeof layout))
+        {
+            ctx->state.dirty_bits &= ~(DIRTY_VAO | DIRTY_FBO);
+        }
+        else if (rebuild)
         {
             // create pipeline descriptor
             MTLRenderPipelineDescriptor *pipelineStateDescriptor;
@@ -12036,9 +12187,12 @@ static bool unitTakesAtomics(GLMContext ctx, int unit)
             // create vertex descriptor
             MTLVertexDescriptor *vertexDescriptor;
 
-            vertexDescriptor = mglProgramIsMesh(ctx->state.program) ? [MTLVertexDescriptor new]
-                                                                     : [self generateVertexDescriptor];
-            RETURN_FALSE_ON_NULL(vertexDescriptor);
+            if (mglProgramIsMesh(prog))
+                vertexDescriptor = [MTLVertexDescriptor new];
+            else if (!plain)
+                vertexDescriptor = [self generateVertexDescriptor];
+            if (!plain && vertexDescriptor == nil)
+                return false;
 
             // write masks apply even with blending off
             if (ctx->state.dirty_bits & DIRTY_ALPHA_STATE)
@@ -12052,7 +12206,7 @@ static bool unitTakesAtomics(GLMContext ctx, int unit)
 
             // A tessellation evaluation shader reads control points out of a
             // buffer, so the pipeline has no vertex descriptor at all.
-            if (!(ctx->state.program && ctx->state.program->tess.active))
+            if (!plain && !(ctx->state.program && ctx->state.program->tess.active))
                 pipelineStateDescriptor.vertexDescriptor = vertexDescriptor;
 
             // PROPER AGX VIRTUALIZATION COMPATIBILITY: Fix root cause while maintaining Metal functionality
@@ -12065,12 +12219,17 @@ static bool unitTakesAtomics(GLMContext ctx, int unit)
                 // Force synchronous pipeline creation to avoid completion queue crashes
                 MGL_NSINFO(@"MGL INFO: Using synchronous pipeline creation to prevent virtualization crashes");
 
-                // PROPER FIX: Disable async compilation that causes completion queue crashes
-                if ([_device name] && ([[_device name] containsString:@"AGX"])) {
-                    MGL_NSINFO(@"MGL INFO: AGX virtualization detected - using safe synchronous compilation");
-                }
+                _pipelineState = [self cachedPipelineFor: pipelineStateDescriptor layout: plain ? &layout : NULL
+                                                   error: &error];
+                _builtPipeline = plain ? _pipelineState : nil;
 
-                _pipelineState = [self cachedPipelineFor: pipelineStateDescriptor error: &error];
+                if (_builtPipeline)
+                {
+                    _builtProgram = prog;
+                    _builtVS = (__bridge id)prog->spirv[_VERTEX_SHADER].mtl_function;
+                    _builtFS = (__bridge id)prog->spirv[_FRAGMENT_SHADER].mtl_function;
+                    _builtLayout = layout;
+                }
 
                 if (!_pipelineState) {
                     MGL_NSERR(@"MGL ERROR: Pipeline creation failed: %@", error);
@@ -12192,6 +12351,9 @@ static bool unitTakesAtomics(GLMContext ctx, int unit)
         }
 
         RETURN_FALSE_ON_FAILURE([self updateMeshStageBuffers: false mesh: mesh_dirty task: task_dirty]);
+
+        if (ctx->state.attrib_constant_dirty)
+            [self bindAttribConstants];
     }
 
     [self bindBindlessToRenderEncoder];
@@ -12206,6 +12368,17 @@ static bool unitTakesAtomics(GLMContext ctx, int unit)
     // Create a render command encoder.
     if (_pipelineState && !mglProgramHasGeometry(ctx->state.program))
         [_currentRenderEncoder setRenderPipelineState: _pipelineState];
+
+    if (draw_command)
+    {
+        Program *p = ctx->state.program;
+
+        _seenEncoder = _currentRenderEncoder;
+        _seenVAO = ctx->state.vao;
+        _seenProgram = p;
+        _seenVS = p ? (__bridge id)p->spirv[_VERTEX_SHADER].mtl_function : nil;
+        _seenFS = p ? (__bridge id)p->spirv[_FRAGMENT_SHADER].mtl_function : nil;
+    }
 
     return true;
 }
@@ -13395,7 +13568,7 @@ void mtlFlush (GLMContext glm_ctx, bool finish)
         return;
     }
 
-    if (ctx->state.draw_buffer == GL_FRONT || ctx->state.draw_buffer == GL_COLOR_ATTACHMENT0)
+    // a swap presents the window whatever the draw buffer is
     {
         // clear commands rely on processGLState
         // glClear / glSwap / repeat..
@@ -13446,7 +13619,8 @@ void mtlFlush (GLMContext glm_ctx, bool finish)
 
         MTLCommandBufferStatus bufferStatus = _currentCommandBuffer.status;
         if (bufferStatus >= MTLCommandBufferStatusCommitted) {
-            MGL_NSERR(@"MGL WARNING: Command buffer already committed (status: %ld), creating new buffer", (long)bufferStatus);
+            // the usual case after glFlush, which GLUT calls before every swap
+            MGL_NSDEBUG(@"MGL: command buffer already committed (status: %ld), presenting on a new one", (long)bufferStatus);
             [self newCommandBuffer];
             if (!_currentCommandBuffer) {
                 MGL_NSERR(@"MGL ERROR: Failed to create new command buffer for presentation");
@@ -13487,6 +13661,7 @@ void mtlFlush (GLMContext glm_ctx, bool finish)
 
             // Present the drawable with proper error handling
             [_currentCommandBuffer presentDrawable: _drawable];
+            ctx->stats.frames_presented++;
 
         } @catch (NSException *exception) {
             MGL_NSERR(@"MGL ERROR: Critical drawable presentation failure: %@", exception);

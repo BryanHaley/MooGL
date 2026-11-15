@@ -433,6 +433,22 @@ void mglShaderSource(GLMContext ctx, GLuint shader, GLsizei count, const GLchar 
 
     src[len] = 0;
 
+#ifdef MGL_COMPAT_CONTEXTS
+    // the old built-ins only mean something in a compatibility context; the
+    // linker reads layouts from the source, so the source is what changes
+    if (ctx->compat)
+    {
+        char *modern = mglCompatRewriteGLSL(src, ptr->type);
+
+        if (modern)
+        {
+            free(src);
+            src = modern;
+            len = strlen(src);
+        }
+    }
+#endif
+
     free((void *)ptr->src);
     ptr->src_len = len;
     ptr->src = src;
@@ -1983,6 +1999,7 @@ static void compileShaderObject(GLMContext ctx, Shader *ptr)
 
     memcpy(ended, ptr->src, src_len);
     memcpy(ended + src_len, "\n\n", 3);
+
 
     char *normal = normalizeFrontEnd(ended, ptr->type);
     char *raised = rewriteCullExtension(normal ? normal : ended);

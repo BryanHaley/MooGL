@@ -256,6 +256,10 @@ void mglFreeProgram(GLMContext ctx, Program *ptr)
 {
     freeResourceList(&ptr->atomic_uniforms);
 
+#ifdef MGL_COMPAT_CONTEXTS
+    mglCompatForgetBuiltins(ptr);
+#endif
+
     if (ptr->linked_glsl_program)
     {
         glslang_program_delete(ptr->linked_glsl_program);
@@ -5422,6 +5426,9 @@ static void linkProgram(GLMContext ctx, GLuint program)
 #ifdef MGL_COMPAT_PROFILE
         mglFindAlphaTestLocations(pptr);
 #endif
+#ifdef MGL_COMPAT_CONTEXTS
+        mglCompatForgetBuiltins(pptr);
+#endif
         pptr->tess.patches_loc = mglFindUniformByName(pptr, "mglPatchesU");
 
         pptr->geom.prims_loc   = mglFindUniformByName(pptr, "mglGsPrimsU");
@@ -5537,6 +5544,9 @@ static void linkProgram(GLMContext ctx, GLuint program)
     pptr->sample_mask_off_loc = mglFindSampleMaskOffLocation(pptr);
 #ifdef MGL_COMPAT_PROFILE
     mglFindAlphaTestLocations(pptr);
+#endif
+#ifdef MGL_COMPAT_CONTEXTS
+    mglCompatForgetBuiltins(pptr);
 #endif
     pptr->tess.patches_loc = mglFindUniformByName(pptr, "mglPatchesU");
 

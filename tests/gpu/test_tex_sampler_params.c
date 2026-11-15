@@ -952,3 +952,86 @@ GPU_TEST(tex_sampler_params, cube_edges_are_not_seamless_by_default)
     glDeleteProgram(prog);
     mgl_target_destroy(&target);
 }
+
+// A border colour Metal's sampler cannot hold, with linear filtering: at the
+// edge the filter takes half the edge texel and half the border, exactly, at
+// level 0, at a smaller mip level and in a rectangle texture.
+GPU_TEST(tex_sampler_params, linear_filtering_blends_an_exact_border)
+{
+    static const char *cs =
+        "#version 450\nlayout(local_size_x = 1) in;\n"
+        "layout(binding = 0) uniform sampler2D t;\n"
+        "layout(binding = 1) uniform sampler2D m;\n"
+        "layout(binding = 2) uniform sampler2DRect r;\n"
+        "layout(std430, binding = 0) buffer O { vec4 o[4]; };\n"
+        "void main() {\n"
+        "    o[0] = textureLod(t, vec2(-0.5, 0.5), 0.0);\n"
+        "    o[1] = textureLod(t, vec2(0.0, 0.5), 0.0);\n"
+        "    o[2] = textureLod(m, vec2(0.0, 0.5), 1.0);\n"
+        "    o[3] = texture(r, vec2(0.0, 0.5));\n"
+        "}\n";
+    static const GLfloat border[4] = { 0.25f, 0.5f, 0.75f, 1.0f };
+    static const GLubyte red[8 * 4] = {
+        255, 0, 0, 255,  255, 0, 0, 255,  255, 0, 0, 255,  255, 0, 0, 255,
+        255, 0, 0, 255,  255, 0, 0, 255,  255, 0, 0, 255,  255, 0, 0, 255 };
+    // half red, half border
+    static const GLfloat edge[4] = { 0.625f, 0.25f, 0.375f, 1.0f };
+    char log[2048] = "";
+    GLuint prog = mgl_build_compute_program(cs, log, sizeof log);
+    GLuint tex[3], buf;
+    GLenum targets[3] = { GL_TEXTURE_2D, GL_TEXTURE_2D, GL_TEXTURE_RECTANGLE };
+    GLfloat out[4][4] = { { 0 } };
+
+    CHECK_MSG(prog, "did not build: %s", log);
+    if (!prog)
+        return;
+
+    glGenTextures(3, tex);
+    for (int i = 0; i < 3; i++)
+    {
+        glActiveTexture(GL_TEXTURE0 + i);
+        glBindTexture(targets[i], tex[i]);
+        glTexParameteri(targets[i], GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(targets[i], GL_TEXTURE_MIN_FILTER, i == 1 ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR);
+        glTexParameteri(targets[i], GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
+        glTexParameteri(targets[i], GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
+        glTexParameterfv(targets[i], GL_TEXTURE_BORDER_COLOR, border);
+    }
+
+    // 2x1, then 4x2 with a 2x1 level 1, then a 2x1 rectangle
+    glActiveTexture(GL_TEXTURE0);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 2, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, red);
+    glActiveTexture(GL_TEXTURE1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 4, 2, 0, GL_RGBA, GL_UNSIGNED_BYTE, red);
+    glTexImage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 2, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, red);
+    glTexImage2D(GL_TEXTURE_2D, 2, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, red);
+    glActiveTexture(GL_TEXTURE2);
+    glTexImage2D(GL_TEXTURE_RECTANGLE, 0, GL_RGBA8, 2, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, red);
+    glActiveTexture(GL_TEXTURE0);
+
+    glGenBuffers(1, &buf);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, buf);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof out, out, GL_DYNAMIC_DRAW);
+    glUseProgram(prog);
+    glDispatchCompute(1, 1, 1);
+    glMemoryBarrier(GL_ALL_BARRIER_BITS);
+    glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof out, out);
+
+    static const char *what[4] = { "outside", "at the edge", "at the edge of level 1", "at a rectangle's edge" };
+    for (int k = 0; k < 4; k++)
+    {
+        const GLfloat *want = k == 0 ? border : edge;
+        int ok = 1;
+
+        for (int c = 0; c < 4; c++)
+            ok = ok && fabsf(out[k][c] - want[c]) < 0.01f;
+        CHECK_MSG(ok, "%s read %g %g %g %g, want %g %g %g %g", what[k], out[k][0], out[k][1], out[k][2],
+                  out[k][3], want[0], want[1], want[2], want[3]);
+    }
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+
+    glUseProgram(0);
+    glDeleteBuffers(1, &buf);
+    glDeleteTextures(3, tex);
+    glDeleteProgram(prog);
+}

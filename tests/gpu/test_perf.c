@@ -414,6 +414,60 @@ GPU_TEST(perf, state_outside_the_pipeline_skips_the_pipeline_lookup)
     mgl_target_destroy(&t);
 }
 
+// glVertexAttrib on an attribute with no array marked all state dirty, so the
+// next draw rebuilt the pipeline descriptor to look its pipeline up.
+GPU_TEST(perf, a_constant_attribute_value_skips_the_pipeline_lookup)
+{
+    static const char *vs =
+        "#version 460 core\n"
+        "layout(location = 0) in vec2 pos;\n"
+        "layout(location = 1) in vec4 colour;\n"
+        "out vec4 c;\n"
+        "void main() { c = colour; gl_Position = vec4(pos, 0.0, 1.0); }\n";
+    static const char *fs =
+        "#version 460 core\n"
+        "in vec4 c;\n"
+        "layout(location = 0) out vec4 frag;\n"
+        "void main() { frag = c; }\n";
+    MGLTestTarget t;
+    char log[1024];
+    unsigned char left[4], right[4];
+    GLuint p, vao, vbo;
+
+    if (!mgl_target_create(&t, W, H, GL_RGBA8, 1)) SKIP("no target");
+    p = mgl_build_program(vs, fs, log, sizeof log);
+    CHECK(p);
+    vao = mgl_fullscreen_quad(&vbo);
+
+    mgl_target_bind(&t);
+    glBindVertexArray(vao);
+    glUseProgram(p);
+    glDisableVertexAttribArray(1);
+    glVertexAttrib4f(1, 1, 0, 0, 1);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+
+    GLuint lookups = stat(MGL_STAT_PIPELINE_LOOKUPS);
+
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, 0, W / 2, H);
+    glVertexAttrib4f(1, 0, 1, 0, 1);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+
+    CHECK_EQ_UINT(stat(MGL_STAT_PIPELINE_LOOKUPS) - lookups, 0);
+
+    pixel(&t, W / 4, H / 2, left);
+    pixel(&t, 3 * W / 4, H / 2, right);
+    CHECK_MSG(IS(left, 0, 1, 0), "left %d %d %d", left[0], left[1], left[2]);
+    CHECK_MSG(IS(right, 1, 0, 0), "right %d %d %d", right[0], right[1], right[2]);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+
+    glDisable(GL_SCISSOR_TEST);
+    glDeleteProgram(p);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo);
+    mgl_target_destroy(&t);
+}
+
 // A coherent persistent mapping, once written with glBufferSubData, stayed
 // dirty forever, so every draw rebound the stage's whole buffer list.
 GPU_TEST(perf, a_coherent_mapped_buffer_is_not_rebound_every_draw)

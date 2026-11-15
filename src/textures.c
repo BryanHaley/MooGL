@@ -1588,6 +1588,11 @@ bool verifyInternalFormatAndFormatType(GLMContext ctx, GLint internalformat, GLe
         case GL_RGB565:
             break;
 
+        // the compatibility profile's one- and two-channel formats
+        case GL_LUMINANCE: case GL_LUMINANCE_ALPHA:
+        case GL_INTENSITY: case GL_INTENSITY8: case GL_INTENSITY16:
+            break;
+
         default:
             // Log warning but don't error - many formats work even if not explicitly listed
             MGL_ERR("MGL WARNING: verifyInternalFormat unknown internalformat 0x%x\n", internalformat);
@@ -2342,8 +2347,129 @@ bool createTextureLevel(GLMContext ctx, Texture *tex, GLuint face, GLint level, 
     return true;
 }
 
+#ifdef MGL_COMPAT_CONTEXTS
+// GL 1.0 named an internal format by its number of components, which a
+// compatibility context still takes
+static GLint legacyComponents(GLMContext ctx, GLint internalformat)
+{
+    if (ctx->compat == NULL)
+        return internalformat;
+
+    switch (internalformat)
+    {
+        case 1: return GL_LUMINANCE;
+        case 2: return GL_LUMINANCE_ALPHA;
+        case 3: return GL_RGB;
+        case 4: return GL_RGBA;
+    }
+
+    return internalformat;
+}
+#endif
+
+// the target a proxy target stands for, or 0 when it is not one
+GLenum mglProxyBase(GLenum target)
+{
+    switch (target)
+    {
+        case GL_PROXY_TEXTURE_1D: return GL_TEXTURE_1D;
+        case GL_PROXY_TEXTURE_2D: return GL_TEXTURE_2D;
+        case GL_PROXY_TEXTURE_3D: return GL_TEXTURE_3D;
+        case GL_PROXY_TEXTURE_RECTANGLE: return GL_TEXTURE_RECTANGLE;
+        case GL_PROXY_TEXTURE_1D_ARRAY: return GL_TEXTURE_1D_ARRAY;
+        case GL_PROXY_TEXTURE_2D_ARRAY: return GL_TEXTURE_2D_ARRAY;
+        case GL_PROXY_TEXTURE_CUBE_MAP: return GL_TEXTURE_CUBE_MAP;
+        case GL_PROXY_TEXTURE_CUBE_MAP_ARRAY: return GL_TEXTURE_CUBE_MAP_ARRAY;
+    }
+
+    return 0;
+}
+
+static bool proxyFits(GLMContext ctx, GLenum base, GLint level, GLenum sized, GLsizei w, GLsizei h, GLsizei d)
+{
+    GLuint max = STATE_VAR(max_texture_size), layers = STATE_VAR(max_array_texture_layers);
+    bool h_size = true, d_size = false;
+
+    switch (base)
+    {
+        case GL_TEXTURE_1D:
+            h_size = false;
+            break;
+        case GL_TEXTURE_1D_ARRAY:
+            h_size = false;
+            if ((GLuint)h > layers)
+                return false;
+            break;
+        case GL_TEXTURE_2D_ARRAY:
+            if ((GLuint)d > layers)
+                return false;
+            break;
+        case GL_TEXTURE_3D:
+            max = STATE_VAR(max_3d_texture_size);
+            d_size = true;
+            break;
+        case GL_TEXTURE_RECTANGLE:
+            max = STATE_VAR(max_rectangle_texture_size);
+            if (level)
+                return false;
+            break;
+        case GL_TEXTURE_CUBE_MAP:
+        case GL_TEXTURE_CUBE_MAP_ARRAY:
+            max = STATE_VAR(max_cube_map_texture_size);
+            if (w != h || (base == GL_TEXTURE_CUBE_MAP_ARRAY && (d % 6 || (GLuint)d > layers)))
+                return false;
+            break;
+    }
+
+    if (level > (GLint)ilog2(max))
+        return false;
+
+    max >>= level;
+
+    return (GLuint)w <= max && (!h_size || (GLuint)h <= max) && (!d_size || (GLuint)d <= max) &&
+           sized != 0 && checkInternalFormatForMetal(ctx, sized);
+}
+
+// glTexImage or glTexStorage on a proxy target: notes the size each level
+// would have, or zero when the texture would not fit
+void mglProxyImage(GLMContext ctx, GLenum target, GLint level, GLsizei levels, GLint internalformat, GLenum format,
+                   GLenum type, GLsizei w, GLsizei h, GLsizei d)
+{
+    GLenum base = mglProxyBase(target);
+    GLuint index = textureIndexFromTarget(ctx, base);
+    GLenum sized = mglFormatSizedForBase(internalformat ? (GLenum)internalformat
+                                         : internalFormatForGLFormatType(format, type));
+    bool layers_h = base == GL_TEXTURE_1D_ARRAY;
+    bool layers_d = base == GL_TEXTURE_2D_ARRAY || base == GL_TEXTURE_CUBE_MAP_ARRAY;
+    bool fits = level >= 0 && level + levels <= MGL_PROXY_LEVELS;
+
+    for (GLsizei l = 0; fits && l < levels; l++)
+        fits = proxyFits(ctx, base, level + l, sized, MAX(1, w >> l), layers_h ? h : MAX(1, h >> l),
+                         layers_d ? d : MAX(1, d >> l));
+
+    for (GLsizei l = 0; l < levels && level >= 0 && level + l < MGL_PROXY_LEVELS; l++)
+    {
+        MGLProxyLevel *p = &STATE(proxy_levels[index][level + l]);
+
+        if (!fits)
+        {
+            memset(p, 0, sizeof(*p));
+            continue;
+        }
+
+        p->width = MAX(1, w >> l);
+        p->height = layers_h ? h : MAX(1, h >> l);
+        p->depth = base == GL_TEXTURE_3D ? MAX(1, d >> l) : d;
+        p->internalformat = sized;
+    }
+}
+
 void mglTexImage1D(GLMContext ctx, GLenum target, GLint level, GLint internalformat, GLsizei width, GLint border, GLenum format, GLenum type, const void *pixels)
 {
+#ifdef MGL_COMPAT_CONTEXTS
+    internalformat = legacyComponents(ctx, internalformat);
+#endif
+
     Texture *tex;
     bool proxy;
 
@@ -2371,6 +2497,12 @@ void mglTexImage1D(GLMContext ctx, GLenum target, GLint level, GLint internalfor
 
     ERROR_CHECK_RETURN(border == 0, GL_INVALID_VALUE);
 
+    if (mglProxyBase(target))
+    {
+        mglProxyImage(ctx, target, level, 1, internalformat, format, type, width, 1, 1);
+        return;
+    }
+
     tex = getTex(ctx, 0, target);
 
     ERROR_CHECK_RETURN(tex, GL_INVALID_OPERATION);
@@ -2382,6 +2514,10 @@ void mglTexImage1D(GLMContext ctx, GLenum target, GLint level, GLint internalfor
 
 void mglTexImage2D(GLMContext ctx, GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const void *pixels)
 {
+#ifdef MGL_COMPAT_CONTEXTS
+    internalformat = legacyComponents(ctx, internalformat);
+#endif
+
     Texture *tex;
     GLuint face;
     GLboolean is_array;
@@ -2445,6 +2581,12 @@ void mglTexImage2D(GLMContext ctx, GLenum target, GLint level, GLint internalfor
 
     ERROR_CHECK_RETURN(border == 0, GL_INVALID_VALUE);
 
+    if (mglProxyBase(target))
+    {
+        mglProxyImage(ctx, target, level, 1, internalformat, format, type, width, height, 1);
+        return;
+    }
+
     tex = getTex(ctx, 0, target);
 
     ERROR_CHECK_RETURN(tex, GL_INVALID_OPERATION);
@@ -2482,6 +2624,10 @@ static bool formatAllowedIn3D(GLenum internalformat)
 
 void mglTexImage3D(GLMContext ctx, GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLsizei depth, GLint border, GLenum format, GLenum type, const void *pixels)
 {
+#ifdef MGL_COMPAT_CONTEXTS
+    internalformat = legacyComponents(ctx, internalformat);
+#endif
+
     Texture *tex;
     GLboolean is_array;
     GLboolean proxy;
@@ -2526,6 +2672,12 @@ void mglTexImage3D(GLMContext ctx, GLenum target, GLint level, GLint internalfor
     ERROR_CHECK_RETURN(border == 0, GL_INVALID_VALUE);
 
     ERROR_CHECK_RETURN(is_array || formatAllowedIn3D(internalformat), GL_INVALID_OPERATION);
+
+    if (mglProxyBase(target))
+    {
+        mglProxyImage(ctx, target, level, 1, internalformat, format, type, width, height, depth);
+        return;
+    }
 
     tex = getTex(ctx, 0, target);
 
@@ -3059,6 +3211,12 @@ void mglTexStorage1D(GLMContext ctx, GLenum target, GLsizei levels, GLenum inter
 
     ERROR_CHECK_RETURN(width > 0, GL_INVALID_VALUE);
 
+    if (mglProxyBase(target))
+    {
+        mglProxyImage(ctx, target, 0, levels, internalformat, 0, 0, width, 1, 1);
+        return;
+    }
+
     tex = getTex(ctx, 0, target);
 
     ERROR_CHECK_RETURN(tex != NULL, GL_INVALID_OPERATION);
@@ -3140,6 +3298,12 @@ void mglTexStorage2D(GLMContext ctx, GLenum target, GLsizei levels, GLenum inter
 
     ERROR_CHECK_RETURN(width > 0, GL_INVALID_VALUE);
     ERROR_CHECK_RETURN(height > 0, GL_INVALID_VALUE);
+
+    if (mglProxyBase(target))
+    {
+        mglProxyImage(ctx, target, 0, levels, internalformat, 0, 0, width, height, 1);
+        return;
+    }
 
     tex = getTex(ctx, 0, target);
     
@@ -3230,6 +3394,12 @@ void mglTexStorage3D(GLMContext ctx, GLenum target, GLsizei levels, GLenum inter
     ERROR_CHECK_RETURN(width > 0, GL_INVALID_VALUE);
     ERROR_CHECK_RETURN(height > 0, GL_INVALID_VALUE);
     ERROR_CHECK_RETURN(depth > 0, GL_INVALID_VALUE);
+
+    if (mglProxyBase(target))
+    {
+        mglProxyImage(ctx, target, 0, levels, internalformat, 0, 0, width, height, depth);
+        return;
+    }
 
     tex = getTex(ctx, 0, target);
 
@@ -3912,6 +4082,12 @@ void mglCompressedTexImage3D(GLMContext ctx, GLenum target, GLint level, GLenum 
     ERROR_CHECK_RETURN(width >= 0 && height >= 0 && depth >= 0, GL_INVALID_VALUE);
     ERROR_CHECK_RETURN(imageSize >= 0, GL_INVALID_VALUE);
 
+    if (mglProxyBase(target))
+    {
+        mglProxyImage(ctx, target, level, 1, internalformat, 0, 0, width, height, depth);
+        return;
+    }
+
     tex = getTex(ctx, 0, target);
 
     ERROR_CHECK_RETURN(tex, GL_INVALID_OPERATION);
@@ -3955,6 +4131,12 @@ void mglCompressedTexImage2D(GLMContext ctx, GLenum target, GLint level, GLenum 
     ERROR_CHECK_RETURN(level >= 0, GL_INVALID_VALUE);
     ERROR_CHECK_RETURN(width >= 0 && height >= 0, GL_INVALID_VALUE);
     ERROR_CHECK_RETURN(imageSize >= 0, GL_INVALID_VALUE);
+
+    if (mglProxyBase(target))
+    {
+        mglProxyImage(ctx, target, level, 1, internalformat, 0, 0, width, height, 1);
+        return;
+    }
 
     tex = getTex(ctx, 0, target);
 
@@ -4137,6 +4319,10 @@ static bool copyTexImageLevel(GLMContext ctx, Texture *tex, GLuint face, GLint l
 
 void mglCopyTexImage1D(GLMContext ctx, GLenum target, GLint level, GLenum internalformat, GLint x, GLint y, GLsizei width, GLint border)
 {
+#ifdef MGL_COMPAT_CONTEXTS
+    internalformat = legacyComponents(ctx, internalformat);
+#endif
+
     Texture *tex;
 
     switch(target)
@@ -4164,6 +4350,10 @@ void mglCopyTexImage1D(GLMContext ctx, GLenum target, GLint level, GLenum intern
 
 void mglCopyTexImage2D(GLMContext ctx, GLenum target, GLint level, GLenum internalformat, GLint x, GLint y, GLsizei width, GLsizei height, GLint border)
 {
+#ifdef MGL_COMPAT_CONTEXTS
+    internalformat = legacyComponents(ctx, internalformat);
+#endif
+
     Texture *tex;
     GLuint face;
 

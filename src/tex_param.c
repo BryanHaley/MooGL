@@ -27,6 +27,7 @@ extern Texture *currentTexture(GLMContext ctx, GLuint index);
 extern Texture *findTexture(GLMContext ctx, GLuint texture);
 extern Texture *newTexture(GLMContext ctx, GLenum target, GLuint texture);
 Texture *getTex(GLMContext ctx, GLuint name, GLenum target);
+GLenum mglProxyBase(GLenum target);
 
 // the texture a glTexture*() call names. A name handed out by glGenTextures
 // but never bound has no object yet, so make one, the same way a bind would;
@@ -1180,12 +1181,50 @@ static bool getTexLevelParameter(GLMContext ctx, Texture *tex, GLint level, GLen
     }
 }
 
+static bool proxyLevelParameter(GLMContext ctx, GLenum target, GLint level, GLenum pname, GLint *out)
+{
+    const MGLProxyLevel *p;
+    GLenum f;
+
+    ERROR_CHECK_RETURN_VALUE(level >= 0 && level < MGL_PROXY_LEVELS, GL_INVALID_VALUE, false);
+
+    p = &STATE(proxy_levels[textureIndexFromTarget(ctx, mglProxyBase(target))][level]);
+    f = p->internalformat;
+
+    switch (pname)
+    {
+        case GL_TEXTURE_WIDTH: *out = p->width; return true;
+        case GL_TEXTURE_HEIGHT: *out = p->height; return true;
+        case GL_TEXTURE_DEPTH: *out = p->depth; return true;
+        case GL_TEXTURE_INTERNAL_FORMAT: *out = (GLint)f; return true;
+        case GL_TEXTURE_SAMPLES: *out = 0; return true;
+        case GL_TEXTURE_FIXED_SAMPLE_LOCATIONS: *out = GL_TRUE; return true;
+        case GL_TEXTURE_COMPRESSED: *out = f && mglFormatIsCompressed(f); return true;
+        case GL_TEXTURE_RED_SIZE: *out = f ? bitcountForInternalFormat(f, GL_RED) : 0; return true;
+        case GL_TEXTURE_GREEN_SIZE: *out = f ? bitcountForInternalFormat(f, GL_GREEN) : 0; return true;
+        case GL_TEXTURE_BLUE_SIZE: *out = f ? bitcountForInternalFormat(f, GL_BLUE) : 0; return true;
+        case GL_TEXTURE_ALPHA_SIZE: *out = f ? bitcountForInternalFormat(f, GL_ALPHA) : 0; return true;
+        case GL_TEXTURE_DEPTH_SIZE: *out = f ? bitcountForInternalFormat(f, GL_DEPTH_COMPONENT) : 0; return true;
+        case GL_TEXTURE_STENCIL_SIZE: *out = f ? bitcountForInternalFormat(f, GL_STENCIL_INDEX) : 0; return true;
+        case GL_TEXTURE_SHARED_SIZE: *out = f == GL_RGB9_E5 ? 5 : 0; return true;
+    }
+
+    ERROR_RETURN_VALUE(GL_INVALID_ENUM, false);
+}
+
 void mglGetTexLevelParameteriv(GLMContext ctx, GLenum target, GLint level, GLenum pname, GLint *params)
 {
     GLuint index;
     GLint value = 0;
 
     ERROR_CHECK_RETURN(params, GL_INVALID_VALUE);
+
+    if (mglProxyBase(target))
+    {
+        if (proxyLevelParameter(ctx, target, level, pname, &value))
+            *params = value;
+        return;
+    }
 
     index = textureIndexFromTarget(ctx, target);
 
