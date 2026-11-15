@@ -319,6 +319,71 @@ $(sdl2_lib): $(mgl_lib) $(wildcard $(sdl2_dir)/src/video/cocoa/*.m) $(sdl2_dir)/
 
 sdl2: $(sdl2_lib)
 
+# SDL3, the same MooGL backend (submodules/SDL3, branch mgl3)
+sdl3_dir := submodules/SDL3
+sdl3_install := $(build_dir)/sdl3/install
+sdl3_lib := $(build_dir)/libSDL3.0.dylib
+
+$(sdl3_lib): $(mgl_lib) $(wildcard $(sdl3_dir)/src/video/cocoa/*.m) $(sdl3_dir)/CMakeLists.txt
+	cmake -S $(sdl3_dir) -B $(build_dir)/sdl3 -Wno-dev -Wno-deprecated -DCMAKE_BUILD_TYPE=Release \
+		-DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_C_FLAGS=-w -DCMAKE_OBJC_FLAGS=-w \
+		-DSDL_STATIC=OFF -DSDL_TEST_LIBRARY=OFF -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF -DCMAKE_SKIP_BUILD_RPATH=ON \
+		-DMOOGL_LIBRARY=$(abspath $(mgl_lib)) -DCMAKE_INSTALL_PREFIX=$(abspath $(sdl3_install))
+	env -u MAKEFLAGS -u MFLAGS -u MAKELEVEL cmake --build $(build_dir)/sdl3 --target install -j8
+	cp $(sdl3_install)/lib/libSDL3.0.dylib $@
+
+sdl3: $(sdl3_lib)
+
+# SFML 3 and 2.6 with a MooGL context in place of NSOpenGL (submodules/SFML
+# and SFML2, branch mgl): system, window and graphics
+sfml3_dir := submodules/SFML
+sfml3_install := $(build_dir)/sfml3/install
+sfml3_lib := $(sfml3_install)/lib/libsfml-graphics.3.1.dylib
+sfml2_dir := submodules/SFML2
+sfml2_install := $(build_dir)/sfml2/install
+sfml2_lib := $(sfml2_install)/lib/libsfml-graphics.2.6.dylib
+sfml_target := $(or $(MACOSX_DEPLOYMENT_TARGET),$(shell sw_vers -productVersion | cut -d. -f1).0)
+sfml_flags := -Wno-dev -Wno-deprecated -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64 \
+	-DCMAKE_OSX_DEPLOYMENT_TARGET=$(sfml_target) -DCMAKE_C_FLAGS=-w -DCMAKE_CXX_FLAGS=-w -DCMAKE_OBJCXX_FLAGS=-w \
+	-DBUILD_SHARED_LIBS=ON -DSFML_BUILD_AUDIO=OFF -DSFML_BUILD_NETWORK=OFF -DCMAKE_SKIP_BUILD_RPATH=ON \
+	-DMOOGL_LIBRARY=$(abspath $(mgl_lib))
+
+$(sfml3_lib): $(mgl_lib) $(wildcard $(sfml3_dir)/src/SFML/Window/macOS/*) $(sfml3_dir)/src/SFML/Window/CMakeLists.txt
+	cmake -S $(sfml3_dir) -B $(build_dir)/sfml3 $(sfml_flags) -DSFML_USE_SYSTEM_DEPS=OFF \
+		-DCMAKE_INSTALL_PREFIX=$(abspath $(sfml3_install))
+	env -u MAKEFLAGS -u MFLAGS -u MAKELEVEL cmake --build $(build_dir)/sfml3 --target install -j8
+
+# its graphics library looks for freetype one folder up from lib; it sits in lib
+$(sfml2_lib): $(mgl_lib) $(wildcard $(sfml2_dir)/src/SFML/Window/OSX/*) $(sfml2_dir)/src/SFML/Window/CMakeLists.txt
+	cmake -S $(sfml2_dir) -B $(build_dir)/sfml2 $(sfml_flags) -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+		-DCMAKE_INSTALL_PREFIX=$(abspath $(sfml2_install))
+	env -u MAKEFLAGS -u MFLAGS -u MAKELEVEL cmake --build $(build_dir)/sfml2 --target install -j8
+	install_name_tool -change @rpath/../Frameworks/freetype.framework/Versions/A/freetype \
+		@rpath/freetype.framework/Versions/A/freetype $(sfml2_install)/lib/libsfml-graphics.2.6.2.dylib 2>/dev/null
+	codesign -f -s - $(sfml2_install)/lib/libsfml-graphics.2.6.2.dylib 2>/dev/null
+
+sfml: $(sfml3_lib) $(sfml2_lib)
+
+# raylib, stock, built against MooGL's GLFW and libmoogl in place of Apple's OpenGL
+raylib_dir := submodules/raylib
+raylib_install := $(build_dir)/raylib/install
+raylib_lib := $(raylib_install)/lib/libraylib.620.dylib
+glfw_pkg := $(build_dir)/glfw-pkg
+
+$(raylib_lib): $(mgl_lib) $(build_dir)/libglfw.dylib tools/sdk/glfw3/glfw3Config.cmake
+	@mkdir -p $(glfw_pkg)/lib/cmake/glfw3
+	cp tools/sdk/glfw3/*.cmake $(glfw_pkg)/lib/cmake/glfw3/
+	ln -sf $(abspath $(build_dir))/libglfw.dylib $(glfw_pkg)/lib/libglfw.dylib
+	ln -sfn $(abspath $(glfw_dir))/include $(glfw_pkg)/include
+	cmake -S $(raylib_dir) -B $(build_dir)/raylib -Wno-dev -Wno-deprecated -DCMAKE_BUILD_TYPE=Release \
+		-DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_C_FLAGS=-w -DBUILD_SHARED_LIBS=ON -DBUILD_EXAMPLES=OFF \
+		-DUSE_EXTERNAL_GLFW=ON -Dglfw3_DIR=$(abspath $(glfw_pkg))/lib/cmake/glfw3 \
+		-DOPENGL_LIBRARY=$(abspath $(mgl_lib)) -DCMAKE_SKIP_BUILD_RPATH=ON \
+		-DCMAKE_INSTALL_PREFIX=$(abspath $(raylib_install))
+	env -u MAKEFLAGS -u MFLAGS -u MAKELEVEL cmake --build $(build_dir)/raylib --target install -j8
+
+raylib: $(raylib_lib)
+
 # specific rules
 
 # Dear ImGui with its GLFW, SDL2 and OpenGL 3 backends, the last one on MooGL
@@ -335,7 +400,7 @@ $(imgui_lib): $(imgui_srcs) $(sdl2_lib)
 	done
 	libtool -static -o $@ $(build_dir)/imgui/*.o
 
-lib: $(mgl_lib) $(mgl_es_lib) $(build_dir)/libglfw.dylib $(fsr2_lib) $(sdl2_lib) $(imgui_lib) $(glut_lib) $(glu_lib)
+lib: $(mgl_lib) $(mgl_es_lib) $(build_dir)/libglfw.dylib $(fsr2_lib) $(sdl2_lib) $(sdl3_lib) $(sfml3_lib) $(sfml2_lib) $(raylib_lib) $(imgui_lib) $(glut_lib) $(glu_lib)
 
 toolchain: $(mgl_toolchain_lib)
 
@@ -411,6 +476,33 @@ $(build_dir)/sdl2_triangle: examples/sdl2_triangle/main.c $(mgl_lib) $(sdl2_lib)
 $(build_dir)/test_sdl_share: tests/window/test_sdl_share.c $(mgl_lib) $(sdl2_lib)
 	$(CC) -o $@ $< -Iinclude -I$(sdl2_install)/include -L$(build_dir) -lSDL2-2.0.0 $(window_libs)
 
+$(build_dir)/test_sdl3: tests/window/test_sdl3.c $(mgl_lib) $(sdl3_lib)
+	$(CC) -o $@ $< -Iinclude -I$(sdl3_install)/include -L$(build_dir) -lSDL3.0 $(window_libs)
+
+$(build_dir)/test_sfml3: tests/window/test_sfml.cpp $(mgl_lib) $(sfml3_lib)
+	$(CXX) -std=c++17 -o $@ $< -I$(sfml3_install)/include -L$(sfml3_install)/lib -lsfml-graphics -lsfml-window \
+		-lsfml-system -Wl,-rpath,$(CURDIR)/$(sfml3_install)/lib $(window_libs)
+
+# SFML 2.6's headers warn under a current libc++
+$(build_dir)/test_sfml2: tests/window/test_sfml.cpp $(mgl_lib) $(sfml2_lib)
+	$(CXX) -std=c++17 -o $@ $< -isystem $(sfml2_install)/include -L$(sfml2_install)/lib -lsfml-graphics \
+		-lsfml-window -lsfml-system -Wl,-rpath,$(CURDIR)/$(sfml2_install)/lib $(window_libs)
+
+$(build_dir)/test_raylib: tests/window/test_raylib.c $(mgl_lib) $(raylib_lib)
+	$(CC) -o $@ $< -I$(raylib_install)/include -L$(raylib_install)/lib -lraylib \
+		-Wl,-rpath,$(CURDIR)/$(raylib_install)/lib $(window_libs)
+
+$(build_dir)/sdl3_triangle: examples/sdl3_triangle/main.c $(mgl_lib) $(sdl3_lib)
+	$(CC) -o $@ $< -Iinclude -I$(sdl3_install)/include -L$(build_dir) -lSDL3.0 $(window_libs)
+
+$(build_dir)/sfml_shapes: examples/sfml_shapes/main.cpp $(mgl_lib) $(sfml3_lib)
+	$(CXX) -std=c++17 -o $@ $< -I$(sfml3_install)/include -L$(sfml3_install)/lib -lsfml-graphics -lsfml-window \
+		-lsfml-system -Wl,-rpath,$(CURDIR)/$(sfml3_install)/lib $(window_libs)
+
+$(build_dir)/raylib_shapes: examples/raylib_shapes/main.c $(mgl_lib) $(raylib_lib)
+	$(CC) -o $@ $< -I$(raylib_install)/include -L$(raylib_install)/lib -lraylib \
+		-Wl,-rpath,$(CURDIR)/$(raylib_install)/lib $(window_libs)
+
 $(build_dir)/test_cgl: tests/window/test_cgl.c $(mgl_lib)
 	$(CC) -o $@ $< -Iinclude $(window_libs)
 
@@ -429,10 +521,14 @@ $(build_dir)/test_imgui_viewports: tests/window/test_imgui_viewports.cpp $(imgui
 $(build_dir)/test_imgui_viewports_sdl2: tests/window/test_imgui_viewports.cpp $(imgui_lib) $(mgl_lib) $(sdl2_lib)
 	$(CXX) -std=c++17 -DMGL_TEST_SDL2 -o $@ $< $(imgui_cflags) -L$(build_dir) -limgui -lSDL2-2.0.0 $(window_libs)
 
-window-test: $(build_dir)/test_window $(build_dir)/test_sdl_share $(build_dir)/test_sdl_renderer $(build_dir)/test_glut $(build_dir)/test_glu $(build_dir)/test_cgl $(build_dir)/test_imgui_viewports $(build_dir)/test_imgui_viewports_sdl2 $(build_dir)/triangle $(build_dir)/sdl2_triangle
+window-test: $(build_dir)/test_window $(build_dir)/test_sdl_share $(build_dir)/test_sdl3 $(build_dir)/test_sfml3 $(build_dir)/test_sfml2 $(build_dir)/test_raylib $(build_dir)/test_sdl_renderer $(build_dir)/test_glut $(build_dir)/test_glu $(build_dir)/test_cgl $(build_dir)/test_imgui_viewports $(build_dir)/test_imgui_viewports_sdl2 $(build_dir)/triangle $(build_dir)/sdl2_triangle $(build_dir)/sdl3_triangle $(build_dir)/sfml_shapes $(build_dir)/raylib_shapes
 	$(build_dir)/test_window
 	$(build_dir)/test_sdl_share
 	$(build_dir)/test_sdl_renderer
+	$(build_dir)/test_sdl3
+	$(build_dir)/test_sfml3
+	$(build_dir)/test_sfml2
+	$(build_dir)/test_raylib
 	$(build_dir)/test_glut
 	$(build_dir)/test_glu
 	$(build_dir)/test_cgl
@@ -440,6 +536,9 @@ window-test: $(build_dir)/test_window $(build_dir)/test_sdl_share $(build_dir)/t
 	$(build_dir)/test_imgui_viewports_sdl2
 	$(build_dir)/triangle --frames 60
 	$(build_dir)/sdl2_triangle --frames 60
+	$(build_dir)/sdl3_triangle --frames 60
+	$(build_dir)/sfml_shapes --frames 60
+	$(build_dir)/raylib_shapes --frames 60
 
 gears-test: gears
 	@echo "== straight port (fixed function) =="
@@ -550,6 +649,6 @@ clean:
 	rm -f libmoogles.dylib
 	rm -f libglfw.dylib
 
-.PHONY: default test tests cts gears gears-test window-test dbg lib fsr2 sdl2 clean generate FORCE
+.PHONY: default test tests cts gears gears-test window-test dbg lib fsr2 sdl2 sdl3 sfml raylib clean generate FORCE
 
 -include $(deps)

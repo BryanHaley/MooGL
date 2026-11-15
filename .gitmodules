@@ -59,3 +59,18 @@
 	path = submodules/freeglut
 	url = https://github.com/BryanHaley/freeglut.git
 	branch = mgl
+[submodule "submodules/SDL3"]
+	path = submodules/SDL3
+	url = https://github.com/BryanHaley/SDL.git
+	branch = mgl3
+[submodule "submodules/SFML"]
+	path = submodules/SFML
+	url = https://github.com/BryanHaley/SFML.git
+	branch = mgl
+[submodule "submodules/SFML2"]
+	path = submodules/SFML2
+	url = https://github.com/BryanHaley/SFML.git
+	branch = mgl-2.6
+[submodule "submodules/raylib"]
+	path = submodules/raylib
+	url = https://github.com/raysan5/raylib.git

@@ -297,6 +297,13 @@ GPU_TEST(tex_sampler_params, texture_parameter_dsa_f_and_i)
     glGenTextures(1, &t);
     CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
 
+    // generated but never bound, so not a texture yet
+    glTextureParameterf(t, GL_TEXTURE_LOD_BIAS, 2.0f);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_INVALID_OPERATION);
+    CHECK(!glIsTexture(t));
+
+    glBindTexture(GL_TEXTURE_2D, t);
+
     // set via glTextureParameterf (scalar float)
     glTextureParameterf(t, GL_TEXTURE_LOD_BIAS, 2.0f);
     CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
@@ -304,9 +311,6 @@ GPU_TEST(tex_sampler_params, texture_parameter_dsa_f_and_i)
     // set via glTextureParameteri (scalar int)
     glTextureParameteri(t, GL_TEXTURE_BASE_LEVEL, 1);
     CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
-
-    // bind and verify
-    glBindTexture(GL_TEXTURE_2D, t);
 
     {
         GLfloat got = 9999.0f;
@@ -336,7 +340,7 @@ GPU_TEST(tex_sampler_params, texture_parameter_dsa_fv_and_iv)
 {
     GLuint t = 0;
 
-    glGenTextures(1, &t);
+    glCreateTextures(GL_TEXTURE_2D, 1, &t);
     CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
 
     // set border color via glTextureParameterfv

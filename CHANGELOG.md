@@ -1,6 +1,14 @@
 ## MooGL 0.2.0
 
 ### Added
+- SDL3, SFML 3, SFML 2.6 and raylib on MooGL, in the SDK with their own CMake packages and
+  an example each. SDL3 and SFML make MooGL contexts in place of Apple's; raylib is stock,
+  built on MooGL's GLFW. SDL3's `opengl` renderer works, and so does SFML's graphics module.
+- A `glfw3` CMake package for MooGL's GLFW.
+- In compatibility contexts, `GL_ARB_shader_objects`, `GL_ARB_vertex_shader`,
+  `GL_ARB_fragment_shader` and `GL_ARB_shading_language_100` with their `ARB` calls, which
+  SFML checks for before it uses shaders, and the `EXT` names for blending and framebuffer
+  blits and multisampling.
 - Shared contexts. Contexts created to share with another one now have the same
   textures, buffers, renderbuffers, samplers, programs, shaders and fences. Each
   context still has its own vertex arrays, framebuffers and transform feedback
@@ -65,6 +73,14 @@
     each draw.
 
 ### Fixed
+- `glCopyTexSubImage*` into a texture of another format, such as from the window into an
+  RGBA texture, converts the colour. It copied the bytes, so red and blue came out swapped.
+- In compatibility contexts, a unit with texturing on and no complete texture now leaves the
+  colour alone, as GL says. It drew black.
+- `glBindBufferARB` and the rest of `GL_ARB_vertex_buffer_object`'s calls exist. The
+  extension was listed without them.
+- `glTextureParameter*` on a name from `glGenTextures` that was never bound gives
+  `GL_INVALID_OPERATION`. It made a texture for it instead.
 - Programs using MooGL never became the active app, so their windows got no keyboard input and
   could not capture the mouse. Loading the library made a context with an `NSView`, which set up
   AppKit's application object before SDL or GLFW could. That context is now made on first use.
