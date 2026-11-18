@@ -253,7 +253,17 @@ GLuint sizeForType(GLenum type)
         case GL_UNSIGNED_INT_8_8_8_8_REV:
         case GL_UNSIGNED_INT_10_10_10_2:
         case GL_UNSIGNED_INT_2_10_10_10_REV:
+        case GL_UNSIGNED_INT_24_8:
+        case GL_UNSIGNED_INT_10F_11F_11F_REV:
+        case GL_UNSIGNED_INT_5_9_9_9_REV:
             return sizeof(uint32_t);
+
+        case GL_HALF_FLOAT:
+        case 0x8D61:    // GL_HALF_FLOAT_OES
+            return sizeof(uint16_t);
+
+        case GL_FLOAT_32_UNSIGNED_INT_24_8_REV:
+            return 8;
 
         default:
             MGL_ERR("MGL WARNING: sizeForType unknown type 0x%x, assuming 4 bytes\n", type);

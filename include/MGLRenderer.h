@@ -61,6 +61,7 @@ extern "C" {
 #endif
 void* CppCreateMGLRendererFromContextAndBindToWindow (void *glm_ctx, void *window);
 void* CppCreateMGLRendererHeadless (void *glm_ctx);
+void* CppCreateMGLRendererHeadlessSize (void *glm_ctx, int width, int height);
 #ifdef __cplusplus
 }
 #endif

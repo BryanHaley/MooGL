@@ -111,6 +111,19 @@ Buffer *getBuffer(GLMContext ctx, GLenum target, GLuint buffer)
     return ptr;
 }
 
+Buffer *findBuffer(GLMContext ctx, GLuint buffer);
+
+// a name glGenBuffers handed out gets its object the first time it is bound
+Buffer *mglGeneratedBuffer(GLMContext ctx, GLuint buffer)
+{
+    Buffer *ptr = findBuffer(ctx, buffer);
+
+    if (ptr == NULL && buffer < SHARED(buffer_table.current_name) && !isFreeName(&SHARED(buffer_table), buffer))
+        ptr = getBuffer(ctx, GL_ARRAY_BUFFER, buffer);
+
+    return ptr;
+}
+
 bool isBuffer(GLMContext ctx, GLuint buffer)
 {
     Buffer *ptr;
@@ -718,6 +731,11 @@ void mglDeleteBuffers(GLMContext ctx, GLsizei n, const GLuint *buffers)
                 free(ptr);
             }
         } // if (isBuffer(ctx, buffer))
+        // a name that was generated but never bound has no object, only its name
+        else if (buffer && buffer < SHARED(buffer_table.current_name) && !isFreeName(&SHARED(buffer_table), buffer))
+        {
+            deleteHashElement(&SHARED(buffer_table), buffer);
+        }
     } // while(--n)
 
     mglSweepHeldObjects(ctx);
@@ -743,8 +761,12 @@ void mglBindBuffer(GLMContext ctx, GLenum target, GLuint buffer)
 
     if (buffer)
     {
-        // core GL binds only names glGenBuffers handed out
-        ERROR_CHECK_RETURN(isBuffer(ctx, buffer) ||
+        // core GL binds only names glGenBuffers handed out; ES binds any
+        bool any_name = false;
+#ifdef MGL_OGL_ES
+        any_name = ctx->es != NULL;
+#endif
+        ERROR_CHECK_RETURN(any_name || isBuffer(ctx, buffer) ||
                            (buffer < SHARED(buffer_table.current_name) && !isFreeName(&SHARED(buffer_table), buffer)),
                            GL_INVALID_OPERATION);
 
@@ -1164,19 +1186,6 @@ void mglBufferSubData(GLMContext ctx, GLenum target, GLintptr offset, GLsizeiptr
         return;
     }
 
-    // Early exit for zero-size operations
-    if (size == 0)
-    {
-        return;
-    }
-
-    // Validate data pointer for non-zero size
-    if (data == NULL)
-    {
-        // MGL_ERR("MGL WARNING: mglBufferSubData: data is NULL\n");
-        return;  // Silent return for NULL data
-    }
-
     if (offset < 0 || size < 0)
     {
         MGL_ERR("MGL Error: mglBufferSubData: offset (%ld) or size (%ld) < 0\n", offset, size);
@@ -1216,6 +1225,10 @@ void mglBufferSubData(GLMContext ctx, GLenum target, GLintptr offset, GLsizeiptr
         MGL_ERR("MGL Error: mglBufferSubData: immutable storage without dynamic bit\n");
         ERROR_RETURN(GL_INVALID_OPERATION);
     }
+
+    // checked, but nothing to copy
+    if (size == 0 || data == NULL)
+        return;
 
     if (ptr->storage_flags & (GL_CLIENT_STORAGE_BIT | GL_DYNAMIC_STORAGE_BIT))
     {

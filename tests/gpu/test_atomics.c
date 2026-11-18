@@ -514,3 +514,68 @@ GPU_TEST(atomics, an_array_of_arrays_counts_every_counter)
     }
     mgl_drain_errors();
 }
+
+// counters handed to functions are the counters themselves, not copies
+GPU_TEST(atomics, counters_passed_to_functions_count)
+{
+    static const char *CS =
+        "#version 430 core\n"
+        "layout(local_size_x = 1) in;\n"
+        "layout(binding = 0) uniform atomic_uint c[2][2][2];\n"
+        "void bump1(in atomic_uint arr[2]);\n"
+        "void bump1(in atomic_uint arr[2]) {\n"
+        "  atomicCounterIncrement(arr[0]); // first\n"
+        "  atomicCounterIncrement(arr[1]);\n"
+        "}\n"
+        "void bump2(in atomic_uint arr[2][2]) {\n"
+        "  bump1(arr[1]);\n"
+        "  for (int i = 0; i < 2; i++)\n"
+        "    atomicCounterIncrement(arr[0][i]);\n"
+        "}\n"
+        "void main() {\n"
+        "  bump2(c[0]);\n"
+        "  for (int i = 0; i < 2; i++) bump1(c[1][i]);\n"
+        "}\n";
+    char log[2048] = "";
+    GLuint prog = mgl_build_compute_program(CS, log, sizeof log), buf = 0;
+    GLuint zero[8] = {0}, got[8] = {0};
+
+    CHECK_MSG(prog != 0, "compute program did not build: %s", log);
+    if (!prog)
+        return;
+
+    glGenBuffers(1, &buf);
+    glBindBuffer(GL_ATOMIC_COUNTER_BUFFER, buf);
+    glBufferData(GL_ATOMIC_COUNTER_BUFFER, sizeof zero, zero, GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_ATOMIC_COUNTER_BUFFER, 0, buf);
+
+    glUseProgram(prog);
+    glDispatchCompute(3, 1, 1);
+    glFinish();
+
+    glGetBufferSubData(GL_ATOMIC_COUNTER_BUFFER, 0, sizeof got, got);
+
+    for (int i = 0; i < 8; i++)
+        CHECK_MSG(got[i] == 3, "c[%d][%d][%d] counted %u", i / 4, i / 2 % 2, i % 2, got[i]);
+
+    glUseProgram(0);
+    glDeleteProgram(prog);
+    glDeleteBuffers(1, &buf);
+}
+
+GPU_TEST(atomics, atomic_uint_is_not_a_parameter_name)
+{
+    static const char *CS =
+        "#version 430 core\n"
+        "layout(local_size_x = 1) in;\n"
+        "void test(in vec4 atomic_uint) {\n"
+        "}\n"
+        "void main() {\n"
+        "}\n";
+    char log[2048] = "";
+    GLuint prog = mgl_build_compute_program(CS, log, sizeof log);
+
+    CHECK_MSG(prog == 0, "a parameter named atomic_uint was accepted");
+    if (prog)
+        glDeleteProgram(prog);
+}

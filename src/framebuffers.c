@@ -19,6 +19,7 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "glm_context.h"
@@ -26,6 +27,7 @@
 #include "mgl_format_table.h"
 #include "utils.h"
 #include "mgl_log.h"
+#include "mgl_es.h"
 
 #define RENDBUF_STATE(_val_)    ctx->state.renderbuffer->_val_
 
@@ -275,8 +277,13 @@ GLsizei mglFramebufferSamples(Framebuffer *fbo)
             return tex->samples;
     }
 
+    // Metal rasterises 1, 2, 4 or 8 samples; GL lets the count round up
     if (fbo->color_attachment_bitfield == 0 && !fbo->depth.texture && !fbo->stencil.texture)
-        return fbo->default_samples;
+    {
+        GLsizei n = fbo->default_samples;
+
+        return n <= 2 ? n : n <= 4 ? 4 : 8;
+    }
 
     return 0;
 }
@@ -315,6 +322,9 @@ void mglApplyClearsFor(GLMContext ctx, Framebuffer *fbo)
 void mglBindFramebuffer(GLMContext ctx, GLenum target, GLuint framebuffer)
 {
     Framebuffer *ptr;
+
+    ERROR_CHECK_RETURN(target == GL_FRAMEBUFFER || target == GL_DRAW_FRAMEBUFFER || target == GL_READ_FRAMEBUFFER,
+                       GL_INVALID_ENUM);
 
     if(framebuffer)
     {
@@ -364,6 +374,8 @@ void mglBindFramebuffer(GLMContext ctx, GLenum target, GLuint framebuffer)
 
 void mglDeleteFramebuffers(GLMContext ctx, GLsizei n, const GLuint *framebuffers)
 {
+    ERROR_CHECK_RETURN(n >= 0, GL_INVALID_VALUE);
+
     for (GLsizei i = 0; i < n; i++)
     {
         if (framebuffers[i] == 0)
@@ -375,11 +387,11 @@ void mglDeleteFramebuffers(GLMContext ctx, GLsizei n, const GLuint *framebuffers
 
         mglApplyClearsFor(ctx, fbo);
             
-        // Unbind if currently bound
+        // a bound one goes back to the window
         if (ctx->state.framebuffer == fbo)
-            ctx->state.framebuffer = NULL;
+            mglBindFramebuffer(ctx, GL_DRAW_FRAMEBUFFER, 0);
         if (ctx->state.readbuffer == fbo)
-            ctx->state.readbuffer = NULL;
+            mglBindFramebuffer(ctx, GL_READ_FRAMEBUFFER, 0);
             
         // Remove from hash table
         deleteHashElement(&STATE(framebuffer_table), framebuffers[i]);
@@ -530,10 +542,57 @@ GLenum  mglCheckFramebufferStatus(GLMContext ctx, GLenum target)
         if (!attachmentComplete(all[i], points[i]))
             return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
 
+#ifdef MGL_OGL_ES
+    // ES 3.0 4.4.4: a mutable texture attached past its base level has to be
+    // mipmap complete, and cube complete for a cube map
+    for (int i = 0; ctx->es && i < n; i++)
+    {
+        Texture *tex = attachmentImage(all[i]);
+
+        if (points[i] >= GL_COLOR_ATTACHMENT0 && points[i] < GL_COLOR_ATTACHMENT0 + MAX_COLOR_ATTACHMENTS &&
+            !mglESColorRenderable(tex->internalformat))
+            return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
+
+        // only sized formats are depth or stencil renderable
+        if (tex->es_unsized_depth)
+            return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
+
+        if (all[i]->textarget == GL_RENDERBUFFER || tex->immutable_storage ||
+            all[i]->level == (GLint)tex->params.base_level)
+            continue;
+
+        TextureParameter mip = tex->params;
+
+        mip.min_filter = GL_NEAREST_MIPMAP_NEAREST;
+        mip.mag_filter = GL_NEAREST;
+
+        if (all[i]->level < (GLint)tex->params.base_level || all[i]->level > (GLint)tex->params.max_level ||
+            !mglTextureSamplingComplete(tex, &mip))
+            return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
+    }
+#endif
+
     // every image has to report the same sample count
     for (int i = 1; i < n; i++)
         if (attachmentImage(all[i])->samples != attachmentImage(all[0])->samples)
             return GL_FRAMEBUFFER_INCOMPLETE_MULTISAMPLE;
+
+    // GL 4.6 9.4.2: textures agree on fixed sample locations, and next to a
+    // renderbuffer they all have them
+    bool renderbuffer = false, fixed = false, variable = false;
+
+    for (int i = 0; i < n; i++)
+    {
+        if (all[i]->textarget == GL_RENDERBUFFER)
+            renderbuffer = true;
+        else if (attachmentImage(all[i])->variable_sample_locations)
+            variable = true;
+        else
+            fixed = true;
+    }
+
+    if (variable && (renderbuffer || fixed))
+        return GL_FRAMEBUFFER_INCOMPLETE_MULTISAMPLE;
 
     // layered or not, all of them; and layered ones all of one texture target
     for (int i = 1; i < n; i++)
@@ -823,8 +882,13 @@ static void getRenderbufferParameter(GLMContext ctx, Renderbuffer *rbo, GLenum p
                 *params = 0;
                 return;
 
+            // ES 3.0 6.1.15 starts a renderbuffer at GL_RGBA4
             case GL_RENDERBUFFER_INTERNAL_FORMAT:
                 *params = GL_RGBA;
+#ifdef MGL_OGL_ES
+                if (ctx->es)
+                    *params = GL_RGBA4;
+#endif
                 return;
 
             case GL_RENDERBUFFER_RED_SIZE:
@@ -986,6 +1050,9 @@ void framebufferTexture(GLMContext ctx, GLenum target, GLenum attachment_type, G
     {
         tex = findTexture(ctx, texture);
 
+#ifdef MGL_OGL_ES
+        ERROR_CHECK_RETURN(tex || !ctx->es, GL_INVALID_OPERATION);
+#endif
         ERROR_CHECK_RETURN(tex, GL_INVALID_VALUE);
 
         // a buffer texture is not an image a framebuffer can hold
@@ -1031,12 +1098,25 @@ void framebufferTexture(GLMContext ctx, GLenum target, GLenum attachment_type, G
             return;
         }
 
-        // A texture may legally be attached before it has storage allocated; that should
-        // make the FBO incomplete, not raise GL_INVALID_VALUE.
-        if (tex->mipmap_levels != 0 && level >= (GLint)tex->mipmap_levels)
+        // only a level no texture of this target could have is an error; one
+        // this texture lacks leaves the framebuffer incomplete
         {
-            STATE(error) = GL_INVALID_VALUE;
-            return;
+            GLuint biggest = textarget == GL_TEXTURE_3D ? STATE_VAR(max_3d_texture_size) :
+                             isCubeMapTarget(ctx, textarget) ? STATE_VAR(max_cube_map_texture_size) :
+                             STATE_VAR(max_texture_size);
+
+            if (biggest && level > ilog2(biggest))
+            {
+                STATE(error) = GL_INVALID_VALUE;
+                return;
+            }
+
+            // GL 4.6 9.2.8: an immutable texture has exactly the levels it was given
+            if (tex->immutable_storage && level >= (GLint)tex->mipmap_levels)
+            {
+                STATE(error) = GL_INVALID_VALUE;
+                return;
+            }
         }
 
         if (level > 0)
@@ -1052,7 +1132,7 @@ void framebufferTexture(GLMContext ctx, GLenum target, GLenum attachment_type, G
 
                 // if textarget is GL_TEXTURE_3D, then level must be greater than or equal to zero and less than or equal to $log_2$ of the value of GL_MAX_3D_TEXTURE_SIZE.
                 case GL_TEXTURE_3D:
-                    if (level >= ilog2(STATE_VAR(max_texture_size)))
+                    if (level > ilog2(STATE_VAR(max_3d_texture_size)))
                     {
                         ERROR_RETURN(GL_INVALID_VALUE);
                         return;
@@ -1075,7 +1155,7 @@ void framebufferTexture(GLMContext ctx, GLenum target, GLenum attachment_type, G
                             return;
                         }
                     }
-                    else if (level >= ilog2(STATE_VAR(max_texture_size)))
+                    else if (level > (GLint)ilog2(STATE_VAR(max_texture_size)))
                     {
                         // For all other values of textarget, level must be greater than or equal to zero and less than or equal to $log_2$ of the value of GL_MAX_TEXTURE_SIZE.
 
@@ -1225,9 +1305,11 @@ void mglFramebufferTextureLayer(GLMContext ctx, GLenum target, GLenum attachment
 
     if (t)
     {
-        // GL 4.6 §9.2.8: a rectangle texture cannot be attached to a layered
-        // framebuffer attachment point (it has no layers).
-        ERROR_CHECK_RETURN(t->target != GL_TEXTURE_RECTANGLE, GL_INVALID_OPERATION);
+        // GL 4.6 9.2.8: only textures with layers or faces
+        ERROR_CHECK_RETURN(t->target == GL_TEXTURE_3D || t->target == GL_TEXTURE_1D_ARRAY ||
+                           t->target == GL_TEXTURE_2D_ARRAY || t->target == GL_TEXTURE_CUBE_MAP ||
+                           t->target == GL_TEXTURE_CUBE_MAP_ARRAY || t->target == GL_TEXTURE_2D_MULTISAMPLE_ARRAY,
+                           GL_INVALID_OPERATION);
 
         GLint most = t->target == GL_TEXTURE_3D ? (GLint)STATE_VAR(max_3d_texture_size)
                                                 : (GLint)STATE_VAR(max_array_texture_layers);
@@ -1438,8 +1520,12 @@ void getFramebufferAttachmentParameteriv(GLMContext ctx, GLuint framebuffer, GLe
                     return;
 
                 case GL_FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE:
-                case GL_FRAMEBUFFER_ATTACHMENT_COLOR_ENCODING:
                     *params = GL_NONE;
+                    return;
+
+                // the default format is not sRGB
+                case GL_FRAMEBUFFER_ATTACHMENT_COLOR_ENCODING:
+                    *params = GL_LINEAR;
                     return;
 
                 case GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL:
@@ -1590,11 +1676,77 @@ void mglGetNamedFramebufferAttachmentParameteriv(GLMContext ctx, GLuint framebuf
 }
 
 
+static int blitColorKind(GLenum internalformat)
+{
+    int kind = internalformat ? mglFormatKind(internalformat) : MGL_FMT_COLOR_FLOAT;
+
+    return kind == MGL_FMT_COLOR_INT || kind == MGL_FMT_COLOR_UINT ? kind : MGL_FMT_COLOR_FLOAT;
+}
+
+// GL 4.6 18.3.1: integer and other colour do not mix, integers are not
+// filtered, and depth and stencil formats have to match
+static bool blitFormatsAgree(GLMContext ctx, GLbitfield mask, GLenum filter)
+{
+    Framebuffer *read = ctx->state.readbuffer, *draw = ctx->state.framebuffer;
+    GLenum rf = mglReadColorInternalFormat(ctx);
+
+    if ((mask & GL_COLOR_BUFFER_BIT) && (read == NULL || rf))
+    {
+        int rk = blitColorKind(rf);
+
+        if (filter == GL_LINEAR && rk != MGL_FMT_COLOR_FLOAT)
+            return false;
+
+        for (GLsizei i = 0; draw && i < draw->n_draw_buffers; i++)
+        {
+            GLenum b = draw->draw_buffers[i];
+            Texture *tex;
+
+            if (b < GL_COLOR_ATTACHMENT0 || b >= GL_COLOR_ATTACHMENT0 + MAX_COLOR_ATTACHMENTS)
+                continue;
+
+            tex = attachmentImage(&draw->color_attachments[b - GL_COLOR_ATTACHMENT0]);
+
+            if (tex && blitColorKind(tex->internalformat) != rk)
+                return false;
+        }
+
+        if (draw == NULL && rk != MGL_FMT_COLOR_FLOAT)
+            return false;
+    }
+
+    if (read && draw)
+    {
+        Texture *rd = attachmentImage(&read->depth), *dd = attachmentImage(&draw->depth);
+        Texture *rs = attachmentImage(&read->stencil), *ds = attachmentImage(&draw->stencil);
+
+        if ((mask & GL_DEPTH_BUFFER_BIT) && rd && dd && rd->internalformat != dd->internalformat)
+            return false;
+
+        if ((mask & GL_STENCIL_BUFFER_BIT) && rs && ds && rs->internalformat != ds->internalformat)
+            return false;
+    }
+
+    return true;
+}
+
 void mglBlitFramebuffer(GLMContext ctx, GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter)
 {
     ERROR_CHECK_RETURN((mask & ~(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT)) == 0,
                       GL_INVALID_VALUE);
     ERROR_CHECK_RETURN(filter == GL_NEAREST || filter == GL_LINEAR, GL_INVALID_ENUM);
+    // depth and stencil are not filtered
+    ERROR_CHECK_RETURN(filter == GL_NEAREST || !(mask & (GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT)),
+                       GL_INVALID_OPERATION);
+    ERROR_CHECK_RETURN(mglCheckFramebufferStatus(ctx, GL_READ_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE &&
+                       mglCheckFramebufferStatus(ctx, GL_DRAW_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE,
+                       GL_INVALID_FRAMEBUFFER_OPERATION);
+    ERROR_CHECK_RETURN(blitFormatsAgree(ctx, mask, filter), GL_INVALID_OPERATION);
+
+    // a multisampled side is copied sample for sample, so the sizes have to match
+    if (mglFramebufferSamples(ctx->state.readbuffer) || mglDrawFramebufferSamples(ctx))
+        ERROR_CHECK_RETURN(abs(srcX1 - srcX0) == abs(dstX1 - dstX0) && abs(srcY1 - srcY0) == abs(dstY1 - dstY0),
+                           GL_INVALID_OPERATION);
 
     MGL_INFO("MGL: glBlitFramebuffer src(%d,%d)-(%d,%d) dst(%d,%d)-(%d,%d) mask=0x%x\n",
             srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, mask);
@@ -1615,25 +1767,25 @@ static void framebufferParameter(GLMContext ctx, Framebuffer *fbo, GLenum pname,
 
     switch(pname) {
         case GL_FRAMEBUFFER_DEFAULT_WIDTH:
-            if (param < 0) {
+            if (param < 0 || (GLuint)param > STATE_VAR(max_framebuffer_width)) {
                 ERROR_RETURN(GL_INVALID_VALUE);
             }
             fbo->default_width = param;
             break;
         case GL_FRAMEBUFFER_DEFAULT_HEIGHT:
-            if (param < 0) {
+            if (param < 0 || (GLuint)param > STATE_VAR(max_framebuffer_height)) {
                 ERROR_RETURN(GL_INVALID_VALUE);
             }
             fbo->default_height = param;
             break;
         case GL_FRAMEBUFFER_DEFAULT_LAYERS:
-            if (param < 0) {
+            if (param < 0 || (GLuint)param > STATE_VAR(max_framebuffer_layers)) {
                 ERROR_RETURN(GL_INVALID_VALUE);
             }
             fbo->default_layers = param;
             break;
         case GL_FRAMEBUFFER_DEFAULT_SAMPLES:
-            if (param < 0) {
+            if (param < 0 || (GLuint)param > STATE_VAR(max_framebuffer_samples)) {
                 ERROR_RETURN(GL_INVALID_VALUE);
             }
             fbo->default_samples = param;
@@ -1678,16 +1830,14 @@ void mglFramebufferParameteri(GLMContext ctx, GLenum target, GLenum pname, GLint
 // What ReadPixels will accept for the colour buffer currently being read.
 // GL always allows RGBA/UNSIGNED_BYTE for a normalised buffer, but an integer
 // buffer has to name an integer pair or the caller reads integers as floats.
-void mglReadColorFormatAndType(GLMContext ctx, GLenum *format, GLenum *type)
+// the internal format of the colour buffer being read, or 0 for the window's
+GLenum mglReadColorInternalFormat(GLMContext ctx)
 {
     Framebuffer *fbo = ctx->state.readbuffer;
     GLenum internalformat = 0;
 
-    *format = GL_RGBA;
-    *type = GL_UNSIGNED_BYTE;
-
     if (fbo == NULL)
-        return;
+        return 0;
 
     {
         GLuint att = 0;
@@ -1706,6 +1856,16 @@ void mglReadColorFormatAndType(GLMContext ctx, GLenum *format, GLenum *type)
             internalformat = fbo->color_attachments[att].buf.tex->internalformat;
         }
     }
+
+    return internalformat;
+}
+
+void mglReadColorFormatAndType(GLMContext ctx, GLenum *format, GLenum *type)
+{
+    GLenum internalformat = mglReadColorInternalFormat(ctx);
+
+    *format = GL_RGBA;
+    *type = GL_UNSIGNED_BYTE;
 
     if (internalformat == 0)
         return;

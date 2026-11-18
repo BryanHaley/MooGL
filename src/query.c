@@ -163,9 +163,14 @@ void mglGenQueries(GLMContext ctx, GLsizei n, GLuint *ids)
 
     ERROR_CHECK_RETURN(ids, GL_INVALID_VALUE);
 
-    // reserves names only; a name becomes an object on first use
+    // a name with no target yet is only reserved; it becomes a query on first use
     for (GLsizei i = 0; i < n; i++)
+    {
         ids[i] = getNewName(&ctx->state.query_table);
+
+        if (newQuery(ctx, ids[i]) == NULL)
+            return;
+    }
 }
 
 void mglCreateQueries(GLMContext ctx, GLenum target, GLsizei n, GLuint *ids)
@@ -224,7 +229,9 @@ void mglDeleteQueries(GLMContext ctx, GLsizei n, const GLuint *ids)
 
 GLboolean mglIsQuery(GLMContext ctx, GLuint id)
 {
-    return findQuery(ctx, id) ? GL_TRUE : GL_FALSE;
+    Query *q = findQuery(ctx, id);
+
+    return q && q->target ? GL_TRUE : GL_FALSE;
 }
 
 void mglBeginQueryIndexed(GLMContext ctx, GLenum target, GLuint index, GLuint id)
@@ -234,7 +241,6 @@ void mglBeginQueryIndexed(GLMContext ctx, GLenum target, GLuint index, GLuint id
 
     ERROR_CHECK_RETURN(t >= 0, GL_INVALID_ENUM);
     ERROR_CHECK_RETURN(target != GL_TIMESTAMP, GL_INVALID_ENUM);
-    ERROR_CHECK_RETURN(id != 0, GL_INVALID_VALUE);
     ERROR_CHECK_RETURN(index < MAX_QUERY_STREAMS, GL_INVALID_VALUE);
     ERROR_CHECK_RETURN(targetAllowsStream(t, index), GL_INVALID_VALUE);
     ERROR_CHECK_RETURN(ctx->state.active_query[t][index] == NULL, GL_INVALID_OPERATION);
@@ -247,14 +253,8 @@ void mglBeginQueryIndexed(GLMContext ctx, GLenum target, GLuint index, GLuint id
 
     q = findQuery(ctx, id);
 
-    if (q == NULL)
-    {
-        q = newQuery(ctx, id);
-
-        if (q == NULL)
-            return;
-    }
-
+    // zero, a name glGenQueries never gave, or one since deleted
+    ERROR_CHECK_RETURN(q, GL_INVALID_OPERATION);
     ERROR_CHECK_RETURN(q->target == 0 || q->target == target, GL_INVALID_OPERATION);
 
     // counter slots from a run nobody read the answer of go back first
@@ -317,18 +317,10 @@ void mglQueryCounter(GLMContext ctx, GLuint id, GLenum target)
     Query *q;
 
     ERROR_CHECK_RETURN(target == GL_TIMESTAMP, GL_INVALID_ENUM);
-    ERROR_CHECK_RETURN(id != 0, GL_INVALID_VALUE);
 
     q = findQuery(ctx, id);
 
-    if (q == NULL)
-    {
-        q = newQuery(ctx, id);
-
-        if (q == NULL)
-            return;
-    }
-
+    ERROR_CHECK_RETURN(q, GL_INVALID_OPERATION);
     ERROR_CHECK_RETURN(q->active == GL_FALSE, GL_INVALID_OPERATION);
     ERROR_CHECK_RETURN(q->target == 0 || q->target == target, GL_INVALID_OPERATION);
 
@@ -376,7 +368,7 @@ static bool queryObjectValue(GLMContext ctx, GLuint id, GLenum pname, GLuint64 *
 {
     Query *q = findQuery(ctx, id);
 
-    ERROR_CHECK_RETURN_VALUE(q, GL_INVALID_OPERATION, false);
+    ERROR_CHECK_RETURN_VALUE(q && q->target, GL_INVALID_OPERATION, false);
     ERROR_CHECK_RETURN_VALUE(q->active == GL_FALSE, GL_INVALID_OPERATION, false);
 
     switch (pname)

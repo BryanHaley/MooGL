@@ -376,3 +376,233 @@ GPU_TEST(uniform_query, shaders_and_programs_never_share_a_name)
     }
     mgl_drain_errors();
 }
+
+GPU_TEST(uniform_query, struct_samplers_keep_their_gl_names)
+{
+    static const char *VS =
+        "#version 330 core\n"
+        "layout(location = 0) in vec2 pos;\n"
+        "void main() { gl_Position = vec4(pos, 0.0, 1.0); }\n";
+    static const char *FS =
+        "#version 330 core\n"
+        "struct S { sampler2D my_tex; float x; };\n"
+        "uniform S u_var;\n"
+        "uniform sampler2D many[2];\n"
+        "out vec4 color;\n"
+        "void main() { color = texture(u_var.my_tex, vec2(0.5)) * u_var.x + texture(many[1], vec2(0.5)); }\n";
+    const GLchar *names[1] = { "u_var.my_tex" };
+    char log[1024] = "", name[64];
+    GLuint prog = mgl_build_program(VS, FS, log, sizeof log), index = GL_INVALID_INDEX;
+    GLint count = 0, found = 0;
+
+    CHECK_MSG(prog != 0, "%s", log);
+    if (!prog)
+        return;
+
+    glGetUniformIndices(prog, 1, names, &index);
+    CHECK(index != GL_INVALID_INDEX);
+    CHECK(glGetUniformLocation(prog, "u_var.my_tex") >= 0);
+
+    glGetProgramiv(prog, GL_ACTIVE_UNIFORMS, &count);
+    for (GLint i = 0; i < count; i++)
+    {
+        GLint size;
+        GLenum type;
+
+        glGetActiveUniform(prog, (GLuint)i, sizeof name, NULL, &size, &type, name);
+        found += !strcmp(name, "u_var.my_tex");
+        // an array is named with "[0]"
+        found += !strcmp(name, "many[0]") * 10;
+    }
+    CHECK_EQ_INT(found, 11);
+
+    glDeleteProgram(prog);
+}
+
+GPU_TEST(uniform_query, a_sampler_struct_in_both_stages_is_one_uniform)
+{
+    static const char *VS =
+        "#version 330 core\n"
+        "struct S { sampler2D a; samplerCube b; };\n"
+        "uniform S u_var;\n"
+        "layout(location = 0) in vec2 pos;\n"
+        "out float v;\n"
+        "void main() { v = texture(u_var.a, vec2(0.0)).x + texture(u_var.b, vec3(0.0)).x;\n"
+        "              gl_Position = vec4(pos, 0.0, 1.0); }\n";
+    static const char *FS =
+        "#version 330 core\n"
+        "struct S { sampler2D a; samplerCube b; };\n"
+        "uniform S u_var;\n"
+        "in float v;\n"
+        "out vec4 color;\n"
+        "void main() { color = vec4(v) + texture(u_var.a, vec2(0.0)) + texture(u_var.b, vec3(0.0)); }\n";
+    char log[1024] = "";
+    GLuint prog = mgl_build_program(VS, FS, log, sizeof log);
+    GLint count = 0;
+
+    CHECK_MSG(prog != 0, "%s", log);
+    if (!prog)
+        return;
+
+    glGetProgramiv(prog, GL_ACTIVE_UNIFORMS, &count);
+    CHECK_EQ_INT(count, 2);
+    glDeleteProgram(prog);
+}
+
+GPU_TEST(uniform_query, bool_arrays_read_back_every_element)
+{
+    static const char *VS =
+        "#version 330 core\n"
+        "layout(location = 0) in vec2 pos;\n"
+        "void main() { gl_Position = vec4(pos, 0.0, 1.0); }\n";
+    static const char *FS =
+        "#version 330 core\n"
+        "struct S { float f; bvec2 m[3]; };\n"
+        "uniform S s;\n"
+        "uniform bool b[3];\n"
+        "out vec4 color;\n"
+        "void main() { color = vec4(s.f + float(s.m[2].y) + float(b[2])); }\n";
+    char log[1024] = "";
+    GLuint prog = mgl_build_program(VS, FS, log, sizeof log);
+    GLint set[2] = { 0, 1 }, got[2] = { 9, 9 };
+
+    CHECK_MSG(prog != 0, "%s", log);
+    if (!prog)
+        return;
+
+    glUseProgram(prog);
+    glUniform2iv(glGetUniformLocation(prog, "s.m[2]"), 1, set);
+    glGetUniformiv(prog, glGetUniformLocation(prog, "s.m[2]"), got);
+    CHECK_MSG(got[0] == 0 && got[1] == 1, "s.m[2] read %d %d", got[0], got[1]);
+
+    glUniform1i(glGetUniformLocation(prog, "b[2]"), 1);
+    glGetUniformiv(prog, glGetUniformLocation(prog, "b[2]"), got);
+    CHECK_EQ_INT(got[0], 1);
+
+    glUseProgram(0);
+    glDeleteProgram(prog);
+}
+
+GPU_TEST(uniform_query, samplers_in_an_array_of_structs_are_listed_per_element)
+{
+    static const char *VS =
+        "#version 330 core\n"
+        "layout(location = 0) in vec2 pos;\n"
+        "void main() { gl_Position = vec4(pos, 0.0, 1.0); }\n";
+    static const char *FS =
+        "#version 330 core\n"
+        "struct S { sampler2D a; sampler2D b[2]; float f; };\n"
+        "uniform S u_var[2];\n"
+        "out vec4 color;\n"
+        "void main() { color = texture(u_var[0].a, vec2(0.0)) + texture(u_var[1].b[1], vec2(0.0)) * u_var[1].f; }\n";
+    const GLchar *names[2] = { "u_var[1].a", "u_var[1].b[0]" };
+    char log[1024] = "", name[64];
+    GLuint prog = mgl_build_program(VS, FS, log, sizeof log), idx[2] = { GL_INVALID_INDEX, GL_INVALID_INDEX };
+    GLint count = 0, found = 0;
+
+    CHECK_MSG(prog != 0, "%s", log);
+    if (!prog)
+        return;
+
+    glGetUniformIndices(prog, 2, names, idx);
+    CHECK(idx[0] != GL_INVALID_INDEX && idx[1] != GL_INVALID_INDEX);
+
+    glGetProgramiv(prog, GL_ACTIVE_UNIFORMS, &count);
+    for (GLint i = 0; i < count; i++)
+    {
+        GLint size;
+        GLenum type;
+
+        glGetActiveUniform(prog, (GLuint)i, sizeof name, NULL, &size, &type, name);
+        found += !strcmp(name, "u_var[0].a") + !strcmp(name, "u_var[1].a") +
+                 (!strcmp(name, "u_var[1].b[0]") && size == 2);
+    }
+    CHECK_EQ_INT(found, 3);
+
+    glDeleteProgram(prog);
+}
+
+// a struct uniform nobody set reads as zero, however big it is
+GPU_TEST(uniform_query, a_large_unset_struct_reads_zero)
+{
+    static const char *VS =
+        "#version 330 core\n"
+        "layout(location = 0) in vec2 pos;\n"
+        "void main() { gl_Position = vec4(pos, 0.0, 1.0); }\n";
+    static const char *FS =
+        "#version 330 core\n"
+        "struct S { mat4 a; mat2 b; mat4 c[3]; mat2 d[3]; };\n"
+        "uniform S u;\n"
+        "out vec4 o;\n"
+        "void main() { o = vec4(u.d[2][1][1] == 0.0 && u.c[2][3][3] == 0.0 ? 1.0 : 0.0, 0.0, 0.0, 1.0); }\n";
+    MGLTestTarget t;
+    char log[1024] = { 0 };
+    GLuint prog = mgl_build_program(VS, FS, log, sizeof log), vbo = 0, vao;
+    unsigned char *px, c[4] = { 0 };
+
+    if (!prog || !mgl_target_create(&t, 4, 4, GL_RGBA8, 0)) { CHECK_MSG(0, "%s", log); return; }
+
+    mgl_target_bind(&t);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glUseProgram(prog);
+    vao = mgl_fullscreen_quad(&vbo);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    px = mgl_read_rgba8(&t);
+    if (px)
+        mgl_pixel_at(px, &t, 2, 2, c);
+    free(px);
+    CHECK_MSG(c[0] == 255, "drew %d, want 255", c[0]);
+
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo);
+    glUseProgram(0);
+    glDeleteProgram(prog);
+    mgl_target_destroy(&t);
+}
+
+// a three-row matrix beside a sampler in a struct, set and drawn
+GPU_TEST(uniform_query, three_row_matrices_in_a_struct_with_a_sampler)
+{
+    static const char *VS =
+        "#version 330 core\n"
+        "layout(location = 0) in vec2 pos;\n"
+        "void main() { gl_Position = vec4(pos, 0.0, 1.0); }\n";
+    static const char *FS =
+        "#version 330 core\n"
+        "struct S { mat2x3 a; sampler2D s; mat3 b; };\n"
+        "uniform S u;\n"
+        "out vec4 o;\n"
+        "void main() { o = vec4(u.a[1][2] == 6.0 && u.b[2][1] == 8.0 ? 1.0 : 0.0, 0.0, 0.0, 1.0)\n"
+        "                  + texture(u.s, vec2(0.5)) * 0.0; }\n";
+    static const GLfloat a[6] = { 1, 2, 3, 4, 5, 6 }, b[9] = { 0, 0, 0, 0, 0, 0, 0, 8, 0 };
+    MGLTestTarget t;
+    char log[1024] = { 0 };
+    GLuint prog = mgl_build_program(VS, FS, log, sizeof log), vbo = 0, vao;
+    GLfloat back[9] = { 0 };
+    unsigned char *px, c[4] = { 0 };
+
+    if (!prog || !mgl_target_create(&t, 4, 4, GL_RGBA8, 0)) { CHECK_MSG(0, "%s", log); return; }
+
+    mgl_target_bind(&t);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glUseProgram(prog);
+    glUniformMatrix2x3fv(glGetUniformLocation(prog, "u.a"), 1, GL_FALSE, a);
+    glUniformMatrix3fv(glGetUniformLocation(prog, "u.b"), 1, GL_FALSE, b);
+    glGetUniformfv(prog, glGetUniformLocation(prog, "u.a"), back);
+    CHECK(back[5] == 6.0f);
+    vao = mgl_fullscreen_quad(&vbo);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    px = mgl_read_rgba8(&t);
+    if (px)
+        mgl_pixel_at(px, &t, 2, 2, c);
+    free(px);
+    CHECK_MSG(c[0] == 255, "drew %d, want 255", c[0]);
+
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo);
+    glUseProgram(0);
+    glDeleteProgram(prog);
+    mgl_target_destroy(&t);
+}

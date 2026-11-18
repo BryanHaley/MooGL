@@ -75,9 +75,9 @@ void mglDispatchComputeIndirect(GLMContext ctx, GLintptr indirect)
 {
     Buffer *buf = STATE(buffers[_DISPATCH_INDIRECT_BUFFER]);
 
-    ERROR_CHECK_RETURN(buf, GL_INVALID_OPERATION);
     ERROR_CHECK_RETURN(indirect >= 0, GL_INVALID_VALUE);
     ERROR_CHECK_RETURN((indirect & 3) == 0, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(buf, GL_INVALID_OPERATION);
     ERROR_CHECK_RETURN(indirect + 12 <= buf->size, GL_INVALID_OPERATION);
     ERROR_CHECK_RETURN(STATE(program), GL_INVALID_OPERATION);
 

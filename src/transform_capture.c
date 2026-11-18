@@ -164,9 +164,11 @@ static void matrixShape(const char *type, int *cols, int *rows)
 
 // Finds "out TYPE name;" for the named varying in the shader source, and hands
 // back the type. gl_Position and friends are built in and have known types.
-static bool varyingType(const char *src, const char *name, char *type, size_t typelen)
+static bool varyingType(const char *src, const char *name, char *type, size_t typelen, int *length)
 {
     size_t i = 0;
+
+    *length = 0;
 
     if (!strcmp(name, "gl_Position")) { snprintf(type, typelen, "vec4"); return true; }
     if (!strcmp(name, "gl_PointSize")) { snprintf(type, typelen, "float"); return true; }
@@ -216,7 +218,13 @@ static bool varyingType(const char *src, const char *name, char *type, size_t ty
             for (int w = 1; w < n; w++)
                 if (!strcmp(words[w], "out"))
                 {
+                    size_t after = skipSpace(src, i + strlen(name));
+
                     snprintf(type, typelen, "%s", words[0]);
+
+                    if (src[after] == '[')
+                        *length = atoi(src + after + 1);
+
                     return true;
                 }
         }
@@ -352,7 +360,7 @@ static bool anonymousMemberType(const char *src, const char *name, char *type, s
 }
 
 static bool resolveVarying(const char *src, const char *name, char *expr, size_t exprlen,
-                           char *type, size_t typelen)
+                           char *type, size_t typelen, int *length)
 {
     const char *index = strchr(name, '[');
     char base[160];
@@ -360,6 +368,8 @@ static bool resolveVarying(const char *src, const char *name, char *expr, size_t
     snprintf(base, sizeof base, "%.*s", index ? (int)(index - name) : (int)strlen(name), name);
 
     char *dot = strchr(base, '.');
+
+    *length = 0;
 
     if (dot)
     {
@@ -375,8 +385,12 @@ static bool resolveVarying(const char *src, const char *name, char *expr, size_t
         return true;
     }
 
-    if (!varyingType(src, base, type, typelen) && !anonymousMemberType(src, base, type, typelen))
+    if (!varyingType(src, base, type, typelen, length) && !anonymousMemberType(src, base, type, typelen))
         return false;
+
+    // a whole array is captured element by element
+    if (index)
+        *length = 0;
 
     snprintf(expr, exprlen, "%s%s", base, index ? index : "");
 
@@ -445,12 +459,10 @@ static int itemsFromVaryings(const char *src, char *const *varyings, GLsizei cou
             offset = 0;
         }
 
-        if (buffer >= MGL_XFB_MAX_BUFFERS || n >= max_items)
-            return -1;
-
         char expr[160];
+        int length;
 
-        if (!resolveVarying(src, name, expr, sizeof expr, type, sizeof type))
+        if (!resolveVarying(src, name, expr, sizeof expr, type, sizeof type, &length))
         {
             MGL_ERR("MGL Error: transform feedback varying '%s' is not an output of this stage\n", name);
             return -1;
@@ -466,17 +478,28 @@ static int itemsFromVaryings(const char *src, char *const *varyings, GLsizei cou
 
         matrixShape(type, &cols, &rows);
 
-        memset(&items[n], 0, sizeof(items[n]));
-        snprintf(items[n].expr, sizeof(items[n].expr), "%s", expr);
-        items[n].buffer = buffer;
-        items[n].offset = offset;
-        items[n].kind = kind;
-        items[n].components = comps;
-        items[n].rows = cols ? rows : 0;
-        n++;
+        for (int e = 0; e < (length ? length : 1); e++)
+        {
+            if (buffer >= MGL_XFB_MAX_BUFFERS || n >= max_items)
+                return -1;
 
-        // A double takes two slots, the same way the capture writes it.
-        offset += (kind == 'd' ? 8 : 4) * comps;
+            memset(&items[n], 0, sizeof(items[n]));
+
+            if (length)
+                snprintf(items[n].expr, sizeof(items[n].expr), "%s[%d]", expr, e);
+            else
+                snprintf(items[n].expr, sizeof(items[n].expr), "%s", expr);
+
+            items[n].buffer = buffer;
+            items[n].offset = offset;
+            items[n].kind = kind;
+            items[n].components = comps;
+            items[n].rows = cols ? rows : 0;
+            n++;
+
+            // A double takes two slots, the same way the capture writes it.
+            offset += (kind == 'd' ? 8 : 4) * comps;
+        }
 
         if (offset > stride_bytes[buffer])
             stride_bytes[buffer] = offset;

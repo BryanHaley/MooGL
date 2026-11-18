@@ -41,7 +41,7 @@ void mglClear(GLMContext ctx, GLbitfield mask)
         ERROR_RETURN(GL_INVALID_VALUE);
     }
 
-    if (!mglDrawFramebufferComplete(ctx) || mglConditionalRenderSkips(ctx))
+    if (!mglDrawFramebufferComplete(ctx) || mglConditionalRenderSkips(ctx) || ctx->state.caps.rasterizer_discard)
         return;
 
     // clears still waiting on this framebuffer add up
@@ -78,7 +78,7 @@ void mglClearStencil(GLMContext ctx, GLint s)
 
 void mglClearDepth(GLMContext ctx, GLdouble depth)
 {
-    ctx->state.var.depth_clear_value = depth;
+    ctx->state.var.depth_clear_value = depth < 0.0 ? 0.0 : depth > 1.0 ? 1.0 : depth;
 
     ctx->state.dirty_bits |= DIRTY_STATE;
 }
@@ -157,7 +157,7 @@ void mglClearBufferfv(GLMContext ctx, GLenum buffer, GLint drawbuffer, const GLf
     Framebuffer * fbo = ctx->state.framebuffer;
     FBOAttachment * fboa;
 
-    if (!mglDrawFramebufferComplete(ctx) || mglConditionalRenderSkips(ctx))
+    if (!mglDrawFramebufferComplete(ctx) || mglConditionalRenderSkips(ctx) || ctx->state.caps.rasterizer_discard)
         return;
 
     ERROR_CHECK_RETURN(value, GL_INVALID_VALUE);
@@ -201,7 +201,7 @@ void mglClearBufferfi(GLMContext ctx, GLenum buffer, GLint drawbuffer, GLfloat d
     Framebuffer * fbo = ctx->state.framebuffer;
     FBOAttachment * fboa;
 
-    if (!mglDrawFramebufferComplete(ctx) || mglConditionalRenderSkips(ctx))
+    if (!mglDrawFramebufferComplete(ctx) || mglConditionalRenderSkips(ctx) || ctx->state.caps.rasterizer_discard)
         return;
 
     if (buffer != GL_DEPTH_STENCIL)
@@ -695,6 +695,9 @@ void mglReadPixels(GLMContext ctx, GLint x, GLint y, GLsizei width, GLsizei heig
         ERROR_RETURN(GL_INVALID_VALUE);
     }
 
+    // GL 4.6 18.2.1: a multisampled framebuffer is resolved with a blit, not read
+    ERROR_CHECK_RETURN(mglFramebufferSamples(ctx->state.readbuffer) == 0, GL_INVALID_OPERATION);
+
     if (width == 0 || height == 0)
     {
         return;
@@ -822,6 +825,27 @@ void mglReadPixels(GLMContext ctx, GLint x, GLint y, GLsizei width, GLsizei heig
 
     ctx->mtl_funcs.mtlReadPixels(ctx, pixels, pitch, format, type, x, y, width, height);
 
+    // an RGB buffer is kept in RGBA, and its alpha reads as 1 whatever is stored there
+    if ((format == GL_RGBA || format == GL_RGBA_INTEGER) && src_format &&
+        (src_format == GL_RGB || (mglFormatDesc(src_format)->base_format == GL_RGB &&
+                                  mglFormatDesc(src_format)->bits[3] == 0)))
+    {
+        for (GLsizei r = 0; r < height; r++)
+        {
+            GLubyte *row = (GLubyte *)pixels + (size_t)r * pitch;
+
+            for (GLsizei c = 0; c < width; c++)
+            {
+                if (type == GL_UNSIGNED_BYTE)
+                    row[c * 4 + 3] = 255;
+                else if (type == GL_FLOAT)
+                    ((GLfloat *)row)[c * 4 + 3] = 1.0f;
+                else if (type == GL_INT || type == GL_UNSIGNED_INT)
+                    ((GLint *)row)[c * 4 + 3] = 1;
+            }
+        }
+    }
+
     if (type == GL_FLOAT && format != GL_DEPTH_COMPONENT && format != GL_DEPTH_STENCIL &&
         format != GL_STENCIL_INDEX && readClamps(ctx, src_format))
     {
@@ -905,7 +929,7 @@ void mglClearBufferiv(GLMContext ctx, GLenum buffer, GLint drawbuffer, const GLi
 
     ERROR_CHECK_RETURN(value, GL_INVALID_VALUE);
 
-    if (!mglDrawFramebufferComplete(ctx) || mglConditionalRenderSkips(ctx))
+    if (!mglDrawFramebufferComplete(ctx) || mglConditionalRenderSkips(ctx) || ctx->state.caps.rasterizer_discard)
         return;
 
     for (int i = 0; i < 4; i++)
@@ -920,7 +944,7 @@ void mglClearBufferuiv(GLMContext ctx, GLenum buffer, GLint drawbuffer, const GL
 
     ERROR_CHECK_RETURN(value, GL_INVALID_VALUE);
 
-    if (!mglDrawFramebufferComplete(ctx) || mglConditionalRenderSkips(ctx))
+    if (!mglDrawFramebufferComplete(ctx) || mglConditionalRenderSkips(ctx) || ctx->state.caps.rasterizer_discard)
         return;
 
     for (int i = 0; i < 4; i++)

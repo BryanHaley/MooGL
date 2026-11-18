@@ -30,6 +30,7 @@
 
 #include <stdlib.h>
 #include "glm_context.h"
+#include "mgl_es.h"
 
 // in mgl_spirv_opt.cpp -- folds called functions into their callers
 extern bool mglInlineSpirv(const unsigned int *words, size_t count,
@@ -48,6 +49,9 @@ extern bool mglPatchGsPassthroughBuiltins(unsigned int *words, size_t count, uin
 extern bool mglPatchFsPrimitiveId(unsigned int *words, size_t count, uint32_t location);
 extern bool mglZeroBaseInstance(const unsigned int *words, size_t count,
                                 unsigned int **out_words, size_t *out_count);
+extern int mglMergeAliasedInputs(const unsigned int *words, size_t count, const char *const *bind_names,
+                                 const unsigned int *bind_locs, int nbinds, unsigned int **out_words,
+                                 size_t *out_count, char **removed, char **kept, int max_pairs);
 #include "shaders.h"
 #include "buffers.h"
 #include "mgl_log.h"
@@ -215,6 +219,18 @@ Program *findProgram(GLMContext ctx, GLuint program)
     return ptr;
 }
 
+Shader *findShader(GLMContext ctx, GLuint shader);
+
+GLenum mglProgramNameError(GLMContext ctx, GLuint name)
+{
+    return findShader(ctx, name) ? GL_INVALID_OPERATION : GL_INVALID_VALUE;
+}
+
+GLenum mglShaderNameError(GLMContext ctx, GLuint name)
+{
+    return findProgram(ctx, name) ? GL_INVALID_OPERATION : GL_INVALID_VALUE;
+}
+
 GLuint mglCreateProgram(GLMContext ctx)
 {
     GLuint program;
@@ -327,6 +343,8 @@ void mglFreeProgram(GLMContext ctx, Program *ptr)
     mglFreeCaptureInfo(&ptr->xfb);
     mglFreeResourceTable(&ptr->resources);
     freeSyntheticGeometry(ptr);
+
+    mglFreeOpaqueViews(ptr);
 
     for (GLint i = 0; i < ptr->attrib_bind_count; i++)
         free(ptr->attrib_binds[i].name);
@@ -458,7 +476,7 @@ void mglDeleteProgram(GLMContext ctx, GLuint program)
     {
         // 0 is silently ignored, any other unknown name is an error
         if (program != 0)
-            ERROR_RETURN(GL_INVALID_VALUE);
+            ERROR_RETURN(mglProgramNameError(ctx, program));
 
         return;
     }
@@ -517,30 +535,15 @@ static bool shaderHasMain(const Shader *sh)
 
 void mglAttachShader(GLMContext ctx, GLuint program, GLuint shader)
 {
-    Program *pptr;
+    Program *pptr = findProgram(ctx, program);
     Shader *sptr;
     GLuint index;
 
+    ERROR_CHECK_RETURN(pptr, mglProgramNameError(ctx, program));
+
     sptr = findShader(ctx, shader);
 
-    if (!sptr)
-    {
-        // CRITICAL FIX: Handle missing shader gracefully instead of crashing
-        MGL_ERR("MGL ERROR: Shader %u not found in attach shader\n", shader);
-        STATE(error) = GL_INVALID_VALUE;
-        return;
-    }
-
-    pptr = findProgram(ctx, program);
-
-    if (!pptr)
-    {
-        // CRITICAL FIX: Handle error gracefully instead of crashing
-        MGL_ERR("MGL ERROR: Critical error in program.c at line %d\n", __LINE__);
-        STATE(error) = GL_INVALID_OPERATION;
-
-        return;
-    }
+    ERROR_CHECK_RETURN(sptr, mglShaderNameError(ctx, shader));
 
     index = sptr->glm_type;
 
@@ -581,13 +584,8 @@ void mglDetachShader(GLMContext ctx, GLuint program, GLuint shader)
     GLuint index;
 
     pptr = findProgram(ctx, program);
-    if (!pptr)
-    {
-        // CRITICAL FIX: Handle error gracefully instead of crashing
-        MGL_ERR("MGL ERROR: Critical error in program.c at line %d\n", __LINE__);
-        STATE(error) = GL_INVALID_OPERATION;
-        return;
-    }
+
+    ERROR_CHECK_RETURN(pptr, mglProgramNameError(ctx, program));
 
     sptr = findShader(ctx, shader);
 
@@ -602,13 +600,8 @@ void mglDetachShader(GLMContext ctx, GLuint program, GLuint shader)
         }
     }
 
-    if (!sptr)
-    {
-        // CRITICAL FIX: Handle error gracefully instead of crashing
-        MGL_ERR("MGL ERROR: Critical error in program.c at line %d\n", __LINE__);
-        STATE(error) = GL_INVALID_OPERATION;
-        return;
-    }
+    ERROR_CHECK_RETURN(sptr, mglShaderNameError(ctx, shader));
+    ERROR_CHECK_RETURN(shaderAttached(pptr, sptr), GL_INVALID_OPERATION);
 
     index = sptr->glm_type;
 
@@ -967,6 +960,13 @@ static bool scanDeclSaysBool(const char *src, const char *keyword, const char *b
 
             if (strncmp(w, block, blen) != 0)
                 continue;
+
+            w += blen;
+            while (*w == ' ' || *w == '\t' || *w == '\n' || *w == '\r') w++;
+
+            // "uniform S s;" names the type, not a body
+            if (*w != '{')
+                continue;
         }
 
         open = strchr(p, '{');
@@ -1154,21 +1154,59 @@ static GLuint countBlockLeaves(spvc_compiler compiler, spvc_type st, unsigned de
                          : mt;
             GLuint elems = 1;
 
-            if (spvc_type_get_num_array_dimensions(mt) > 0)
+            for (unsigned d = 0; d < spvc_type_get_num_array_dimensions(mt); d++)
             {
-                unsigned dim = spvc_type_get_array_dimension(mt, 0);
+                unsigned dim = spvc_type_get_array_dimension(mt, d);
 
-                elems = dim ? dim : 1;
+                elems *= dim ? dim : 1;
             }
 
             if (et)
                 n += elems * countBlockLeaves(compiler, et, depth + 1);
         }
         else
-            n++;
+        {
+            // an array of arrays is one entry per outer element
+            GLuint outer = 1;
+
+            for (unsigned d = 1; d < spvc_type_get_num_array_dimensions(mt); d++)
+            {
+                unsigned dim = spvc_type_get_array_dimension(mt, d);
+
+                outer *= dim ? dim : 1;
+            }
+
+            n += outer;
+        }
     }
 
     return n;
+}
+
+// The array levels of a block member, outermost first, and each level's stride.
+// SPIR-V gives only the outermost stride; the inner levels are packed inside it.
+static void blockArrayLevels(spvc_compiler compiler, spvc_type st, unsigned m, spvc_type mt,
+                             GLint dims[4], GLint strides[4], GLint *nd)
+{
+    unsigned n = spvc_type_get_num_array_dimensions(mt), as = 0;
+
+    *nd = n > 4 ? 4 : (GLint)n;
+
+    if (*nd == 0)
+        return;
+
+    // SPIRV-Cross keeps the innermost size first
+    for (GLint d = 0; d < *nd; d++)
+    {
+        unsigned v = spvc_type_get_array_dimension(mt, (unsigned)(*nd - 1 - d));
+
+        dims[d] = v ? (GLint)v : 1;
+    }
+
+    strides[0] = spvc_compiler_type_struct_member_array_stride(compiler, st, m, &as) == SPVC_SUCCESS ? (GLint)as : 0;
+
+    for (GLint d = 1; d < *nd; d++)
+        strides[d] = strides[d - 1] / dims[d];
 }
 
 static void flattenBlockMembers(spvc_compiler compiler, Program *ptr, int stage,
@@ -1209,36 +1247,45 @@ static void flattenBlockMembers(spvc_compiler compiler, Program *ptr, int stage,
             unsigned sub = 0;
             GLint here = (spvc_compiler_type_struct_member_offset(compiler, st, m, &sub) == SPVC_SUCCESS)
                        ? base_offset + (GLint)sub : base_offset;
-            GLint elems = 1, stride = 0;
-            bool is_array = spvc_type_get_num_array_dimensions(mt) > 0;
+            GLint dims[4], strides[4], nd = 0, elems = 1;
 
             if (!et)
                 continue;
 
-            if (is_array)
-            {
-                unsigned dim = spvc_type_get_array_dimension(mt, 0);
-                unsigned as = 0;
+            blockArrayLevels(compiler, st, m, mt, dims, strides, &nd);
 
-                elems = dim ? (GLint)dim : 1;
+            for (GLint d = 0; d < nd; d++)
+                elems *= dims[d];
 
-                if (spvc_compiler_type_struct_member_array_stride(compiler, st, m, &as) == SPVC_SUCCESS)
-                    stride = (GLint)as;
-            }
-
-            // GL enumerates every element of an array of structures
+            // GL enumerates every element of an array of structures, every level of it
             for (GLint e = 0; e < elems && *out < total; e++)
             {
                 char child[512];
+                GLint at = here, rest = e;
+                size_t l = (size_t)snprintf(child, sizeof child, "%s", name);
 
                 // an array of one is still an array: GL names it "l[0].mA"
-                if (is_array)
-                    snprintf(child, sizeof child, "%s[%d]", name, e);
-                else
-                    snprintf(child, sizeof child, "%s", name);
+                for (GLint d = nd - 1; d >= 0; d--)
+                {
+                    GLint i = rest % dims[d];
+
+                    rest /= dims[d];
+                    at += i * strides[d];
+                }
+
+                rest = e;
+                for (GLint d = 0; d < nd; d++)
+                {
+                    GLint below = 1;
+
+                    for (GLint k = d + 1; k < nd; k++)
+                        below *= dims[k];
+
+                    l += (size_t)snprintf(child + l, sizeof child - l, "[%d]", (rest / below) % dims[d]);
+                }
 
                 flattenBlockMembers(compiler, ptr, stage, et, etid, child, depth + 1,
-                                    block_index, here + e * stride, out, total);
+                                    block_index, at, out, total);
             }
 
             continue;
@@ -1264,46 +1311,75 @@ static void flattenBlockMembers(spvc_compiler compiler, Program *ptr, int stage,
                 gl_type = boolTypeForVecSize(n);
         }
 
-        // GL names an array member "g[0]" even when the array holds one
-        // element, and reports its size as that count
-        if (spvc_type_get_num_array_dimensions(mt) > 0)
+        GLint dims[4], strides[4], nd = 0, outer = 1;
+
+        blockArrayLevels(compiler, st, m, mt, dims, strides, &nd);
+
+        for (GLint d = 0; d + 1 < nd; d++)
+            outer *= dims[d];
+
+        // an array of arrays is one GL uniform per outer element, "g[1][0]";
+        // GL names an array "g[0]" even when it holds one element
+        for (GLint o = 0; o < outer && *out < total; o++)
         {
-            size_t l = strlen(name);
+            char full[512];
+            size_t l = (size_t)snprintf(full, sizeof full, "%s", name);
+            GLint shift = 0, rest = o;
+            bool seen = false;
 
-            if (l + 4 < sizeof name)
-                snprintf(name + l, sizeof name - l, "[0]");
-        }
+            for (GLint d = nd - 2; d >= 0; d--)
+            {
+                shift += (rest % dims[d]) * strides[d];
+                rest /= dims[d];
+            }
 
-        // a block declared in two stages is still one set of uniforms
-        for (int prev = _VERTEX_SHADER; prev <= stage; prev++)
-        {
-            SpirvResourceList *pl = &ptr->block_uniforms[prev];
-            GLuint limit = (prev == stage) ? *out : pl->count;
+            rest = o;
+            for (GLint d = 0; d + 1 < nd; d++)
+            {
+                GLint below = 1;
 
-            for (GLuint k = 0; k < limit; k++)
-                if (pl->list[k].name && !strcmp(pl->list[k].name, name))
-                    return;
-        }
+                for (GLint k = d + 1; k + 1 < nd; k++)
+                    below *= dims[k];
 
-        {
+                l += (size_t)snprintf(full + l, sizeof full - l, "[%d]", (rest / below) % dims[d]);
+            }
+
+            if (nd > 0)
+                snprintf(full + l, sizeof full - l, "[0]");
+
+            // a block declared in two stages is still one set of uniforms
+            for (int prev = _VERTEX_SHADER; prev <= stage && !seen; prev++)
+            {
+                SpirvResourceList *pl = &ptr->block_uniforms[prev];
+                GLuint limit = (prev == stage) ? *out : pl->count;
+
+                for (GLuint k = 0; k < limit; k++)
+                    if (pl->list[k].name && !strcmp(pl->list[k].name, full))
+                        seen = true;
+            }
+
+            if (seen)
+                continue;
+
             SpirvResource *dst = &ptr->block_uniforms[stage].list[*out];
 
             dst->type_id = mtid;
             dst->gl_type = gl_type;
-            dst->array_size = asize;
-            dst->name = strdup(name);
+            dst->array_size = nd > 1 ? dims[nd - 1] : asize;
+            dst->name = strdup(full);
             dst->block_index = block_index;
             dst->offset = (spvc_compiler_type_struct_member_offset(compiler, st, m, &off) == SPVC_SUCCESS)
-                        ? base_offset + (GLint)off : -1;
-            dst->array_stride = (spvc_compiler_type_struct_member_array_stride(compiler, st, m, &astride) == SPVC_SUCCESS)
+                        ? base_offset + (GLint)off + shift : -1;
+            dst->array_stride = nd > 1 ? strides[nd - 1] :
+                        (spvc_compiler_type_struct_member_array_stride(compiler, st, m, &astride) == SPVC_SUCCESS)
                         ? (GLint)astride : 0;
             dst->matrix_stride = (spvc_compiler_type_struct_member_matrix_stride(compiler, st, m, &mstride) == SPVC_SUCCESS)
                         ? (GLint)mstride : 0;
             dst->is_row_major = spvc_compiler_has_member_decoration(compiler, st_id, m, SpvDecorationRowMajor)
                         ? GL_TRUE : GL_FALSE;
-        }
 
-        (*out)++;
+            (*out)++;
+        }
     }
 }
 
@@ -1324,7 +1400,8 @@ static unsigned mslScalarSize(spvc_basetype bt)
 {
     switch (bt)
     {
-        case SPVC_BASETYPE_BOOLEAN: return 1;
+        // SPIRV-Cross makes a bool in a buffer struct a short
+        case SPVC_BASETYPE_BOOLEAN: return 2;
         case SPVC_BASETYPE_INT8:
         case SPVC_BASETYPE_UINT8:   return 1;
         case SPVC_BASETYPE_INT16:
@@ -1805,6 +1882,8 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage, Spirv *sp
     size_t i;
     unsigned int *lowered = NULL;
     size_t lowered_count = 0;
+    char *merged_removed[32], *merged_kept[32];
+    int merged_count = 0;
     unsigned int atomic_ids[MAX_ATOMIC_COUNTER_BUFFER_BINDINGS];
     unsigned int atomic_bindings[MAX_ATOMIC_COUNTER_BUFFER_BINDINGS];
     int atomic_blocks = 0;
@@ -1893,6 +1972,35 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage, Spirv *sp
         {
             src = zeroed;
             n = zeroed_count;
+        }
+
+        if (stage == _VERTEX_SHADER && ptr->attrib_bind_count > 0 && ptr->shader_slots[stage] &&
+            ptr->shader_slots[stage]->src)
+        {
+            const char *bind_names[32];
+            unsigned bind_locs[32];
+            unsigned int *folded = NULL;
+            size_t folded_count = 0;
+
+            int nb = 0;
+
+            // layout(location) wins over glBindAttribLocation
+            for (GLint b = 0; b < ptr->attrib_bind_count; b++)
+            {
+                if (explicitLayout(ptr->shader_slots[stage]->src, ptr->attrib_binds[b].name, "location", "in") != -1)
+                    continue;
+                bind_names[nb] = ptr->attrib_binds[b].name;
+                bind_locs[nb++] = ptr->attrib_binds[b].location;
+            }
+
+            merged_count = mglMergeAliasedInputs(src, n, bind_names, bind_locs, nb,
+                                                 &folded, &folded_count, merged_removed, merged_kept, 32);
+            if (merged_count > 0)
+            {
+                free(zeroed);
+                src = zeroed = folded;
+                n = folded_count;
+            }
         }
 
         parse_res = spvc_context_parse_spirv(context, src, n, &ir);
@@ -1998,6 +2106,10 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage, Spirv *sp
         MGL_ERR("MGL Error: spvc_compiler_options_set_uint(SPVC_COMPILER_OPTION_MSL_VERSION) failed\n");
         { spvc_context_destroy(context); ERROR_RETURN_VALUE(GL_INVALID_OPERATION, NULL); }
     }
+
+    // a variable read before it is written reads zero, as most GL drivers
+    // give it; Metal leaves it holding anything
+    spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_FORCE_ZERO_INITIALIZED_VARIABLES, SPVC_TRUE);
 
     // a samplerBuffer or imageBuffer is Metal's own texture_buffer, which
     // aliases the MTLBuffer rather than copying it into a 2D texture
@@ -2552,6 +2664,17 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage, Spirv *sp
             ptr->spirv_resources_list[stage][res_type].list[i].base_type_id = list[i].base_type_id;
             ptr->spirv_resources_list[stage][res_type].list[i].type_id = list[i].type_id;
             ptr->spirv_resources_list[stage][res_type].list[i].name = strdup(list[i].name);
+
+            // a sampler moved out of a struct uniform answers to its GL name
+            {
+                char gl_name[256];
+
+                if (mglOpaqueStructGLName(list[i].name, gl_name, sizeof gl_name))
+                {
+                    free((void *)ptr->spirv_resources_list[stage][res_type].list[i].name);
+                    ptr->spirv_resources_list[stage][res_type].list[i].name = strdup(gl_name);
+                }
+            }
             ptr->spirv_resources_list[stage][res_type].list[i].set = spvc_compiler_get_decoration(compiler_msl, list[i].id, SpvDecorationDescriptorSet);
             ptr->spirv_resources_list[stage][res_type].list[i].binding = spvc_compiler_get_decoration(compiler_msl, list[i].id, SpvDecorationBinding);
             if (res_type == SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT ||
@@ -2569,7 +2692,16 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage, Spirv *sp
                 ptr->spirv_resources_list[stage][res_type].list[i].explicit_location = explicit_loc >= 0;
             }
             else
-                ptr->spirv_resources_list[stage][res_type].list[i].location = spvc_compiler_get_decoration(compiler_msl, list[i].id, SpvDecorationLocation);
+            {
+                GLuint loc = spvc_compiler_get_decoration(compiler_msl, list[i].id, SpvDecorationLocation);
+
+                // an aliased input answers to the attribute it was bound to
+                if (stage == _VERTEX_SHADER && res_type == SPVC_RESOURCE_TYPE_STAGE_INPUT && loc < 31 &&
+                    ptr->attrib_alias[loc])
+                    loc = ptr->attrib_alias[loc] - 1u;
+
+                ptr->spirv_resources_list[stage][res_type].list[i].location = loc;
+            }
             // GL reads the texture unit out of the sampler uniform's value. It
             // starts at the binding the shader declared, or at 0 -- not at
             // whatever binding glslang handed out -- and glUniform1i replaces it.
@@ -2595,6 +2727,7 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage, Spirv *sp
                 }
 
                 ptr->spirv_resources_list[stage][res_type].list[i].tex_unit = declared >= 0 ? declared : 0;
+                ptr->spirv_resources_list[stage][res_type].list[i].has_binding = declared >= 0;
             }
 
             // The CTS sizes its buffer from GL_UNIFORM_BLOCK_DATA_SIZE, so a
@@ -2724,6 +2857,37 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage, Spirv *sp
         rlist->count = kept;
     }
 
+    // a folded input is still a GL attribute, at the same place as the one it reads
+    if (merged_count > 0)
+    {
+        SpirvResourceList *in = &ptr->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_STAGE_INPUT];
+        SpirvResource *grown = (SpirvResource *)realloc(in->list, (in->count + merged_count) * sizeof(SpirvResource));
+
+        if (grown)
+        {
+            in->list = grown;
+
+            for (int m = 0; m < merged_count; m++)
+                for (GLuint k = 0, n0 = in->count; k < n0; k++)
+                    if (in->list[k].name && !strcmp(in->list[k].name, merged_kept[m]))
+                    {
+                        in->list[in->count] = in->list[k];
+                        in->list[in->count].name = strdup(merged_removed[m]);
+                        in->list[in->count].element_binding = NULL;
+                        in->list[in->count].element_unit = NULL;
+                        in->count++;
+                        break;
+                    }
+        }
+    }
+
+    for (int m = 0; m < merged_count; m++)
+    {
+        free(merged_removed[m]);
+        free(merged_kept[m]);
+    }
+    merged_count = 0;
+
     // MSL slots are not a dense run -- an arrayed uniform reserves one index
     // per element -- so ask for each slot rather than counting. They are only
     // assigned once the shader has actually been emitted, hence after compile.
@@ -2763,6 +2927,15 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage, Spirv *sp
             rlist->list[i].gl_type = glTypeFromSpirv(compiler_msl, rlist->list[i].type_id,
                                                      &rlist->list[i].array_size);
 
+            if (res_type == SPVC_RESOURCE_TYPE_STAGE_INPUT || res_type == SPVC_RESOURCE_TYPE_STAGE_OUTPUT)
+                rlist->list[i].flat = spvc_compiler_has_decoration(compiler_msl, rlist->list[i]._id, SpvDecorationFlat);
+#ifdef MGL_OGL_ES
+            if (ctx->es && ptr->shader_slots[stage] && ptr->shader_slots[stage]->src &&
+                (res_type == SPVC_RESOURCE_TYPE_STAGE_INPUT || res_type == SPVC_RESOURCE_TYPE_STAGE_OUTPUT))
+                rlist->list[i].precision = mglESVaryingPrecision(ptr->shader_slots[stage]->src, rlist->list[i].name,
+                                                                 stage == _FRAGMENT_SHADER);
+#endif
+
             // a plain array of arrays takes a location for every element,
             // numbered with the last subscript changing fastest -- and so does
             // one of samplers or images, which Metal is handed flat in the
@@ -2774,6 +2947,8 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage, Spirv *sp
             {
                 spvc_type at = spvc_compiler_get_type_handle(compiler_msl, rlist->list[i].type_id);
                 unsigned nd = at ? spvc_type_get_num_array_dimensions(at) : 0;
+
+                rlist->list[i].is_array = nd > 0;
 
                 if (nd > 1 && nd <= 4)
                 {
@@ -2791,9 +2966,22 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage, Spirv *sp
                     rlist->list[i].dim_count = (GLint)nd;
                     rlist->list[i].array_size = total;
                 }
+
+                // a sampler kept flat for want of arrays of arrays
+                if (nd == 1 && rlist->list[i].name)
+                {
+                    int d[4];
+                    int dn = mglOpaqueStructTakeSizes((char *)rlist->list[i].name, d, 4);
+
+                    for (int k = 0; k < dn; k++)
+                        rlist->list[i].dims[k] = d[k];
+
+                    if (dn > 1)
+                        rlist->list[i].dim_count = dn;
+                }
             }
 
-            // layout(binding = N) on an array gives its elements N, N+1, ...
+            // layout(binding = N) on an array gives its elements N, N+1, ...; with none they all start at 0
             if ((res_type == SPVC_RESOURCE_TYPE_SAMPLED_IMAGE ||
                  res_type == SPVC_RESOURCE_TYPE_STORAGE_IMAGE) && rlist->list[i].array_size > 1)
             {
@@ -2802,7 +2990,8 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage, Spirv *sp
 
                 if (rlist->list[i].element_unit)
                     for (GLint e = 0; e < rlist->list[i].array_size; e++)
-                        rlist->list[i].element_unit[e] = rlist->list[i].tex_unit + e;
+                        rlist->list[i].element_unit[e] = rlist->list[i].tex_unit +
+                                                         (rlist->list[i].has_binding ? e : 0);
             }
 
             if (res_type == SPVC_RESOURCE_TYPE_STORAGE_IMAGE)
@@ -2974,6 +3163,9 @@ static void assignPipeLocations(Program *ptr, spvc_compiler compiler, int stage)
     if (count > 64)
         count = 64;
 
+    if (inputs)
+        memset(ptr->attrib_alias, 0, sizeof ptr->attrib_alias);
+
     for (size_t i = 0; i < count; i++)
     {
         spvc_type t = spvc_compiler_get_type_handle(compiler, list[i].type_id);
@@ -3001,6 +3193,32 @@ static void assignPipeLocations(Program *ptr, spvc_compiler compiler, int stage)
             for (GLint b = 0; b < nb; b++)
                 if (!strcmp(binds[b].name, list[i].name))
                     want[i] = (GLint)binds[b].location;
+        }
+
+        // a second input bound to a taken attribute moves to a spare one
+        if (inputs && want[i] >= 0 && want[i] + slots[i] <= 16)
+        {
+            bool taken = false;
+
+            for (GLuint k = 0; k < slots[i]; k++)
+                taken |= used[want[i] + k];
+
+            for (GLint spare = 16; taken && spare + (GLint)slots[i] <= 31; spare++)
+            {
+                bool free_run = true;
+
+                for (GLuint k = 0; k < slots[i]; k++)
+                    free_run &= !used[spare + k] && ptr->attrib_alias[spare + k] == 0;
+
+                if (!free_run)
+                    continue;
+
+                for (GLuint k = 0; k < slots[i]; k++)
+                    ptr->attrib_alias[spare + k] = (GLubyte)(want[i] + k + 1);
+
+                want[i] = spare;
+                break;
+            }
         }
 
         if (want[i] >= 0)
@@ -3135,6 +3353,165 @@ static const char *imageUniformProblem(GLMContext ctx, Program *ptr)
 
     if (total > STATE_VAR(max_combined_image_uniforms))
         return "link failed: more image uniforms than GL_MAX_COMBINED_IMAGE_UNIFORMS";
+
+    return NULL;
+}
+
+// Bytes a SPIR-V type takes, near enough to check a limit: no padding.
+static uint64_t spirvTypeBytes(const uint32_t *w, size_t n, uint32_t id, int depth)
+{
+    for (size_t i = 5; i < n && depth < 16; i += (w[i] >> 16) ? (w[i] >> 16) : 1)
+    {
+        uint32_t op = w[i] & 0xFFFF, len = w[i] >> 16;
+
+        if (len < 2 || w[i + 1] != id)
+            continue;
+
+        switch (op)
+        {
+            case 20: return 4;                                              // OpTypeBool
+            case 21: case 22: return w[i + 2] / 8;                          // OpTypeInt, OpTypeFloat
+            case 23: case 24: return w[i + 3] * spirvTypeBytes(w, n, w[i + 2], depth + 1);  // vector, matrix
+            case 28:                                                        // OpTypeArray
+            {
+                uint64_t count = 0;
+
+                for (size_t j = 5; j < n; j += (w[j] >> 16) ? (w[j] >> 16) : 1)
+                    if ((w[j] & 0xFFFF) == 43 && w[j + 2] == w[i + 3])      // OpConstant
+                        count = w[j + 3];
+
+                return count * spirvTypeBytes(w, n, w[i + 2], depth + 1);
+            }
+            case 30:                                                        // OpTypeStruct
+            {
+                uint64_t sum = 0;
+
+                for (uint32_t m = 2; m < len; m++)
+                    sum += spirvTypeBytes(w, n, w[i + m], depth + 1);
+
+                return sum;
+            }
+        }
+    }
+
+    return 0;
+}
+
+// what a compute shader's shared variables take
+static uint64_t sharedMemoryBytes(const Spirv *sp)
+{
+    const uint32_t *w = sp->ir;
+    uint64_t total = 0;
+
+    for (size_t i = 5; w && i < sp->size; i += (w[i] >> 16) ? (w[i] >> 16) : 1)
+    {
+        // OpVariable in the Workgroup storage class
+        if ((w[i] & 0xFFFF) != 59 || (w[i] >> 16) < 4 || w[i + 3] != 4)
+            continue;
+
+        // its pointer type names the pointee
+        for (size_t j = 5; j < sp->size; j += (w[j] >> 16) ? (w[j] >> 16) : 1)
+            if ((w[j] & 0xFFFF) == 32 && w[j + 1] == w[i + 1])
+                total += spirvTypeBytes(w, sp->size, w[j + 3], 0);
+    }
+
+    return total;
+}
+
+static bool mglInternalBlock(const char *name)
+{
+    return name && (!strncmp(name, "mgl", 3) || !strncmp(name, "Mgl", 3)) && isupper((unsigned char)name[3]);
+}
+
+// GL 4.6 7.6.2 and 7.8, 19.1: a program over a stage's block, shared memory or
+// work group limits does not link
+static const char *limitProblem(GLMContext ctx, Program *ptr)
+{
+    static const int types[2] = { SPVC_RESOURCE_TYPE_UNIFORM_BUFFER, SPVC_RESOURCE_TYPE_STORAGE_BUFFER };
+    GLuint limits[2][_MAX_SHADER_TYPES] = {
+        { STATE_VAR(max_vertex_uniform_blocks), STATE_VAR(max_tess_control_uniform_blocks),
+          STATE_VAR(max_tess_evaluation_uniform_blocks), STATE_VAR(max_geometry_uniform_blocks),
+          STATE_VAR(max_fragment_uniform_blocks), STATE_VAR(max_compute_uniform_blocks) },
+        { STATE_VAR(max_vertex_shader_storage_blocks), STATE_VAR(max_tess_control_shader_storage_blocks),
+          STATE_VAR(max_tess_evaluation_shader_storage_blocks), STATE_VAR(max_geometry_shader_storage_blocks),
+          STATE_VAR(max_fragment_shader_storage_blocks), STATE_VAR(max_compute_shader_storage_blocks) },
+    };
+    GLuint combined[2] = { STATE_VAR(max_combined_uniform_blocks), STATE_VAR(max_combined_shader_storage_blocks) };
+
+    for (int t = 0; t < 2; t++)
+    {
+        GLuint total = 0;
+
+        for (int stage = _VERTEX_SHADER; stage <= _COMPUTE_SHADER; stage++)
+        {
+            SpirvResourceList *list = &ptr->spirv_resources_list[stage][types[t]];
+            GLuint used = 0;
+
+            if (ptr->shader_slots[stage] == NULL)
+                continue;
+
+            for (GLuint i = 0; i < list->count; i++)
+                if (!mglInternalBlock(list->list[i].name))
+                    used += list->list[i].array_size > 1 ? (GLuint)list->list[i].array_size : 1;
+
+            if (limits[t][stage] && used > limits[t][stage])
+                return t ? "link failed: a stage uses more storage blocks than its GL_MAX_*_SHADER_STORAGE_BLOCKS"
+                         : "link failed: a stage uses more uniform blocks than its GL_MAX_*_UNIFORM_BLOCKS";
+
+            total += used;
+        }
+
+        if (combined[t] && total > combined[t])
+            return t ? "link failed: more storage blocks than GL_MAX_COMBINED_SHADER_STORAGE_BLOCKS"
+                     : "link failed: more uniform blocks than GL_MAX_COMBINED_UNIFORM_BLOCKS";
+    }
+
+    // every location the vertex inputs take, a matrix one per column
+    if (ptr->shader_slots[_VERTEX_SHADER])
+    {
+        SpirvResourceList *in = &ptr->spirv_resources_list[_VERTEX_SHADER][SPVC_RESOURCE_TYPE_STAGE_INPUT];
+        GLuint used = 0;
+        uint64_t taken = 0;
+
+        for (GLuint i = 0; i < in->count; i++)
+        {
+            GLenum t = in->list[i].gl_type;
+            GLuint columns = (t == GL_FLOAT_MAT2 || t == GL_FLOAT_MAT2x3 || t == GL_FLOAT_MAT2x4) ? 2 :
+                             (t == GL_FLOAT_MAT3 || t == GL_FLOAT_MAT3x2 || t == GL_FLOAT_MAT3x4) ? 3 :
+                             (t == GL_FLOAT_MAT4 || t == GL_FLOAT_MAT4x2 || t == GL_FLOAT_MAT4x3) ? 4 : 1;
+            GLuint n = columns * (GLuint)(in->list[i].array_size > 1 ? in->list[i].array_size : 1);
+            GLuint loc = in->list[i].location;
+
+            if (!in->list[i].name || mglInternalBlock(in->list[i].name))
+                continue;
+
+            // inputs bound to the same location (ES 1.00 aliasing) count once
+            if (loc != MGL_NO_LOCATION && loc + n <= 64)
+            {
+                uint64_t bits = (n == 64 ? ~0ull : ((1ull << n) - 1)) << loc;
+
+                used += __builtin_popcountll(bits & ~taken);
+                taken |= bits;
+            }
+            else
+                used += n;
+        }
+
+        if (used > (GLuint)ctx->state.max_vertex_attribs)
+            return "link failed: the vertex inputs need more than GL_MAX_VERTEX_ATTRIBS locations";
+    }
+
+    if (ptr->shader_slots[_COMPUTE_SHADER])
+    {
+        uint64_t invocations = (uint64_t)ptr->local_workgroup_size.x * ptr->local_workgroup_size.y *
+                               ptr->local_workgroup_size.z;
+
+        if (invocations > STATE_VAR(max_compute_work_group_invocations))
+            return "link failed: the work group is larger than GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS";
+
+        if (sharedMemoryBytes(&ptr->spirv[_COMPUTE_SHADER]) > STATE_VAR(max_compute_shared_memory_size))
+            return "link failed: shared variables take more than GL_MAX_COMPUTE_SHARED_MEMORY_SIZE";
+    }
 
     return NULL;
 }
@@ -5040,14 +5417,7 @@ static void linkProgram(GLMContext ctx, GLuint program)
 
     pptr = findProgram(ctx, program);
 
-    if (!pptr)
-    {
-        // CRITICAL FIX: Handle error gracefully instead of crashing
-        MGL_ERR("MGL ERROR: Critical error in program.c at line %d\n", __LINE__);
-        STATE(error) = GL_INVALID_OPERATION;
-
-        return;
-    }
+    ERROR_CHECK_RETURN(pptr, mglProgramNameError(ctx, program));
 
     // the program feedback is recording with cannot be relinked under it
     ERROR_CHECK_RETURN(!(pptr == ctx->state.program && ctx->state.transform_feedback &&
@@ -5418,11 +5788,21 @@ static void linkProgram(GLMContext ctx, GLuint program)
             if (pptr->log == NULL)
                 pptr->log = strdup(imageUniformProblem(ctx, pptr));
         }
+
+        if (limitProblem(ctx, pptr))
+        {
+            pptr->link_status = GL_FALSE;
+
+            if (pptr->log == NULL)
+                pptr->log = strdup(limitProblem(ctx, pptr));
+        }
         pptr->num_samples_loc = mglFindNumSamplesLocation(pptr);
         pptr->indexed_draw_loc = mglFindUniformByName(pptr, MGL_INDEXED_DRAW_NAME);
         pptr->nv_first_loc[0] = mglFindUniformByName(pptr, MGL_NV_TASK_FIRST_NAME);
         pptr->nv_first_loc[1] = mglFindUniformByName(pptr, MGL_NV_MESH_FIRST_NAME);
         pptr->sample_mask_off_loc = mglFindSampleMaskOffLocation(pptr);
+        pptr->depth_range_loc = mglFindUniformByName(pptr, MGL_DEPTH_RANGE_NAME);
+        mglBuildOpaqueViews(pptr);
 #ifdef MGL_COMPAT_PROFILE
         mglFindAlphaTestLocations(pptr);
 #endif
@@ -5535,6 +5915,13 @@ static void linkProgram(GLMContext ctx, GLuint program)
         pptr->log = strdup(imageUniformProblem(ctx, pptr));
     }
 
+    if (pptr->link_status == GL_TRUE && limitProblem(ctx, pptr))
+    {
+        pptr->link_status = GL_FALSE;
+        free(pptr->log);
+        pptr->log = strdup(limitProblem(ctx, pptr));
+    }
+
     resolveTransformCaptureUniforms(pptr);
 
     pptr->num_samples_loc = mglFindNumSamplesLocation(pptr);
@@ -5542,6 +5929,8 @@ static void linkProgram(GLMContext ctx, GLuint program)
     pptr->nv_first_loc[0] = mglFindUniformByName(pptr, MGL_NV_TASK_FIRST_NAME);
     pptr->nv_first_loc[1] = mglFindUniformByName(pptr, MGL_NV_MESH_FIRST_NAME);
     pptr->sample_mask_off_loc = mglFindSampleMaskOffLocation(pptr);
+    pptr->depth_range_loc = mglFindUniformByName(pptr, MGL_DEPTH_RANGE_NAME);
+    mglBuildOpaqueViews(pptr);
 #ifdef MGL_COMPAT_PROFILE
     mglFindAlphaTestLocations(pptr);
 #endif
@@ -5609,15 +5998,7 @@ void mglUseProgram(GLMContext ctx, GLuint program)
     {
         pptr = findProgram(ctx, program);
 
-        if (!pptr)
-        {
-            MGL_ERR("MGL Error: mglUseProgram program %u not found\n", program);
-            // CRITICAL FIX: Handle error gracefully instead of crashing
-        MGL_ERR("MGL ERROR: Critical error in program.c at line %d\n", __LINE__);
-        STATE(error) = GL_INVALID_OPERATION;
-
-            return;
-        }
+        ERROR_CHECK_RETURN(pptr, mglProgramNameError(ctx, program));
 
         ERROR_CHECK_RETURN(pptr->executable, GL_INVALID_OPERATION);
 
@@ -5697,7 +6078,7 @@ void mglBindAttribLocation(GLMContext ctx, GLuint program, GLuint index, const G
 {
     Program *ptr = findProgram(ctx, program);
 
-    ERROR_CHECK_RETURN(ptr, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(ptr, mglProgramNameError(ctx, program));
     ERROR_CHECK_RETURN(name, GL_INVALID_VALUE);
     ERROR_CHECK_RETURN(index < ctx->state.max_vertex_attribs, GL_INVALID_VALUE);
     ERROR_CHECK_RETURN(strncmp(name, "gl_", 3) != 0, GL_INVALID_OPERATION);
@@ -5712,7 +6093,7 @@ void mglGetActiveAttrib(GLMContext ctx, GLuint program, GLuint index, GLsizei bu
     SpirvResourceList *l;
     SpirvResource *res;
 
-    ERROR_CHECK_RETURN(ptr, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(ptr, mglProgramNameError(ctx, program));
     ERROR_CHECK_RETURN(bufSize >= 0, GL_INVALID_VALUE);
 
     // vertex attributes are the vertex stage's inputs
@@ -5736,7 +6117,7 @@ void mglGetAttachedShaders(GLMContext ctx, GLuint program, GLsizei maxCount, GLs
     Program *pptr = findProgram(ctx, program);
     GLsizei n = 0;
 
-    ERROR_CHECK_RETURN(pptr, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(pptr, mglProgramNameError(ctx, program));
     ERROR_CHECK_RETURN(maxCount >= 0, GL_INVALID_VALUE);
 
     for (int i = 0; i < _MAX_SHADER_TYPES && n < maxCount; i++)
@@ -5780,7 +6161,7 @@ GLint  mglGetAttribLocation(GLMContext ctx, GLuint program, const GLchar *name)
 {
 	if (isProgram(ctx, program) == GL_FALSE)
 	{
-		ERROR_RETURN_VALUE(GL_INVALID_OPERATION, 0); // also may be GL_INVALID_VALUE ????
+		ERROR_RETURN_VALUE(mglProgramNameError(ctx, program), -1);
 
 		return -1;
 	}
@@ -5850,7 +6231,10 @@ static int programResourceCount(Program *ptr, int res_type)
 {
     int n = 0;
 
-    for (int stage = _VERTEX_SHADER; stage < _MAX_SHADER_TYPES; stage++)
+    // attributes are the vertex stage's inputs only
+    int last = res_type == SPVC_RESOURCE_TYPE_STAGE_INPUT ? _VERTEX_SHADER + 1 : _MAX_SHADER_TYPES;
+
+    for (int stage = _VERTEX_SHADER; stage < last; stage++)
     {
         SpirvResourceList *list = &ptr->spirv_resources_list[stage][res_type];
 
@@ -5880,6 +6264,7 @@ static int programResourceCount(Program *ptr, int res_type)
 }
 
 int mglActiveUniformCount(Program *ptr);
+int mglActiveUniformMaxLength(Program *ptr);
 
 static bool linkedFromSpirv(Program *ptr)
 {
@@ -5894,7 +6279,10 @@ static int programLongestName(Program *ptr, int res_type)
 {
     int longest = 0;
 
-    for (int stage = _VERTEX_SHADER; stage < _MAX_SHADER_TYPES; stage++)
+    // attributes are the vertex stage's inputs only
+    int last = res_type == SPVC_RESOURCE_TYPE_STAGE_INPUT ? _VERTEX_SHADER + 1 : _MAX_SHADER_TYPES;
+
+    for (int stage = _VERTEX_SHADER; stage < last; stage++)
     {
         SpirvResourceList *list = &ptr->spirv_resources_list[stage][res_type];
 
@@ -5917,7 +6305,7 @@ static int programLongestName(Program *ptr, int res_type)
 void mglGetProgramiv(GLMContext ctx, GLuint program, GLenum pname, GLint *params)
 {
     Program *pptr = findProgram(ctx, program);
-    ERROR_CHECK_RETURN(pptr, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(pptr, mglProgramNameError(ctx, program));
     
     switch (pname) {
         case GL_PROGRAM_SEPARABLE:
@@ -5929,6 +6317,12 @@ void mglGetProgramiv(GLMContext ctx, GLuint program, GLenum pname, GLint *params
             break;
         case GL_COMPLETION_STATUS_KHR:
             *params = GL_TRUE;
+            break;
+        case GL_PROGRAM_BINARY_RETRIEVABLE_HINT:
+            *params = pptr->binary_retrievable_hint;
+            break;
+        case GL_PROGRAM_BINARY_LENGTH:
+            *params = 0;
             break;
         case GL_DELETE_STATUS:
             *params = pptr->delete_status;
@@ -5957,7 +6351,7 @@ void mglGetProgramiv(GLMContext ctx, GLuint program, GLenum pname, GLint *params
         case GL_ACTIVE_UNIFORM_MAX_LENGTH:
             // ARB_gl_spirv: a SPIR-V program has no names, only the null
             if (linkedFromSpirv(pptr)) { *params = 1; break; }
-            *params = programLongestName(pptr, SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT);
+            *params = mglActiveUniformMaxLength(pptr);
             break;
 
         case GL_ACTIVE_ATTRIBUTES:
@@ -6078,16 +6472,14 @@ void mglGetProgramiv(GLMContext ctx, GLuint program, GLenum pname, GLint *params
         }
 
         default:
-            MGL_INFO("mglGetProgramiv: unhandled pname 0x%x\n", pname);
-            *params = 0;
-            break;
+            ERROR_RETURN(GL_INVALID_ENUM);
     }
 }
 
 void mglGetProgramInfoLog(GLMContext ctx, GLuint program, GLsizei bufSize, GLsizei *length, GLchar *infoLog)
 {
     Program *pptr = findProgram(ctx, program);
-    ERROR_CHECK_RETURN(pptr, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(pptr, mglProgramNameError(ctx, program));
     
     ERROR_CHECK_RETURN(bufSize >= 0, GL_INVALID_VALUE);
 
@@ -6449,7 +6841,7 @@ void mglGetActiveSubroutineName(GLMContext ctx, GLuint program, GLenum shadertyp
     Program *pptr = findProgram(ctx, program);
     SubroutineInfo *si;
 
-    ERROR_CHECK_RETURN(pptr, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(pptr, mglProgramNameError(ctx, program));
     ERROR_CHECK_RETURN(bufSize >= 0, GL_INVALID_VALUE);
     ERROR_CHECK_RETURN(validShaderType(shadertype), GL_INVALID_ENUM);
 
@@ -6467,7 +6859,7 @@ void mglGetActiveSubroutineUniformiv(GLMContext ctx, GLuint program, GLenum shad
     Program *pptr = findProgram(ctx, program);
     SubroutineInfo *si;
 
-    ERROR_CHECK_RETURN(pptr, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(pptr, mglProgramNameError(ctx, program));
     ERROR_CHECK_RETURN(values, GL_INVALID_VALUE);
     ERROR_CHECK_RETURN(validShaderType(shadertype), GL_INVALID_ENUM);
 
@@ -6508,7 +6900,7 @@ void mglGetActiveSubroutineUniformName(GLMContext ctx, GLuint program, GLenum sh
     Program *pptr = findProgram(ctx, program);
     SubroutineInfo *si;
 
-    ERROR_CHECK_RETURN(pptr, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(pptr, mglProgramNameError(ctx, program));
     ERROR_CHECK_RETURN(bufSize >= 0, GL_INVALID_VALUE);
     ERROR_CHECK_RETURN(validShaderType(shadertype), GL_INVALID_ENUM);
 
@@ -6524,7 +6916,7 @@ GLuint mglGetSubroutineIndex(GLMContext ctx, GLuint program, GLenum shadertype, 
     Program *pptr = findProgram(ctx, program);
     SubroutineInfo *si;
 
-    ERROR_CHECK_RETURN_VALUE(pptr, GL_INVALID_VALUE, GL_INVALID_INDEX);
+    ERROR_CHECK_RETURN_VALUE(pptr, mglProgramNameError(ctx, program), GL_INVALID_INDEX);
     ERROR_CHECK_RETURN_VALUE(name, GL_INVALID_VALUE, GL_INVALID_INDEX);
     ERROR_CHECK_RETURN_VALUE(validShaderType(shadertype), GL_INVALID_ENUM, GL_INVALID_INDEX);
 
@@ -6545,7 +6937,7 @@ GLint mglGetSubroutineUniformLocation(GLMContext ctx, GLuint program, GLenum sha
     Program *pptr = findProgram(ctx, program);
     SubroutineInfo *si;
 
-    ERROR_CHECK_RETURN_VALUE(pptr, GL_INVALID_VALUE, -1);
+    ERROR_CHECK_RETURN_VALUE(pptr, mglProgramNameError(ctx, program), -1);
     ERROR_CHECK_RETURN_VALUE(name, GL_INVALID_VALUE, -1);
     ERROR_CHECK_RETURN_VALUE(validShaderType(shadertype), GL_INVALID_ENUM, -1);
     ERROR_CHECK_RETURN_VALUE(pptr->link_status == GL_TRUE, GL_INVALID_OPERATION, -1);
@@ -7746,7 +8138,7 @@ void mglGetProgramStageiv(GLMContext ctx, GLuint program, GLenum shadertype, GLe
 {
     Program *ptr = findProgram(ctx, program);
 
-    ERROR_CHECK_RETURN(ptr, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(ptr, mglProgramNameError(ctx, program));
     ERROR_CHECK_RETURN(params, GL_INVALID_VALUE);
 
     switch (shadertype)
@@ -7817,7 +8209,7 @@ GLint mglGetFragDataLocation(GLMContext ctx, GLuint program, const GLchar *name)
     Program *ptr = findProgram(ctx, program);
     SpirvResourceList *l;
 
-    ERROR_CHECK_RETURN_VALUE(ptr, GL_INVALID_VALUE, -1);
+    ERROR_CHECK_RETURN_VALUE(ptr, mglProgramNameError(ctx, program), -1);
     ERROR_CHECK_RETURN_VALUE(name, GL_INVALID_VALUE, -1);
     ERROR_CHECK_RETURN_VALUE(ptr->link_status == GL_TRUE, GL_INVALID_OPERATION, -1);
 
@@ -7890,7 +8282,7 @@ void mglValidateProgram(GLMContext ctx, GLuint program)
     Program *pptr = findProgram(ctx, program);
     bool stage_present = false;
 
-    ERROR_CHECK_RETURN(pptr, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(pptr, mglProgramNameError(ctx, program));
 
     for (int i = 0; i < _MAX_SHADER_TYPES; i++)
         if (pptr->spirv[i].msl_str)
@@ -7994,9 +8386,7 @@ void mglShaderStorageBlockBinding(GLMContext ctx, GLuint program, GLuint storage
 {
     Program *pptr = findProgram(ctx, program);
 
-    // a shader's name is a real object, just the wrong kind
-    ERROR_CHECK_RETURN(pptr || !isShader(ctx, program), GL_INVALID_OPERATION);
-    ERROR_CHECK_RETURN(pptr, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(pptr, mglProgramNameError(ctx, program));
     ERROR_CHECK_RETURN(storageBlockIndex < (GLuint)pptr->resources.count[MGL_RES_STORAGE_BLOCK], GL_INVALID_VALUE);
     ERROR_CHECK_RETURN(storageBlockBinding < STATE_VAR(max_shader_storage_buffer_bindings) &&
                        storageBlockBinding < MAX_SHADER_STORAGE_BUFFER_BINDINGS, GL_INVALID_VALUE);
@@ -8044,7 +8434,7 @@ void mglGetActiveAtomicCounterBufferiv(GLMContext ctx, GLuint program, GLuint bu
 {
     Program *pptr = findProgram(ctx, program);
 
-    ERROR_CHECK_RETURN(pptr, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(pptr, mglProgramNameError(ctx, program));
     ERROR_CHECK_RETURN(bufferIndex < (GLuint)pptr->resources.count[MGL_RES_ATOMIC_BUFFER], GL_INVALID_VALUE);
     ERROR_CHECK_RETURN(params, GL_INVALID_VALUE);
 
@@ -8085,7 +8475,7 @@ void mglProgramParameteri(GLMContext ctx, GLuint program, GLenum pname, GLint va
 {
     Program *pptr = findProgram(ctx, program);
 
-    ERROR_CHECK_RETURN(pptr, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(pptr, mglProgramNameError(ctx, program));
     ERROR_CHECK_RETURN(value == GL_TRUE || value == GL_FALSE, GL_INVALID_VALUE);
 
     switch (pname)
@@ -8107,7 +8497,7 @@ void mglGetProgramBinary(GLMContext ctx, GLuint program, GLsizei bufSize, GLsize
 {
     Program *pptr = findProgram(ctx, program);
 
-    ERROR_CHECK_RETURN(pptr, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(pptr, mglProgramNameError(ctx, program));
     ERROR_CHECK_RETURN(bufSize >= 0, GL_INVALID_VALUE);
 
     if (length)
@@ -8121,7 +8511,7 @@ void mglProgramBinary(GLMContext ctx, GLuint program, GLenum binaryFormat, const
 {
     Program *pptr = findProgram(ctx, program);
 
-    ERROR_CHECK_RETURN(pptr, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(pptr, mglProgramNameError(ctx, program));
     ERROR_CHECK_RETURN(length >= 0, GL_INVALID_VALUE);
 
     // the spec wants the program marked unlinked before the error

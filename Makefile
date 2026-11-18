@@ -24,7 +24,6 @@ glslang_include_path ?= ./submodules/glslang/glslang/Include
 # build dirs
 build_dir ?= build
 build_core_dir := $(build_dir)/core
-build_es_dir := $(build_dir)/es
 
 CFLAGS += -Wall #-Wunused-parameter #-Wextra
 CFLAGS += -gfull
@@ -38,6 +37,10 @@ CFLAGS += -O2
 ifdef MGL_NO_COMPAT
 CFLAGS += -DMGL_NO_COMPAT_PROFILE
 endif
+
+# OpenGL ES 3.1 contexts are off by default; make OGL_ES=1 builds them in.
+es_flags := $(if $(OGL_ES),-DMGL_OGL_ES)
+CFLAGS += $(es_flags)
 
 CFLAGS += -arch $(shell uname -m)
 LIBS += -arch $(shell uname -m)
@@ -72,10 +75,6 @@ CXXFLAGS += -I./submodules/glslang -Iinclude/GL
 CFLAGS_GL_CORE := $(CFLAGS) -DMGL_GL_CORE
 CXXFLAGS_GL_CORE := $(CXXFLAGS) -DMGL_GL_CORE
 
-# GL_ES SPECIFIC FLAGS
-CFLAGS_GL_ES := $(CFLAGS) -DMGL_GL_ES
-CXXFLAGS_GL_ES := $(CXXFLAGS) -DMGL_GL_ES
-
 # Add CoreFoundation framework headers for GLFW Objective-C compilation
 GLFW_FRAMEWORKS = -framework Cocoa -framework CoreFoundation -framework CoreGraphics \
                   -framework IOKit -framework Foundation -framework QuartzCore \
@@ -85,7 +84,6 @@ glfw_dir := submodules/glfw
 
 ifneq ($(SDK_ROOT),)
 CFLAGS_GL_CORE += -isysroot $(SDK_ROOT)
-CFLAGS_GL_ES += -isysroot $(SDK_ROOT)
 endif
 
 # SPIRV-Cross and glslang, as tools/build_deps.sh builds them
@@ -111,13 +109,13 @@ LIBS += $(spirv_tools_path)/source/opt/libSPIRV-Tools-opt.a
 default: lib
 
 # --- generated sources ---------------------------------------------------
-# These five come out of tools/spec_parser and are not checked in. They are
+# These four come out of tools/spec_parser and are not checked in. They are
 # listed by hand rather than picked up by the wildcard below, because on a
 # clean tree they do not exist yet when make expands it.
 gen_src_dir := src
 gen_inc_dir := include
 
-generated_srcs := $(gen_src_dir)/gl_core.c $(gen_src_dir)/gl_es.c $(gen_src_dir)/glm_dispatch.c
+generated_srcs := $(gen_src_dir)/gl_core.c $(gen_src_dir)/glm_dispatch.c
 generated_hdrs := $(gen_inc_dir)/glm_dispatch.h $(gen_inc_dir)/mgl.h
 generated := $(generated_srcs) $(generated_hdrs)
 
@@ -134,13 +132,9 @@ mgl_srcs_cpp := $(wildcard src/*.cpp)
 mgl_srcs_objc := $(wildcard src/*.m)
 
 mgl_core_c := src/gl_core.c
-mgl_es_c := src/gl_es.c
 
 mgl_core_obj := $(mgl_core_c:.c=.o)
 mgl_core_obj := $(addprefix $(build_core_dir)/,$(mgl_core_obj))
-
-mgl_es_obj := $(mgl_es_c:.c=.o)
-mgl_es_obj := $(addprefix $(build_es_dir)/,$(mgl_es_obj))
 
 # core objs
 mgl_core_objs := $(mgl_srcs_c:.c=.o) $(mgl_srcs_cpp:.cpp=.o)
@@ -152,16 +146,6 @@ mgl_core_objs := $(addprefix $(build_core_dir)/,$(mgl_core_objs))
 mgl_core_arc_objs := $(mgl_srcs_objc:.m=.o)
 mgl_core_arc_objs := $(addprefix $(build_core_dir)/arc/,$(mgl_core_arc_objs))
 
-# es objs
-mgl_es_objs := $(mgl_srcs_c:.c=.o) $(mgl_srcs_cpp:.cpp=.o)
-mgl_es_objs := $(addprefix $(build_es_dir)/,$(mgl_es_objs))
-
-mgl_es_objs := $(mgl_srcs_c:.c=.o) $(mgl_srcs_cpp:.cpp=.o)
-mgl_es_objs := $(addprefix $(build_es_dir)/,$(mgl_es_objs))
-
-mgl_es_arc_objs := $(mgl_srcs_objc:.m=.o)
-mgl_es_arc_objs := $(addprefix $(build_es_dir)/arc/,$(mgl_es_arc_objs))
-
 
 # --- generating them -----------------------------------------------------
 # The registry copy lives in the tree so a build needs no network. Refresh it
@@ -170,7 +154,7 @@ $(spec_parser): tools/spec_parser/spec_parser.c tools/enum_parser/ezxml.c
 	@mkdir -p $(dir $@)
 	$(CC) -O2 -o $@ $^ -Itools/enum_parser -w
 
-# One run writes all five, so the work hangs off a stamp rather than off each
+# One run writes all four, so the work hangs off a stamp rather than off each
 # file; the per-file rule only re-runs it when a file has gone missing.
 gen_stamp := $(build_dir)/.generated
 
@@ -189,13 +173,9 @@ generate: $(generated)
 deps += $(mgl_core_objs:.o=.d)
 deps += $(mgl_core_arc_objs:.o=.d)
 deps += $(mgl_core_obj:.o=.d)
-deps += $(mgl_es_objs:.o=.d)
-deps += $(mgl_es_arc_objs:.o=.d)
-deps += $(mgl_es_obj:.o=.d)
 
 
 mgl_lib := $(build_dir)/libmoogl.dylib
-mgl_es_lib := $(build_dir)/libmoogles.dylib
 
 # a rebuilt SPIRV-Cross has to relink the driver, or it keeps the old one
 spirv_cross_archives := $(wildcard submodules/SPIRV-Cross/build/libspirv-cross-*.a)
@@ -211,7 +191,18 @@ $(version_h): FORCE
 	@echo '#define MOOGL_VERSION "$(MOOGL_VERSION)"' > $@.tmp
 	@cmp -s $@.tmp $@ && rm $@.tmp || mv $@.tmp $@
 
-$(build_core_dir)/src/get.o $(build_es_dir)/src/get.o: $(version_h)
+$(build_core_dir)/src/get.o $(build_core_dir)/src/es_context.o: $(version_h)
+
+# OGL_ES and MGL_NO_COMPAT change the context's layout, so a change to either
+# rebuilds everything that reads it
+flags_stamp := $(build_dir)/.flags
+
+$(flags_stamp): FORCE
+	@mkdir -p $(dir $@)
+	@echo '$(es_flags) $(MGL_NO_COMPAT)' > $@.tmp
+	@cmp -s $@.tmp $@ && rm $@.tmp || mv $@.tmp $@
+
+$(mgl_core_objs) $(mgl_core_arc_objs) $(mgl_core_obj): $(flags_stamp)
 
 FORCE:
 
@@ -221,13 +212,6 @@ $(mgl_lib): $(mgl_core_objs) $(mgl_core_arc_objs) $(mgl_core_obj) $(spirv_cross_
 		-install_name @rpath/libmoogl.dylib -current_version $(moogl_version_number)
 	# loading dynamic library requires this
 	ln -fs $(mgl_lib) .
-
-$(mgl_es_lib): $(mgl_es_objs) $(mgl_es_arc_objs) $(mgl_es_obj) $(spirv_cross_archives)
-	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS_GL_ES) -dynamiclib -o $@ $(filter %.o,$^) $(LIBS) \
-		-install_name @rpath/libmoogles.dylib
-	# loading dynamic library requires this
-	ln -fs $(mgl_es_lib) .
 
 
 $(mgl_toolchain_lib): $(mgl_toolchain_obj)
@@ -400,7 +384,7 @@ $(imgui_lib): $(imgui_srcs) $(sdl2_lib)
 	done
 	libtool -static -o $@ $(build_dir)/imgui/*.o
 
-lib: $(mgl_lib) $(mgl_es_lib) $(build_dir)/libglfw.dylib $(fsr2_lib) $(sdl2_lib) $(sdl3_lib) $(sfml3_lib) $(sfml2_lib) $(raylib_lib) $(imgui_lib) $(glut_lib) $(glu_lib)
+lib: $(mgl_lib) $(build_dir)/libglfw.dylib $(fsr2_lib) $(sdl2_lib) $(sdl3_lib) $(sfml3_lib) $(sfml2_lib) $(raylib_lib) $(imgui_lib) $(glut_lib) $(glu_lib)
 
 toolchain: $(mgl_toolchain_lib)
 
@@ -414,9 +398,10 @@ test_srcs += $(gears_dir)/gears_common.c
 test_objs := $(patsubst $(test_dir)/%.c,$(test_build_dir)/%.o,$(test_srcs))
 test_exe  := $(build_dir)/mgl_tests
 deps += $(test_objs:.o=.d)
+$(test_objs): $(flags_stamp)
 
 TEST_CFLAGS := -Wall -g -O1 -arch $(shell uname -m) -std=c11 \
-  -Iinclude -Iinclude/GL -I$(test_dir) -I$(gears_dir) -DMGL_GL_CORE $(if $(MGL_NO_COMPAT),-DMGL_NO_COMPAT_PROFILE) \
+  -Iinclude -Iinclude/GL -I$(test_dir) -I$(gears_dir) -DMGL_GL_CORE $(if $(MGL_NO_COMPAT),-DMGL_NO_COMPAT_PROFILE) $(es_flags) \
   -I$(glslang_include_path) -I./submodules/SPIRV-Cross
 ifneq ($(SDK_ROOT),)
 TEST_CFLAGS += -isysroot $(SDK_ROOT)
@@ -465,7 +450,7 @@ gears: $(gears_compat_exe) $(gears_gl46_exe)
 window_libs := -L$(build_dir) -lmoogl -Wl,-rpath,$(CURDIR)/$(build_dir)
 
 $(build_dir)/test_window: tests/window/test_window.c $(mgl_lib) $(build_dir)/libglfw.dylib
-	$(CC) -o $@ $< -Iinclude -I$(glfw_dir)/include -L$(build_dir) -lglfw $(window_libs)
+	$(CC) -o $@ $< $(es_flags) -Iinclude -I$(glfw_dir)/include -L$(build_dir) -lglfw $(window_libs)
 
 $(build_dir)/triangle: examples/triangle/main.c $(mgl_lib) $(build_dir)/libglfw.dylib
 	$(CC) -o $@ $< -Iinclude -I$(glfw_dir)/include -L$(build_dir) -lglfw $(window_libs)
@@ -477,7 +462,7 @@ $(build_dir)/test_sdl_share: tests/window/test_sdl_share.c $(mgl_lib) $(sdl2_lib
 	$(CC) -o $@ $< -Iinclude -I$(sdl2_install)/include -L$(build_dir) -lSDL2-2.0.0 $(window_libs)
 
 $(build_dir)/test_sdl3: tests/window/test_sdl3.c $(mgl_lib) $(sdl3_lib)
-	$(CC) -o $@ $< -Iinclude -I$(sdl3_install)/include -L$(build_dir) -lSDL3.0 $(window_libs)
+	$(CC) -o $@ $< $(es_flags) -Iinclude -I$(sdl3_install)/include -L$(build_dir) -lSDL3.0 $(window_libs)
 
 $(build_dir)/test_sfml3: tests/window/test_sfml.cpp $(mgl_lib) $(sfml3_lib)
 	$(CXX) -std=c++17 -o $@ $< -I$(sfml3_install)/include -L$(sfml3_install)/lib -lsfml-graphics -lsfml-window \
@@ -525,6 +510,7 @@ window-test: $(build_dir)/test_window $(build_dir)/test_sdl_share $(build_dir)/t
 	$(build_dir)/test_window
 	$(build_dir)/test_sdl_share
 	$(build_dir)/test_sdl_renderer
+	$(if $(OGL_ES),$(build_dir)/test_sdl_renderer opengles2)
 	$(build_dir)/test_sdl3
 	$(build_dir)/test_sfml3
 	$(build_dir)/test_sfml2
@@ -539,6 +525,20 @@ window-test: $(build_dir)/test_window $(build_dir)/test_sdl_share $(build_dir)/t
 	$(build_dir)/sdl3_triangle --frames 60
 	$(build_dir)/sfml_shapes --frames 60
 	$(build_dir)/raylib_shapes --frames 60
+
+# The OpenGLESDemo samples, ported to macOS, each run for a few frames on an
+# ES context; needs a library built with OGL_ES=1
+glesdemo_dir := submodules/OpenGLESDemo
+glesdemo_exe := $(build_dir)/glesdemo/OpenGLESDemo
+
+# CMake knows which sample sources changed, so it always gets asked
+$(glesdemo_exe): $(mgl_lib) $(build_dir)/libglfw.dylib FORCE
+	env -u MAKEFLAGS -u MFLAGS -u MAKELEVEL cmake -S $(glesdemo_dir)/macos -B $(build_dir)/glesdemo \
+		-DMOOGL_BUILD_DIR=$(abspath $(build_dir)) -DMOOGL_GLFW_INCLUDE=$(abspath $(glfw_dir))/include
+	env -u MAKEFLAGS -u MFLAGS -u MAKELEVEL cmake --build $(build_dir)/glesdemo -j
+
+gles-demo: $(glesdemo_exe)
+	$(glesdemo_exe) --all --frames 30
 
 gears-test: gears
 	@echo "== straight port (fixed function) =="
@@ -616,28 +616,6 @@ $(build_core_dir)/%.o: %.m | $(generated)
 	clang -fmodules -MMD $(CFLAGS_GL_CORE) -c $< -o $@
 
 
-#
-# es build
-#
-$(build_es_dir)/%.o: %.c | $(generated)
-	@mkdir -p $(dir $@)
-	$(CC) -MMD $(CFLAGS_GL_ES) -c $< -o $@
-
-#-std=gnu17
-$(build_es_dir)/%.o: %.cpp | $(generated)
-	@mkdir -p $(dir $@)
-	$(CXX) -MMD $(CXXFLAGS_GL_ES) -c $< -o $@
-
-#-std=c++14
-$(build_es_dir)/arc/%.o: %.m | $(generated)
-	@mkdir -p $(dir $@)
-	clang -fobjc-arc -fmodules -MMD $(CFLAGS_GL_ES) \
-		-c $< -o $@
-
-$(build_dir)/%.o: %.m | $(generated)
-	@mkdir -p $(dir $@)
-	clang -fmodules -MMD $(CXXFLAGS_GL_ES) -c $< -o $@
-
 
 
 
@@ -646,9 +624,8 @@ clean:
 	if [ -d $(build_dir) ]; then find $(build_dir) -mindepth 1 -maxdepth 1 ! -name cts-work -exec rm -rf {} +; fi
 	rm -f $(generated)
 	rm -f libmoogl.dylib
-	rm -f libmoogles.dylib
 	rm -f libglfw.dylib
 
-.PHONY: default test tests cts gears gears-test window-test dbg lib fsr2 sdl2 sdl3 sfml raylib clean generate FORCE
+.PHONY: default test tests cts gears gears-test window-test gles-demo dbg lib fsr2 sdl2 sdl3 sfml raylib clean generate FORCE
 
 -include $(deps)

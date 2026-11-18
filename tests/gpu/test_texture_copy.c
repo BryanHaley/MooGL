@@ -486,3 +486,136 @@ GPU_TEST(texture_copy, invalidate_tex_image_does_not_crash)
 
     glDeleteTextures(1, &t);
 }
+
+// glCopyTexImage2D from a framebuffer of src into a new texture of dst
+static GLuint copiedFrom(GLenum src, GLenum format, GLenum type, const void *texels, GLenum dst)
+{
+    GLuint s, fbo, d;
+
+    glGenTextures(1, &s);
+    glBindTexture(GL_TEXTURE_2D, s);
+    glTexImage2D(GL_TEXTURE_2D, 0, (GLint)src, 4, 4, 0, format, type, texels);
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s, 0);
+
+    glGenTextures(1, &d);
+    glBindTexture(GL_TEXTURE_2D, d);
+    glCopyTexImage2D(GL_TEXTURE_2D, 0, dst, 0, 0, 4, 4, 0);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &fbo);
+    glDeleteTextures(1, &s);
+    return d;
+}
+
+GPU_TEST(texture_copy, copy_tex_image_drops_integer_channels)
+{
+    GLushort texels[16 * 4], back[16 * 2] = { 0 };
+
+    for (int i = 0; i < 16; i++)
+        for (int c = 0; c < 4; c++)
+            texels[i * 4 + c] = (GLushort)(1000 * c + i);
+
+    GLuint d = copiedFrom(GL_RGBA16UI, GL_RGBA_INTEGER, GL_UNSIGNED_SHORT, texels, GL_RG16UI);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+
+    glGetTexImage(GL_TEXTURE_2D, 0, GL_RG_INTEGER, GL_UNSIGNED_SHORT, back);
+    for (int i = 0; i < 16; i++)
+        CHECK_MSG(back[i * 2] == i && back[i * 2 + 1] == 1000 + i, "texel %d reads %d %d", i, back[i * 2],
+                  back[i * 2 + 1]);
+    glDeleteTextures(1, &d);
+}
+
+GPU_TEST(texture_copy, copy_tex_image_into_rgb_reads_alpha_one)
+{
+    GLubyte texels[16 * 4], back[16 * 4] = { 0 };
+
+    for (int i = 0; i < 16 * 4; i++)
+        texels[i] = (i % 4 == 3) ? 127 : 200;
+
+    GLuint d = copiedFrom(GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, texels, GL_RGB8);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+
+    glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, back);
+    CHECK_MSG(back[0] == 200 && back[3] == 255, "reads %d %d %d %d", back[0], back[1], back[2], back[3]);
+    glDeleteTextures(1, &d);
+}
+
+GPU_TEST(texture_copy, a_cube_face_in_another_format_keeps_the_others)
+{
+    GLubyte texels[16 * 4], zero[16 * 4] = { 0 }, back[4] = { 0 };
+    GLuint src, fbo, cube;
+
+    for (int i = 0; i < 16 * 4; i++)
+        texels[i] = (i % 4 == 0) ? 255 : 0;
+
+    glGenTextures(1, &src);
+    glBindTexture(GL_TEXTURE_2D, src);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 4, 4, 0, GL_RGBA, GL_UNSIGNED_BYTE, texels);
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, src, 0);
+
+    // +X copied as RGB565, then the other faces given as RGB8
+    glGenTextures(1, &cube);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, cube);
+    glCopyTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X, 0, GL_RGB565, 0, 0, 4, 4, 0);
+    for (GLenum f = GL_TEXTURE_CUBE_MAP_NEGATIVE_X; f <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z; f++)
+        glTexImage2D(f, 0, GL_RGB8, 4, 4, 0, GL_RGB, GL_UNSIGNED_BYTE, zero);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_CUBE_MAP_POSITIVE_X, cube, 0);
+    CHECK_EQ_UINT(glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE);
+    glReadPixels(1, 1, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, back);
+    CHECK_MSG(back[0] == 255 && back[1] == 0 && back[2] == 0, "+X reads %d %d %d %d", back[0], back[1], back[2],
+              back[3]);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &fbo);
+    glDeleteTextures(1, &src);
+    glDeleteTextures(1, &cube);
+}
+
+GPU_TEST(texture_copy, copy_tex_image_from_a_3d_slice_converts)
+{
+    GLubyte texels[4 * 4 * 2 * 4], back[16 * 4] = { 0 };
+    GLuint src, fbo, d;
+
+    // slice 0 dark, slice 1 bright with alpha 127
+    for (int i = 0; i < 4 * 4 * 2; i++)
+        for (int c = 0; c < 4; c++)
+            texels[i * 4 + c] = c == 3 ? 127 : (i >= 16 ? 220 : 10);
+
+    glGenTextures(1, &src);
+    glBindTexture(GL_TEXTURE_3D, src);
+    glTexImage3D(GL_TEXTURE_3D, 0, GL_RGBA8, 4, 4, 2, 0, GL_RGBA, GL_UNSIGNED_BYTE, texels);
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, src, 0, 1);
+
+    glGenTextures(1, &d);
+    glBindTexture(GL_TEXTURE_2D, d);
+    glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, 0, 0, 4, 4, 0);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+
+    glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, back);
+    CHECK_MSG(back[0] == 220 && back[3] == 255, "reads %d %d %d %d", back[0], back[1], back[2], back[3]);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &fbo);
+    glDeleteTextures(1, &src);
+    glDeleteTextures(1, &d);
+}
+
+GPU_TEST(texture_copy, copy_tex_image_cube_face_must_be_square)
+{
+    GLuint cube;
+
+    glGenTextures(1, &cube);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, cube);
+    glCopyTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X, 0, GL_RGBA8, 0, 0, 8, 4, 0);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_INVALID_VALUE);
+
+    glDeleteTextures(1, &cube);
+}

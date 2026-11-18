@@ -1192,3 +1192,192 @@ GPU_TEST(compat_profile, auto_normal_lights_an_evaluated_patch)
     glDisable(GL_LIGHTING);
     closeCompat(c, &t);
 }
+
+GPU_TEST(compat_profile, copy_tex_image_from_a_cube_face_into_luminance)
+{
+    MGLTestTarget t;
+    GLMContext c = openCompat(&t);
+    GLuint src, fbo, dst;
+    GLubyte red[16], back[16] = { 0 };
+
+    CHECK(c != NULL);
+    if (!c)
+        return;
+
+    glGenTextures(1, &src);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, src);
+    for (int f = 0; f < 6; f++)
+    {
+        for (int i = 0; i < 16; i++)
+            red[i] = (GLubyte)(40 * f + 20);
+        glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + f, 0, GL_R8, 4, 4, 0, GL_RED, GL_UNSIGNED_BYTE, red);
+    }
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_CUBE_MAP_NEGATIVE_X, src, 0);
+
+    glGenTextures(1, &dst);
+    glBindTexture(GL_TEXTURE_2D, dst);
+    glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, 0, 0, 4, 4, 0);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+
+    // NEGATIVE_X is face 1, and luminance samples as (L, L, L, 1)
+    glGetTexImage(GL_TEXTURE_2D, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, back);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+    CHECK_MSG(back[0] == 60 && back[15] == 60, "luminance reads %d", back[0]);
+
+    mgl_target_bind(&t);
+    {
+        char log[512];
+        GLuint vbo = 0, vao, p = mgl_build_program(
+            "#version 330 core\nlayout(location = 0) in vec2 pos;\n"
+            "void main() { gl_Position = vec4(pos, 0.0, 1.0); }\n",
+            "#version 330 core\nuniform sampler2D s;\nout vec4 c;\n"
+            "void main() { c = texture(s, vec2(0.5)); }\n", log, sizeof log);
+        unsigned char px[4];
+
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glUseProgram(p);
+        vao = mgl_fullscreen_quad(&vbo);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+        pixel(&t, 16, 16, px);
+        CHECK_MSG(NEAR(px[0], 60) && NEAR(px[1], 60) && NEAR(px[2], 60) && px[3] == 255,
+                  "sampled %d %d %d %d", px[0], px[1], px[2], px[3]);
+        glUseProgram(0);
+        glDeleteProgram(p);
+        glDeleteVertexArrays(1, &vao);
+        glDeleteBuffers(1, &vbo);
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &fbo);
+    glDeleteTextures(1, &src);
+    glDeleteTextures(1, &dst);
+    mgl_target_bind(&t);
+    closeCompat(c, &t);
+}
+
+// the centre of tex as a shader samples it
+static void sampled(MGLTestTarget *t, GLuint tex, unsigned char out[4])
+{
+    char log[512];
+    GLuint vbo = 0, vao, p = mgl_build_program(
+        "#version 330 core\nlayout(location = 0) in vec2 pos;\n"
+        "void main() { gl_Position = vec4(pos, 0.0, 1.0); }\n",
+        "#version 330 core\nuniform sampler2D s;\nout vec4 c;\n"
+        "void main() { c = texture(s, vec2(0.5)); }\n", log, sizeof log);
+
+    mgl_target_bind(t);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glUseProgram(p);
+    vao = mgl_fullscreen_quad(&vbo);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    pixel(t, 16, 16, out);
+    glUseProgram(0);
+    glDeleteProgram(p);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo);
+}
+
+GPU_TEST(compat_profile, copy_tex_image_into_alpha_formats_takes_alpha)
+{
+    MGLTestTarget t;
+    GLMContext c = openCompat(&t);
+    GLuint src, fbo, la, a;
+    GLubyte texel[16 * 4];
+    unsigned char px[4];
+
+    CHECK(c != NULL);
+    if (!c)
+        return;
+
+    for (int i = 0; i < 16; i++)
+    {
+        texel[i * 4 + 0] = 50;
+        texel[i * 4 + 1] = 100;
+        texel[i * 4 + 2] = 150;
+        texel[i * 4 + 3] = 200;
+    }
+
+    glGenTextures(1, &src);
+    glBindTexture(GL_TEXTURE_2D, src);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 4, 4, 0, GL_RGBA, GL_UNSIGNED_BYTE, texel);
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, src, 0);
+
+    glGenTextures(1, &la);
+    glBindTexture(GL_TEXTURE_2D, la);
+    glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, 0, 0, 4, 4, 0);
+    glGenTextures(1, &a);
+    glBindTexture(GL_TEXTURE_2D, a);
+    glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA, 0, 0, 4, 4, 0);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+
+    sampled(&t, la, px);
+    CHECK_MSG(NEAR(px[0], 50) && NEAR(px[1], 50) && NEAR(px[2], 50) && NEAR(px[3], 200),
+              "luminance alpha %d %d %d %d", px[0], px[1], px[2], px[3]);
+    sampled(&t, a, px);
+    CHECK_MSG(px[0] == 0 && px[1] == 0 && px[2] == 0 && NEAR(px[3], 200),
+              "alpha %d %d %d %d", px[0], px[1], px[2], px[3]);
+
+    glDeleteFramebuffers(1, &fbo);
+    glDeleteTextures(1, &src);
+    glDeleteTextures(1, &la);
+    glDeleteTextures(1, &a);
+    closeCompat(c, &t);
+}
+
+GPU_TEST(compat_profile, integer_attributes_from_client_memory)
+{
+    MGLTestTarget t;
+    unsigned char a[4];
+    GLMContext c = openCompat(&t);
+    static const GLfloat verts[] = { -1, -1,  1, -1,  -1, 1,  1, 1 };
+    static const GLubyte level[] = { 200, 200, 200, 200 };
+    static const char *VS =
+        "#version 330 core\n"
+        "layout(location = 0) in vec2 pos;\n"
+        "layout(location = 1) in uint level;\n"
+        "flat out uint v;\n"
+        "void main() { v = level; gl_Position = vec4(pos, 0.0, 1.0); }\n";
+    static const char *FS =
+        "#version 330 core\n"
+        "flat in uint v;\n"
+        "out vec4 color;\n"
+        "void main() { color = vec4(float(v) / 255.0, 0.0, 0.0, 1.0); }\n";
+    char log[1024] = "";
+    GLuint prog;
+
+    CHECK(c != NULL);
+    if (!c)
+        return;
+
+    prog = mgl_build_program(VS, FS, log, sizeof log);
+    CHECK_MSG(prog != 0, "program did not build: %s", log);
+
+    if (prog)
+    {
+        glUseProgram(prog);
+
+        glEnableVertexAttribArray(0);
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, verts);
+        glVertexAttribIPointer(1, 1, GL_UNSIGNED_BYTE, 0, level);
+        CHECK_EQ_UINT(glGetError(), GL_NO_ERROR);
+
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+        pixel(&t, 16, 16, a);
+        CHECK_MSG(NEAR(a[0], 200), "drew %d %d %d", a[0], a[1], a[2]);
+
+        glDisableVertexAttribArray(0);
+        glDisableVertexAttribArray(1);
+        glUseProgram(0);
+        glDeleteProgram(prog);
+    }
+
+    closeCompat(c, &t);
+}
+

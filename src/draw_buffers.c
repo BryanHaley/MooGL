@@ -430,6 +430,20 @@ GLsizei getTypeSize(GLenum type)
     return 0;
 }
 
+// Metal culls one face or none, so GL_FRONT_AND_BACK skips polygon draws here
+static bool cullsEverything(GLMContext ctx, GLenum mode)
+{
+    Program *p = ctx->state.program;
+    TransformFeedback *xfb = ctx->state.transform_feedback;
+
+    if (!ctx->state.caps.cull_face || ctx->state.var.cull_face_mode != GL_FRONT_AND_BACK || p == NULL ||
+        mglProgramHasGeometry(p) || p->tess.active || (xfb && xfb->active && !xfb->paused))
+        return false;
+
+    return mode == GL_TRIANGLES || mode == GL_TRIANGLE_STRIP || mode == GL_TRIANGLE_FAN ||
+           mode == GL_TRIANGLES_ADJACENCY || mode == GL_TRIANGLE_STRIP_ADJACENCY;
+}
+
 void mglDrawArrays(GLMContext ctx, GLenum mode, GLint first, GLsizei count)
 {
     // MGL_INFO("DEBUG: mglDrawArrays ctx=%p prog=%p dirty=%x\n", ctx, ctx->state.program, ctx->state.dirty_bits);
@@ -463,7 +477,7 @@ void mglDrawArrays(GLMContext ctx, GLenum mode, GLint first, GLsizei count)
         return;
     }
 
-    if (mglConditionalRenderSkips(ctx))
+    if (mglConditionalRenderSkips(ctx) || cullsEverything(ctx, mode))
         return;
 
     ctx->state.draw_indexed = GL_FALSE;
@@ -496,7 +510,7 @@ void mglDrawElements(GLMContext ctx, GLenum mode, GLsizei count, GLenum type, co
 
     if (!validate_program(ctx, mode)) { endClientIndices(ctx, staged); ERROR_RETURN(GL_INVALID_OPERATION); return; }
 
-    if (mglConditionalRenderSkips(ctx))
+    if (mglConditionalRenderSkips(ctx) || cullsEverything(ctx, mode))
     {
         endClientIndices(ctx, staged);
         return;
@@ -531,7 +545,7 @@ void mglDrawRangeElements(GLMContext ctx, GLenum mode, GLuint start, GLuint end,
 
     if (!validate_program(ctx, mode)) { endClientIndices(ctx, staged); ERROR_RETURN(GL_INVALID_OPERATION); return; }
 
-    if (mglConditionalRenderSkips(ctx))
+    if (mglConditionalRenderSkips(ctx) || cullsEverything(ctx, mode))
     {
         endClientIndices(ctx, staged);
         return;
@@ -574,7 +588,7 @@ void mglDrawArraysInstanced(GLMContext ctx, GLenum mode, GLint first, GLsizei co
 
     if (!validate_program(ctx, mode)) { ERROR_RETURN(GL_INVALID_OPERATION); return; }
 
-    if (mglConditionalRenderSkips(ctx))
+    if (mglConditionalRenderSkips(ctx) || cullsEverything(ctx, mode))
         return;
 
     ctx->state.draw_indexed = GL_FALSE;
@@ -607,7 +621,7 @@ void mglDrawElementsInstanced(GLMContext ctx, GLenum mode, GLsizei count, GLenum
 
     if (!validate_program(ctx, mode)) { endClientIndices(ctx, staged); ERROR_RETURN(GL_INVALID_OPERATION); return; }
 
-    if (mglConditionalRenderSkips(ctx))
+    if (mglConditionalRenderSkips(ctx) || cullsEverything(ctx, mode))
     {
         endClientIndices(ctx, staged);
         return;
@@ -639,7 +653,7 @@ void mglDrawElementsBaseVertex(GLMContext ctx, GLenum mode, GLsizei count, GLenu
 
     if (!validate_program(ctx, mode)) { endClientIndices(ctx, staged); ERROR_RETURN(GL_INVALID_OPERATION); }
 
-    if (mglConditionalRenderSkips(ctx))
+    if (mglConditionalRenderSkips(ctx) || cullsEverything(ctx, mode))
     {
         endClientIndices(ctx, staged);
         return;
@@ -674,7 +688,7 @@ void mglDrawRangeElementsBaseVertex(GLMContext ctx, GLenum mode, GLuint start, G
 
     if (!validate_program(ctx, mode)) { endClientIndices(ctx, staged); ERROR_RETURN(GL_INVALID_OPERATION); }
 
-    if (mglConditionalRenderSkips(ctx))
+    if (mglConditionalRenderSkips(ctx) || cullsEverything(ctx, mode))
     {
         endClientIndices(ctx, staged);
         return;
@@ -709,7 +723,7 @@ void mglDrawElementsInstancedBaseVertex(GLMContext ctx, GLenum mode, GLsizei cou
 
     if (!validate_program(ctx, mode)) { endClientIndices(ctx, staged); ERROR_RETURN(GL_INVALID_OPERATION); }
 
-    if (mglConditionalRenderSkips(ctx))
+    if (mglConditionalRenderSkips(ctx) || cullsEverything(ctx, mode))
     {
         endClientIndices(ctx, staged);
         return;
@@ -754,7 +768,7 @@ void mglDrawArraysIndirect(GLMContext ctx, GLenum mode, const void *indirect)
 
     ERROR_CHECK_RETURN(validate_program(ctx, mode), GL_INVALID_OPERATION);
 
-    if (mglConditionalRenderSkips(ctx))
+    if (mglConditionalRenderSkips(ctx) || cullsEverything(ctx, mode))
         return;
 
     ctx->state.draw_indexed = GL_FALSE;
@@ -778,7 +792,7 @@ void mglDrawElementsIndirect(GLMContext ctx, GLenum mode, GLenum type, const voi
     GLenum err = indirect_error(ctx, indirect, 1, 0, 5 * sizeof(GLuint));
     ERROR_CHECK_RETURN(err == GL_NO_ERROR, err);
 
-    if (mglConditionalRenderSkips(ctx))
+    if (mglConditionalRenderSkips(ctx) || cullsEverything(ctx, mode))
         return;
 
     ctx->state.draw_indexed = GL_TRUE;
@@ -805,7 +819,7 @@ void mglDrawArraysInstancedBaseInstance(GLMContext ctx, GLenum mode, GLint first
 
     ERROR_CHECK_RETURN(validate_program(ctx, mode), GL_INVALID_OPERATION);
 
-    if (mglConditionalRenderSkips(ctx))
+    if (mglConditionalRenderSkips(ctx) || cullsEverything(ctx, mode))
         return;
 
     ctx->state.draw_indexed = GL_FALSE;
@@ -835,7 +849,7 @@ void mglDrawElementsInstancedBaseInstance(GLMContext ctx, GLenum mode, GLsizei c
 
     if (!validate_program(ctx, mode)) { endClientIndices(ctx, staged); ERROR_RETURN(GL_INVALID_OPERATION); }
 
-    if (mglConditionalRenderSkips(ctx))
+    if (mglConditionalRenderSkips(ctx) || cullsEverything(ctx, mode))
     {
         endClientIndices(ctx, staged);
         return;
@@ -870,7 +884,7 @@ void mglDrawElementsInstancedBaseVertexBaseInstance(GLMContext ctx, GLenum mode,
 
     if (!validate_program(ctx, mode)) { endClientIndices(ctx, staged); ERROR_RETURN(GL_INVALID_OPERATION); }
 
-    if (mglConditionalRenderSkips(ctx))
+    if (mglConditionalRenderSkips(ctx) || cullsEverything(ctx, mode))
     {
         endClientIndices(ctx, staged);
         return;
@@ -915,7 +929,7 @@ void mglMultiDrawArrays(GLMContext ctx, GLenum mode, const GLint *first, const G
 
     ERROR_CHECK_RETURN(validate_program(ctx, mode), GL_INVALID_OPERATION);
 
-    if (mglConditionalRenderSkips(ctx))
+    if (mglConditionalRenderSkips(ctx) || cullsEverything(ctx, mode))
         return;
 
     ctx->state.draw_indexed = GL_FALSE;
@@ -945,7 +959,7 @@ void mglMultiDrawElements(GLMContext ctx, GLenum mode, const GLsizei *count, GLe
 
     ERROR_CHECK_RETURN(validate_program(ctx, mode), GL_INVALID_OPERATION);
 
-    if (mglConditionalRenderSkips(ctx))
+    if (mglConditionalRenderSkips(ctx) || cullsEverything(ctx, mode))
         return;
 
     ctx->state.draw_indexed = GL_TRUE;
@@ -975,7 +989,7 @@ void mglMultiDrawElementsBaseVertex(GLMContext ctx, GLenum mode, const GLsizei *
 
     ERROR_CHECK_RETURN(validate_program(ctx, mode), GL_INVALID_OPERATION);
 
-    if (mglConditionalRenderSkips(ctx))
+    if (mglConditionalRenderSkips(ctx) || cullsEverything(ctx, mode))
         return;
 
     ctx->state.draw_indexed = GL_TRUE;
@@ -1004,7 +1018,7 @@ void mglMultiDrawArraysIndirect(GLMContext ctx, GLenum mode, const void *indirec
     GLenum err = indirect_error(ctx, indirect, drawcount, stride, 4 * sizeof(GLuint));
     ERROR_CHECK_RETURN(err == GL_NO_ERROR, err);
 
-    if (mglConditionalRenderSkips(ctx))
+    if (mglConditionalRenderSkips(ctx) || cullsEverything(ctx, mode))
         return;
 
     ctx->state.draw_indexed = GL_FALSE;
@@ -1034,7 +1048,7 @@ void mglMultiDrawElementsIndirect(GLMContext ctx, GLenum mode, GLenum type, cons
     GLenum err = indirect_error(ctx, indirect, drawcount, stride, 5 * sizeof(GLuint));
     ERROR_CHECK_RETURN(err == GL_NO_ERROR, err);
 
-    if (mglConditionalRenderSkips(ctx))
+    if (mglConditionalRenderSkips(ctx) || cullsEverything(ctx, mode))
         return;
 
     ctx->state.draw_indexed = GL_TRUE;

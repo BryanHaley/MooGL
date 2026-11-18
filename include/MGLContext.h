@@ -54,10 +54,15 @@ GLMContext createGLMContextShared(GLenum format, GLenum type,
                                   GLenum stencil_format, GLenum stencil_type,
                                   GLMContext share);
 
+// an OpenGL ES 3.1 context, as GLX and WGL name it; only a libmoogl built
+// with OGL_ES=1 makes one, and others return NULL
+#define MGL_CONTEXT_ES_PROFILE_BIT 0x00000004
+
 // As createGLMContextShared, with the profile: GL_CONTEXT_CORE_PROFILE_BIT,
-// or GL_CONTEXT_COMPATIBILITY_PROFILE_BIT for a context that also takes what
+// GL_CONTEXT_COMPATIBILITY_PROFILE_BIT for a context that also takes what
 // the core profile removed, from glBegin and the matrix stacks to fixed-
-// function lighting, display lists and selection.
+// function lighting, display lists and selection, or MGL_CONTEXT_ES_PROFILE_BIT
+// for OpenGL ES 3.1. Share only with a context of the same API.
 GLMContext createGLMContextProfile(GLenum format, GLenum type,
                                    GLenum depth_format, GLenum depth_type,
                                    GLenum stencil_format, GLenum stencil_type,

@@ -44,6 +44,7 @@ GLsizei typeSize(GLenum type)
 
         case GL_INT:
         case GL_UNSIGNED_INT:
+        case GL_FIXED:
             return sizeof(int);
 
         case GL_FLOAT:
@@ -166,7 +167,10 @@ void mglBindVertexArray(GLMContext ctx, GLuint array)
     }
     else
     {
-        //ERROR_CHECK_RETURN(isVAO(ctx, array), GL_INVALID_VALUE);
+        // only a name glGenVertexArrays gave
+        ERROR_CHECK_RETURN(isVAO(ctx, array) ||
+                           (array < STATE(vao_table.current_name) && !isFreeName(&STATE(vao_table), array)),
+                           GL_INVALID_OPERATION);
 
         ptr = getVAO(ctx, array);
 
@@ -402,6 +406,31 @@ void setVertexAttrib(GLMContext ctx, GLuint index, GLint size, GLenum type, GLbo
     VAO_STATE(dirty_bits) |= DIRTY_VAO | DIRTY_VAO_BUFFER_BASE;
 }
 
+// GL 4.6 10.3.1: what size and type have to agree on
+static GLenum attribFormatError(GLMContext ctx, GLint size, GLenum type, GLboolean normalized)
+{
+    bool bgra = size == GL_BGRA;
+#ifdef MGL_OGL_ES
+    if (ctx->es)
+        bgra = false;
+#endif
+
+    if (!bgra && (size < 1 || size > 4))
+        return GL_INVALID_VALUE;
+
+    if ((type == GL_INT_2_10_10_10_REV || type == GL_UNSIGNED_INT_2_10_10_10_REV) && size != 4 && !bgra)
+        return GL_INVALID_OPERATION;
+
+    if (type == GL_UNSIGNED_INT_10F_11F_11F_REV && size != 3)
+        return GL_INVALID_OPERATION;
+
+    if (bgra && (!normalized || (type != GL_UNSIGNED_BYTE && type != GL_INT_2_10_10_10_REV &&
+                                 type != GL_UNSIGNED_INT_2_10_10_10_REV)))
+        return GL_INVALID_OPERATION;
+
+    return GL_NO_ERROR;
+}
+
 void mglVertexAttribPointer(GLMContext ctx, GLuint index, GLint size, GLenum type, GLboolean normalized, GLsizei stride, const void *pointer)
 {
     ERROR_CHECK_RETURN(index < MAX_ATTRIBS, GL_INVALID_VALUE);
@@ -446,6 +475,10 @@ void mglVertexAttribPointer(GLMContext ctx, GLuint index, GLint size, GLenum typ
             ERROR_RETURN(GL_INVALID_ENUM);
     }
 
+    GLenum bad = attribFormatError(ctx, size, type, normalized);
+
+    ERROR_CHECK_RETURN(bad == GL_NO_ERROR, bad);
+
     setVertexAttrib(ctx, index, size, type, normalized, stride, pointer);
 }
 
@@ -465,7 +498,11 @@ void mglVertexAttribIPointer(GLMContext ctx, GLuint index, GLint size, GLenum ty
 
         ptr = STATE(buffers[_ARRAY_BUFFER]);
 
+#ifdef MGL_COMPAT_CONTEXTS
+        ERROR_CHECK_RETURN(ptr || mglCompatClientArraysAllowed(ctx), GL_INVALID_OPERATION);
+#else
         ERROR_CHECK_RETURN(ptr, GL_INVALID_OPERATION);
+#endif
     }
 
     // integer handling: only the integer types are legal here
@@ -482,6 +519,8 @@ void mglVertexAttribIPointer(GLMContext ctx, GLuint index, GLint size, GLenum ty
         default:
             ERROR_RETURN(GL_INVALID_ENUM);
     }
+
+    ERROR_CHECK_RETURN(size >= 1 && size <= 4, GL_INVALID_VALUE);
 
     setVertexAttrib(ctx, index, size, type, 0, stride, pointer);
 

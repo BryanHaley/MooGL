@@ -18,7 +18,9 @@
  *
  */
 
+#include <math.h>
 #include "glm_context.h"
+#include "utils.h"
 #include "mgl_format_table.h"
 #include "pixel_utils.h"
 
@@ -366,11 +368,11 @@ static bool getTexParmi(GLMContext ctx, TextureParameter *tex_params, const GLen
             break;
 
         case GL_TEXTURE_MIN_LOD:
-            *ret = tex_params->min_lod;
+            *ret = (GLint)lroundf(tex_params->min_lod);
             break;
 
         case GL_TEXTURE_MAX_LOD:
-            *ret = tex_params->max_lod;
+            *ret = (GLint)lroundf(tex_params->max_lod);
             break;
 
         case GL_TEXTURE_MAX_LEVEL:
@@ -539,7 +541,7 @@ bool setParam(GLMContext ctx, TextureParameter *tex_params, GLenum pname, GLint 
         if (setTexParmf(ctx, tex_params, pname, &fparam))
             return true;
 
-        iparam = (GLint)fparam;
+        iparam = (GLint)lroundf(fparam);
         if (setTexParmi(ctx, tex_params, pname, &iparam))
             return true;
     }
@@ -1082,7 +1084,7 @@ void mglGetTexParameteriv(GLMContext ctx, GLenum target, GLenum pname, GLint *pa
         getTexParamiv(ctx, &tex->params, pname, params);
 }
 
-static bool getTexLevelParameter(GLMContext ctx, Texture *tex, GLint level, GLenum pname, GLint *out)
+static bool getTexLevelParameter(GLMContext ctx, Texture *tex, GLuint face, GLint level, GLenum pname, GLint *out)
 {
     TextureLevel *lvl;
 
@@ -1100,9 +1102,33 @@ static bool getTexLevelParameter(GLMContext ctx, Texture *tex, GLint level, GLen
         ERROR_RETURN_VALUE(GL_INVALID_ENUM, false);
     }
 
-    ERROR_CHECK_RETURN_VALUE((GLuint)level < tex->num_levels, GL_INVALID_VALUE, false);
+    ERROR_CHECK_RETURN_VALUE(level <= (GLint)ilog2(STATE_VAR(max_texture_size)), GL_INVALID_VALUE, false);
 
-    lvl = &tex->faces[0].levels[level];
+    // a level that holds no image answers with GL's defaults
+    if ((GLuint)level >= tex->num_levels || tex->faces[face].levels == NULL)
+    {
+        switch (pname)
+        {
+            case GL_TEXTURE_INTERNAL_FORMAT: *out = GL_RGBA; return true;
+            case GL_TEXTURE_FIXED_SAMPLE_LOCATIONS: *out = GL_TRUE; return true;
+
+            case GL_TEXTURE_RED_TYPE: case GL_TEXTURE_GREEN_TYPE: case GL_TEXTURE_BLUE_TYPE:
+            case GL_TEXTURE_ALPHA_TYPE: case GL_TEXTURE_DEPTH_TYPE:
+                *out = GL_NONE; return true;
+
+            case GL_TEXTURE_WIDTH: case GL_TEXTURE_HEIGHT: case GL_TEXTURE_DEPTH: case GL_TEXTURE_SAMPLES:
+            case GL_TEXTURE_COMPRESSED: case GL_TEXTURE_COMPRESSED_IMAGE_SIZE:
+            case GL_TEXTURE_RED_SIZE: case GL_TEXTURE_GREEN_SIZE: case GL_TEXTURE_BLUE_SIZE:
+            case GL_TEXTURE_ALPHA_SIZE: case GL_TEXTURE_DEPTH_SIZE: case GL_TEXTURE_STENCIL_SIZE:
+            case GL_TEXTURE_SHARED_SIZE: case GL_TEXTURE_BUFFER_OFFSET: case GL_TEXTURE_BUFFER_SIZE:
+            case GL_TEXTURE_BUFFER_DATA_STORE_BINDING:
+                *out = 0; return true;
+        }
+
+        ERROR_RETURN_VALUE(GL_INVALID_ENUM, false);
+    }
+
+    lvl = &tex->faces[face].levels[level];
 
     switch(pname)
     {
@@ -1113,7 +1139,7 @@ static bool getTexLevelParameter(GLMContext ctx, Texture *tex, GLint level, GLen
         case GL_TEXTURE_SAMPLES:         *out = tex->samples; return true;
 
         case GL_TEXTURE_FIXED_SAMPLE_LOCATIONS:
-            *out = GL_TRUE;
+            *out = !tex->variable_sample_locations;
             return true;
 
         case GL_TEXTURE_COMPRESSED:
@@ -1220,7 +1246,10 @@ void mglGetTexLevelParameteriv(GLMContext ctx, GLenum target, GLint level, GLenu
 
     ERROR_CHECK_RETURN(index != _MAX_TEXTURE_TYPES, GL_INVALID_ENUM);
 
-    if (getTexLevelParameter(ctx, currentTexture(ctx, index), level, pname, &value))
+    GLuint face = target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X && target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z
+                ? target - GL_TEXTURE_CUBE_MAP_POSITIVE_X : 0;
+
+    if (getTexLevelParameter(ctx, currentTexture(ctx, index), face, level, pname, &value))
         *params = value;
 }
 

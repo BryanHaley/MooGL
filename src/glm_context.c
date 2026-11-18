@@ -32,6 +32,7 @@
 #include "MGLRenderer.h"
 #include "error.h"
 #include "mgl_log.h"
+#include "mgl_es.h"
 #include "programs.h"
 #include "shaders.h"
 #include "buffers.h"
@@ -195,6 +196,15 @@ GLMContext createGLMContextProfile(GLenum format, GLenum type,
     if (ctx == NULL)
         return NULL;
 
+#ifndef MGL_OGL_ES
+    // a build without OGL_ES=1 makes no ES contexts
+    if (profile & MGL_CONTEXT_ES_PROFILE_BIT)
+    {
+        free(ctx);
+        return NULL;
+    }
+#endif
+
     bzero((void *)ctx, sizeof(GLMContextRec));
 
     ctx->state.share = joinShareGroup(ctx, share);
@@ -284,6 +294,7 @@ GLMContext createGLMContextProfile(GLenum format, GLenum type,
     STATE(caps.sample_alpha_to_coverage) = false;
     STATE(caps.sample_alpha_to_one) = false;
     STATE(caps.sample_coverage) = false;
+    STATE_VAR(provoking_vertex) = GL_LAST_VERTEX_CONVENTION;
     STATE(caps.rasterizer_discard) = false;
     STATE(caps.framebuffer_srgb) = false;
     STATE(caps.primitive_restart) = false;
@@ -303,6 +314,7 @@ GLMContext createGLMContextProfile(GLenum format, GLenum type,
     STATE(hints.polygon_smooth_hint) = GL_DONT_CARE;
     STATE(hints.texture_compression_hint) = GL_DONT_CARE;
     STATE(hints.fragment_shader_derivative_hint) = GL_DONT_CARE;
+    STATE(hints.generate_mipmap_hint) = GL_DONT_CARE;
 
     STATE(var.line_width) = 1.0f;
     STATE(var.point_size) = 1.0f;
@@ -434,7 +446,7 @@ GLMContext createGLMContextProfile(GLenum format, GLenum type,
     initHashTable(&STATE(program_pipeline_table), 32);
     initHashTable(&STATE(query_table), 32);
 
-    STATE(debug).messages_enabled = GL_TRUE;
+    STATE(debug).rule_count = 0;
     initHashTable(&STATE(transform_feedback_table), 32);
 
     // the default transform feedback object is bound from the start
@@ -458,14 +470,18 @@ GLMContext createGLMContextProfile(GLenum format, GLenum type,
         MGL_ERR("MGL Error: glslang would not initialise; shader compilation will fail\n");
 
 #ifdef MGL_COMPAT_CONTEXTS
-    if (profile & GL_CONTEXT_COMPATIBILITY_PROFILE_BIT)
+    // ES runs on the compatibility layer for vertex array zero and client arrays
+    if (profile & (GL_CONTEXT_COMPATIBILITY_PROFILE_BIT | MGL_CONTEXT_ES_PROFILE_BIT))
     {
         mglCompatInit(ctx);
         if (ctx->compat)
             STATE_VAR(context_profile_mask) = GL_CONTEXT_COMPATIBILITY_PROFILE_BIT;
     }
-#else
-    (void)profile;
+#endif
+
+#ifdef MGL_OGL_ES
+    if (profile & MGL_CONTEXT_ES_PROFILE_BIT)
+        mglESInit(ctx);
 #endif
 
     _ctx = save;
@@ -638,6 +654,9 @@ void destroyGLMContext(GLMContext ctx)
 
 #ifdef MGL_COMPAT_CONTEXTS
     mglCompatFree(ctx);
+#endif
+#ifdef MGL_OGL_ES
+    mglESFree(ctx);
 #endif
 
     bool last = leaveShareGroup(ctx);

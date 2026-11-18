@@ -148,6 +148,41 @@ static GLsizei debugMeasure(const GLchar *buf, GLsizei length)
     return length;
 }
 
+// KHR_debug: every message starts enabled except low severity ones, then
+// each glDebugMessageControl setting that matches it has its say in turn
+static bool debugEnabled(const DebugState *debug, GLenum source, GLenum type, GLuint id, GLenum severity)
+{
+    bool on = severity != GL_DEBUG_SEVERITY_LOW;
+
+    for (GLuint i = 0; i < debug->rule_count; i++)
+    {
+        const DebugRule *r = &debug->rules[i];
+
+        if ((r->source != GL_DONT_CARE && r->source != source) || (r->type != GL_DONT_CARE && r->type != type) ||
+            (r->severity != GL_DONT_CARE && r->severity != severity) || (r->by_id && r->id != id))
+            continue;
+
+        on = r->enabled;
+    }
+
+    return on;
+}
+
+static void addDebugRule(DebugState *debug, GLenum source, GLenum type, GLenum severity, const GLuint *id,
+                         GLboolean enabled)
+{
+    GLuint floor = debug->group_depth ? debug->group_rules[debug->group_depth - 1] : 0;
+
+    // a setting for everything makes the current group's earlier ones moot
+    if (!id && source == GL_DONT_CARE && type == GL_DONT_CARE && severity == GL_DONT_CARE)
+        debug->rule_count = floor;
+
+    if (debug->rule_count >= MAX_DEBUG_RULES)
+        return;
+
+    debug->rules[debug->rule_count++] = (DebugRule){ source, type, severity, id ? *id : 0, id != NULL, enabled };
+}
+
 void mglDebugEmit(GLMContext ctx, GLenum source, GLenum type, GLuint id, GLenum severity, const char *text)
 {
     DebugState *debug = &ctx->state.debug;
@@ -160,7 +195,7 @@ void mglDebugEmit(GLMContext ctx, GLenum source, GLenum type, GLuint id, GLenum 
     if (ctx->state.caps.debug_output == false)
         return;
 
-    if (debug->messages_enabled == GL_FALSE)
+    if (!debugEnabled(debug, source, type, id, severity))
         return;
 
     len = (GLsizei)strlen(text);
@@ -212,7 +247,11 @@ void mglDebugMessageControl(GLMContext ctx, GLenum source, GLenum type, GLenum s
         ERROR_CHECK_RETURN(severity == GL_DONT_CARE, GL_INVALID_OPERATION);
     }
 
-    ctx->state.debug.messages_enabled = enabled;
+    if (count == 0)
+        addDebugRule(&ctx->state.debug, source, type, severity, NULL, enabled);
+
+    for (GLsizei i = 0; i < count; i++)
+        addDebugRule(&ctx->state.debug, source, type, GL_DONT_CARE, &ids[i], enabled);
 }
 
 void mglDebugMessageInsert(GLMContext ctx, GLenum source, GLenum type, GLuint id, GLenum severity, GLsizei length, const GLchar *buf)
@@ -296,6 +335,7 @@ void mglPushDebugGroup(GLMContext ctx, GLenum source, GLuint id, GLsizei length,
     debug->groups[debug->group_depth].severity = GL_DEBUG_SEVERITY_NOTIFICATION;
     debug->groups[debug->group_depth].length = len;
     memcpy(debug->groups[debug->group_depth].text, text, (size_t)len + 1);
+    debug->group_rules[debug->group_depth] = debug->rule_count;
     debug->group_depth++;
 
     mglDebugEmit(ctx, source, GL_DEBUG_TYPE_PUSH_GROUP, id, GL_DEBUG_SEVERITY_NOTIFICATION, text);
@@ -312,6 +352,7 @@ void mglPopDebugGroup(GLMContext ctx)
     ERROR_CHECK_RETURN(debug->group_depth > 0, GL_STACK_UNDERFLOW);
 
     debug->group_depth--;
+    debug->rule_count = debug->group_rules[debug->group_depth];
     group = &debug->groups[debug->group_depth];
 
     mglDebugEmit(ctx, group->source, GL_DEBUG_TYPE_POP_GROUP, group->id,
@@ -509,10 +550,11 @@ static void labelReturn(const ObjectLabel *l, GLsizei bufSize, GLsizei *length, 
 {
     GLsizei len = l ? (GLsizei)strlen(l->text) : 0;
 
-    if (len > bufSize - 1)
-        len = bufSize - 1;
+    // with no buffer, the label's whole length
+    if (label && len > bufSize - 1)
+        len = bufSize > 0 ? bufSize - 1 : 0;
 
-    if (label)
+    if (label && bufSize > 0)
     {
         if (len > 0)
             memcpy(label, l->text, (size_t)len);
@@ -562,7 +604,7 @@ void mglObjectLabelFetch(GLMContext ctx, GLenum identifier, GLuint name, GLsizei
 {
     ERROR_CHECK_RETURN(labelIdentifierValid(identifier), GL_INVALID_ENUM);
     ERROR_CHECK_RETURN(labelObjectExists(ctx, identifier, name), GL_INVALID_OPERATION);
-    ERROR_CHECK_RETURN(bufSize > 0, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(bufSize >= 0, GL_INVALID_VALUE);
 
     pthread_mutex_lock(&label_lock);
     labelReturn(labelFind(ctx, identifier, name, NULL), bufSize, length, label);
@@ -592,7 +634,7 @@ void mglObjectPtrLabel(GLMContext ctx, const void *ptr, GLsizei length, const GL
 void mglObjectPtrLabelFetch(GLMContext ctx, const void *ptr, GLsizei bufSize, GLsizei *length, GLchar *label)
 {
     ERROR_CHECK_RETURN(isSync(ctx, (GLsync)ptr), GL_INVALID_VALUE);
-    ERROR_CHECK_RETURN(bufSize > 0, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(bufSize >= 0, GL_INVALID_VALUE);
 
     pthread_mutex_lock(&label_lock);
     labelReturn(labelFind(ctx, 0, 0, ptr), bufSize, length, label);

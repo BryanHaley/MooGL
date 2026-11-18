@@ -423,4 +423,57 @@ void glGetActiveAttribARB(GLhandleARB obj, GLuint index, GLsizei maxLength, GLsi
 
 GLint glGetAttribLocationARB(GLhandleARB obj, const GLcharARB *name) { return glGetAttribLocation(NAME(obj), name); }
 
+// GL_KHR_debug, which an ES context lists, names its calls with KHR
+void glDebugMessageControlKHR(GLenum source, GLenum type, GLenum severity, GLsizei count, const GLuint *ids,
+                              GLboolean enabled)
+{
+    glDebugMessageControl(source, type, severity, count, ids, enabled);
+}
+
+void glDebugMessageInsertKHR(GLenum source, GLenum type, GLuint id, GLenum severity, GLsizei length,
+                             const GLchar *buf)
+{
+    glDebugMessageInsert(source, type, id, severity, length, buf);
+}
+
+void glDebugMessageCallbackKHR(GLDEBUGPROC callback, const void *userParam)
+{
+    glDebugMessageCallback(callback, userParam);
+}
+
+GLuint glGetDebugMessageLogKHR(GLuint count, GLsizei bufSize, GLenum *sources, GLenum *types, GLuint *ids,
+                               GLenum *severities, GLsizei *lengths, GLchar *messageLog)
+{
+    return glGetDebugMessageLog(count, bufSize, sources, types, ids, severities, lengths, messageLog);
+}
+
+void glPushDebugGroupKHR(GLenum source, GLuint id, GLsizei length, const GLchar *message)
+{
+    glPushDebugGroup(source, id, length, message);
+}
+
+void glPopDebugGroupKHR(void) { glPopDebugGroup(); }
+
+void glObjectLabelKHR(GLenum identifier, GLuint name, GLsizei length, const GLchar *label)
+{
+    glObjectLabel(identifier, name, length, label);
+}
+
+void glGetObjectLabelKHR(GLenum identifier, GLuint name, GLsizei bufSize, GLsizei *length, GLchar *label)
+{
+    glGetObjectLabel(identifier, name, bufSize, length, label);
+}
+
+void glObjectPtrLabelKHR(const void *ptr, GLsizei length, const GLchar *label)
+{
+    glObjectPtrLabel(ptr, length, label);
+}
+
+void glGetObjectPtrLabelKHR(const void *ptr, GLsizei bufSize, GLsizei *length, GLchar *label)
+{
+    glGetObjectPtrLabel(ptr, bufSize, length, label);
+}
+
+void glGetPointervKHR(GLenum pname, void **params) { glGetPointerv(pname, params); }
+
 #endif

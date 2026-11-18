@@ -313,3 +313,50 @@ GPU_TEST(program_query, parallel_compile_reports_completion_and_thread_count)
     CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
     glDeleteProgram(prog);
 }
+
+static GLint varProp(GLuint prog, const char *name, GLenum prop)
+{
+    GLuint i = glGetProgramResourceIndex(prog, GL_BUFFER_VARIABLE, name);
+    GLint v = -1;
+
+    if (i != GL_INVALID_INDEX)
+        glGetProgramResourceiv(prog, GL_BUFFER_VARIABLE, i, 1, &prop, 1, NULL, &v);
+    return v;
+}
+
+GPU_TEST(program_query, block_arrays_and_top_level_rules)
+{
+    static const char *CS =
+        "#version 430\nlayout(local_size_x = 1) in;\n"
+        "struct S { ivec3 a; vec4 c; };\n"
+        "layout(std430, binding = 0) buffer Block { uint u; vec4 g[5]; S s[][2]; } block[2];\n"
+        "layout(std140, binding = 2) buffer Unused { vec3 d[]; } unused;\n"
+        "layout(std140, binding = 0) uniform U { vec4 aa[2][3]; };\n"
+        "void main() { block[1].u = uint(aa[1][2].x) + uint(block[0].s[1][1].a.x) + uint(block[0].g[4].x); }\n";
+    char log[2048] = "";
+    GLuint prog = mgl_build_compute_program(CS, log, sizeof log), idx;
+    GLint v = -1;
+    GLenum prop = GL_NUM_ACTIVE_VARIABLES;
+
+    CHECK_MSG(prog != 0, "%s", log);
+    if (!prog)
+        return;
+
+    // every element of a block array lists the block's variables
+    idx = glGetProgramResourceIndex(prog, GL_SHADER_STORAGE_BLOCK, "Block[1]");
+    glGetProgramResourceiv(prog, GL_SHADER_STORAGE_BLOCK, idx, 1, &prop, 1, NULL, &v);
+    CHECK_MSG(v >= 4, "Block[1] lists %d variables", v);
+
+    // an unused std140 block is still active
+    CHECK(glGetProgramResourceIndex(prog, GL_SHADER_STORAGE_BLOCK, "Unused") != GL_INVALID_INDEX);
+
+    // the top level counts only for an array of structures, and unsized is 0
+    CHECK_EQ_INT(varProp(prog, "Block.s[0][0].a", GL_TOP_LEVEL_ARRAY_SIZE), 0);
+    CHECK_EQ_INT(varProp(prog, "Block.g[0]", GL_TOP_LEVEL_ARRAY_SIZE), 1);
+    CHECK_EQ_INT(varProp(prog, "Block.g[0]", GL_TOP_LEVEL_ARRAY_STRIDE), 0);
+
+    // a uniform array of arrays is one uniform per outer element
+    CHECK(glGetProgramResourceIndex(prog, GL_UNIFORM, "aa[1][0]") != GL_INVALID_INDEX);
+
+    glDeleteProgram(prog);
+}

@@ -664,3 +664,123 @@ GPU_TEST(ssbo, high_binding_numbers_reach_the_shader)
     glDeleteBuffers(3, bufs);
     glDeleteProgram(prog);
 }
+
+/* An ivec3 followed by two ints packs the ivec3 down in Metal, but std430
+   still steps the array 32 bytes per element. */
+static const char *PACKED_STRUCT_CS =
+"#version 460 core\n"
+"layout(local_size_x = 1) in;\n"
+"struct S { ivec3 v; int a; int b; };\n"
+"layout(std430, binding = 0) buffer In  { S s[]; };\n"
+"layout(std430, binding = 1) buffer Out { int got[]; };\n"
+"void main() {\n"
+"    uint i = gl_WorkGroupID.x;\n"
+"    got[i] = s[i].v.z + s[i].b;\n"
+"}\n";
+
+GPU_TEST(ssbo, struct_array_keeps_std430_stride_after_packing)
+{
+    char log[2048] = "";
+    GLuint prog = mgl_build_compute_program(PACKED_STRUCT_CS, log, sizeof log);
+    GLuint bufs[2] = { 0, 0 };
+    GLint in[4 * 8] = { 0 }, zero[4] = { 0 }, got[4] = { 0 };
+
+    CHECK_MSG(prog != 0, "kernel did not build: %s", log);
+    if (!prog)
+        return;
+
+    /* element i: v.z at word 2, b at word 4 */
+    for (int i = 0; i < 4; i++)
+    {
+        in[i * 8 + 2] = 10 * (i + 1);
+        in[i * 8 + 4] = i + 1;
+    }
+
+    glGenBuffers(2, bufs);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, bufs[0]);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof in, in, GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, bufs[0]);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, bufs[1]);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof zero, zero, GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, bufs[1]);
+
+    CHECK(run_compute(prog, 4, 1, 1));
+
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, bufs[1]);
+    glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof got, got);
+    for (int i = 0; i < 4; i++)
+        CHECK_EQ_INT(got[i], 11 * (i + 1));
+
+    glDeleteBuffers(2, bufs);
+    glDeleteProgram(prog);
+}
+
+/* std140 steps each bool of an array of arrays 16 bytes apart */
+static const char *BOOL_AOA_CS =
+"#version 460 core\n"
+"layout(local_size_x = 1) in;\n"
+"layout(std140, binding = 0) buffer B { mat3 a; bool b[1][8]; };\n"
+"layout(std430, binding = 1) buffer Out { uint got[8]; };\n"
+"void main() {\n"
+"    for (int i = 0; i < 8; i++) got[i] = b[0][i] ? 1u : 0u;\n"
+"}\n";
+
+GPU_TEST(ssbo, std140_bool_array_of_arrays_reads_each_element)
+{
+    char log[2048] = "";
+    GLuint prog = mgl_build_compute_program(BOOL_AOA_CS, log, sizeof log);
+    GLuint bufs[2] = { 0, 0 };
+    GLuint in[48 + 32] = { 0 }, got[8] = { 0 };
+
+    CHECK_MSG(prog != 0, "kernel did not build: %s", log);
+    if (!prog)
+        return;
+
+    /* mat3 takes 48 bytes; b[0][i] sits at 48 + 16 i */
+    for (int i = 0; i < 8; i++)
+        in[12 + 4 * i] = (GLuint)(i & 1);
+
+    glGenBuffers(2, bufs);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, bufs[0]);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof in, in, GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, bufs[0]);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, bufs[1]);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof got, got, GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, bufs[1]);
+
+    CHECK(run_compute(prog, 1, 1, 1));
+
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, bufs[1]);
+    glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof got, got);
+    for (int i = 0; i < 8; i++)
+        CHECK_EQ_UINT(got[i], (GLuint)(i & 1));
+
+    glDeleteBuffers(2, bufs);
+    glDeleteProgram(prog);
+}
+
+/* the inner array of "a[1][1]" has one element; only an outermost array can be unsized */
+GPU_TEST(ssbo, size_one_inner_array_is_not_unsized)
+{
+    static const char *CS =
+        "#version 460 core\n"
+        "layout(local_size_x = 1) in;\n"
+        "layout(std430, binding = 0) buffer B { bvec3 a[1][1]; uint d[]; };\n"
+        "void main() { a[0][0] = bvec3(true); d[0] = 1u; }\n";
+    char log[1024] = "";
+    GLuint prog = mgl_build_compute_program(CS, log, sizeof log);
+    const GLenum prop = GL_ARRAY_SIZE;
+    GLint size = -1;
+
+    CHECK_MSG(prog != 0, "%s", log);
+    if (!prog)
+        return;
+
+    glGetProgramResourceiv(prog, GL_BUFFER_VARIABLE,
+                           glGetProgramResourceIndex(prog, GL_BUFFER_VARIABLE, "a[0][0]"), 1, &prop, 1, NULL, &size);
+    CHECK_EQ_INT(size, 1);
+    glGetProgramResourceiv(prog, GL_BUFFER_VARIABLE,
+                           glGetProgramResourceIndex(prog, GL_BUFFER_VARIABLE, "d[0]"), 1, &prop, 1, NULL, &size);
+    CHECK_EQ_INT(size, 0);
+    glDeleteProgram(prog);
+}

@@ -323,3 +323,126 @@ GPU_TEST(objects, a_program_deleted_in_use_keeps_its_name)
     glUseProgram(0);
     CHECK(!glIsProgram(prog));
 }
+
+/* ---------- which error a wrong name gives ---------- */
+
+GPU_TEST(objects, wrong_kind_of_name_is_invalid_operation)
+{
+    GLuint sh = glCreateShader(GL_VERTEX_SHADER), prog = glCreateProgram();
+    GLint v = 0;
+
+    // a shader where a program goes, and the other way round
+    glUseProgram(sh);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_INVALID_OPERATION);
+    glAttachShader(sh, sh);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_INVALID_OPERATION);
+    glAttachShader(prog, prog);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_INVALID_OPERATION);
+    glCompileShader(prog);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_INVALID_OPERATION);
+    glGetShaderiv(prog, GL_SHADER_TYPE, &v);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_INVALID_OPERATION);
+
+    // a name that is nothing at all
+    glUseProgram(prog + sh + 100);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_INVALID_VALUE);
+    glAttachShader(prog + sh + 100, sh);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_INVALID_VALUE);
+
+    // not attached, and an unknown pname
+    glDetachShader(prog, sh);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_INVALID_OPERATION);
+    glGetProgramiv(prog, 0xFFFF, &v);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_INVALID_ENUM);
+
+    glDeleteShader(sh);
+    glDeleteProgram(prog);
+}
+
+GPU_TEST(objects, binding_needs_a_generated_name)
+{
+    GLuint vao, xfb, q;
+
+    glBindVertexArray(4000000);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_INVALID_OPERATION);
+    glBindTransformFeedback(GL_TRANSFORM_FEEDBACK, 4000000);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_INVALID_OPERATION);
+    glBeginQuery(GL_SAMPLES_PASSED, 4000000);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_INVALID_OPERATION);
+    glBeginQuery(GL_SAMPLES_PASSED, 0);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_INVALID_OPERATION);
+    CHECK(!glIsTransformFeedback(0));
+
+    glGenVertexArrays(1, &vao);
+    glGenTransformFeedbacks(1, &xfb);
+    glGenQueries(1, &q);
+    CHECK(!glIsQuery(q));
+
+    glBindVertexArray(vao);
+    glBindTransformFeedback(GL_TRANSFORM_FEEDBACK, xfb);
+    glBeginQuery(GL_SAMPLES_PASSED, q);
+    glEndQuery(GL_SAMPLES_PASSED);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+    CHECK(glIsQuery(q));
+
+    glGenTransformFeedbacks(-1, &xfb);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_INVALID_VALUE);
+
+    glBindVertexArray(0);
+    glBindTransformFeedback(GL_TRANSFORM_FEEDBACK, 0);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteTransformFeedbacks(1, &xfb);
+    glDeleteQueries(1, &q);
+}
+
+GPU_TEST(objects, a_texture_keeps_its_target)
+{
+    GLuint tex;
+
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, tex);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_INVALID_OPERATION);
+
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glDeleteTextures(1, &tex);
+}
+
+GPU_TEST(objects, a_deleted_buffer_stays_in_other_vertex_arrays)
+{
+    GLuint vao, buf;
+    GLint name = 0;
+
+    glGenVertexArrays(1, &vao);
+    glGenBuffers(1, &buf);
+    glBindVertexArray(vao);
+    glBindBuffer(GL_ARRAY_BUFFER, buf);
+    glBufferData(GL_ARRAY_BUFFER, 64, NULL, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0);
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+    glDeleteBuffers(1, &buf);
+    CHECK(!glIsBuffer(buf));
+
+    glBindVertexArray(vao);
+    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &name);
+    CHECK_EQ_INT(name, (GLint)buf);
+
+    glBindVertexArray(0);
+    glDeleteVertexArrays(1, &vao);
+}
+
+GPU_TEST(objects, buffer_sub_data_checks_a_null_update)
+{
+    GLuint buf;
+
+    glGenBuffers(1, &buf);
+    glBindBuffer(GL_ARRAY_BUFFER, buf);
+    glBufferData(GL_ARRAY_BUFFER, 10, NULL, GL_STATIC_DRAW);
+    glBufferSubData(GL_ARRAY_BUFFER, 8, 8, NULL);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_INVALID_VALUE);
+
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glDeleteBuffers(1, &buf);
+}

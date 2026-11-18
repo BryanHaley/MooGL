@@ -30,6 +30,7 @@ typedef struct GLMHints_t {
     GLuint polygon_smooth_hint;
     GLuint texture_compression_hint;
     GLuint fragment_shader_derivative_hint;
+    GLuint generate_mipmap_hint;
 } GLMHints;
 
 typedef struct GLMCaps_t {

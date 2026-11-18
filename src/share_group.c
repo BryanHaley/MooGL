@@ -163,19 +163,21 @@ static void release(GLMContext ctx, GLenum type, void *obj)
 }
 
 // Call once ctx has unbound obj itself. True when another context in the
-// group still uses it: it is held, and the caller must not free it.
+// group, or for a buffer another of ctx's vertex arrays, still uses it: it is
+// held, and the caller must not free it.
 bool mglHoldIfUsedElsewhere(GLMContext ctx, GLenum type, void *obj)
 {
     MGLShareGroup *g = ctx->state.share;
     bool used = false;
 
-    if (g->context_count < 2)
+    // a deleted buffer also stays in this context's unbound vertex arrays
+    if (g->context_count < 2 && type != GL_BUFFER)
         return false;
 
     pthread_mutex_lock(&g->lock);
 
     for (GLuint i = 0; i < g->context_count && !used; i++)
-        if (g->contexts[i] != ctx)
+        if (g->contexts[i] != ctx || type == GL_BUFFER)
             used = usedBy(g->contexts[i], type, obj);
 
     if (used)

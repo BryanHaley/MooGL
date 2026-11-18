@@ -1,6 +1,15 @@
 ## MooGL 0.2.0
 
 ### Added
+- OpenGL ES 3.1 contexts, in a build made with `make OGL_ES=1`; a plain build leaves them out,
+  and the SDK has them. GLFW's `GLFW_OPENGL_ES_API` and SDL's `SDL_GL_CONTEXT_PROFILE_ES` make
+  one (any request from ES 2.0 to 3.1 gets 3.1), and so does `createGLMContextProfile` with
+  `MGL_CONTEXT_ES_PROFILE_BIT`. SDL's `opengles2` renderer runs on one. An ES context has the
+  ES strings, extensions, enables, texture formats and errors, and takes GLSL ES 1.00, 3.00
+  and 3.10 shaders under the ES rules. KHR-GLES3 and KHR-GLES31 pass with no failures.
+  ES contexts also list `GL_EXT_buffer_storage`, `GL_OES_texture_storage_multisample_2d_array`
+  and `GL_KHR_texture_compression_astc_ldr`. GLSL ES 1.00 attributes may share a location.
+  The separate `libmoogles` build is gone.
 - SDL3, SFML 3, SFML 2.6 and raylib on MooGL, in the SDK with their own CMake packages and
   an example each. SDL3 and SFML make MooGL contexts in place of Apple's; raylib is stock,
   built on MooGL's GLFW. SDL3's `opengl` renderer works, and so does SFML's graphics module.
@@ -75,6 +84,180 @@
     each draw.
 
 ### Fixed
+- Drawing into a `GL_RGB9_E5` renderbuffer no longer aborts in Metal's pipeline check.
+- `glGen*` no longer hands out a name an app already brought to life by binding it, and a
+  name deleted twice is not handed out twice.
+- `glGenerateMipmap` works on luminance and alpha textures in ES contexts.
+- 3-row matrices (`mat3`, `mat2x3`, `mat4x3`) in a struct uniform that also holds a sampler
+  get the right values.
+- An integer attribute with an offset or stride that is not a multiple of 4, such as one
+  `GLshort`, reaches the shader; nothing drew.
+- GLSL ES 1.00 shaders that bind every attribute location twice now link.
+- Program pipelines: two stages from different programs that declare a uniform with the same
+  name each keep their own value; both saw one of them. In ES and compatibility contexts flat
+  values come from the last vertex with a pipeline too. In ES contexts a pipeline whose stages
+  disagree on a varying's flat qualifier, location or struct type fails validation, and drawing
+  with any mismatched pipeline is `GL_INVALID_OPERATION`.
+- Samplers inside struct uniforms are listed by `glGetProgramResourceIndex` and the other
+  program interface queries. In ES contexts a separable program's varyings between stages
+  report location -1 unless `layout(location)` placed them.
+- Bools inside struct uniforms reach the shader; a struct's bool and bvec members read false.
+  A struct member named like a bool member of another struct keeps its own type, so
+  `glUniform2uiv` on it no longer fails.
+- An array of structs in a storage or uniform block keeps the block's stride when a `vec3`
+  member is packed tight in Metal, as in `struct { ivec3 v; int a; int b; }`; every element
+  past the first was read from the wrong place. The fix is in MGL's SPIRV-Cross.
+- `glDebugMessageControl` filters messages by source, type, severity and id, applied in order,
+  and each debug group's own settings end when it is popped. Low severity messages start out
+  off, as GL_KHR_debug says. Before, the call turned every message on or off at once.
+- A sampler array inside an array of structs, such as `sampler2D b[2]` in `uniform S u[2]`,
+  compiles in shaders older than GLSL 4.30 and ES 3.10; MGL keeps it as one flat array.
+- Error checks dEQP's negative tests look for: `glVertexAttribPointer` sizes and packed types,
+  `glTexImage*` size and level limits and unequal cube faces, a pixel unpack buffer offset
+  that is not a whole number of the pixel type, `glTexStorage*` on texture 0, a level past the
+  target's limit in the sub-image and copy calls, location queries on a deleted program,
+  `glShaderSource` on a program name, and `glDispatchComputeIndirect` offsets. An empty
+  compressed image is no longer an error.
+- In ES contexts, a draw with no program checks its arguments and the framebuffer, then draws
+  nothing; an indexed draw while transform feedback records, a negative instance count and an
+  end before the start are errors; `glGenerateMipmap` needs a color-renderable, filterable
+  format; and copies into part of a texture follow the copy format rules.
+- An array of arrays in a buffer block whose outer size is 1, such as `bool b[1][8]` under
+  std140, keeps its element stride; its elements were read 4 bytes apart. The fix is in MGL's
+  SPIRV-Cross. The inner array of `a[1][1]` reports a size of 1, not 0.
+- A `layout(...)` list that names `shared` or `packed` more than eight times compiles.
+- The viewport's size is clamped to `GL_MAX_VIEWPORT_DIMS`; a larger one drew nothing.
+- A framebuffer with no attachments and a default sample count Metal lacks, such as 3, rounds
+  it up and draws; it drew nothing.
+- A program that uses more uniform or storage blocks than a stage or the whole program allows,
+  or a compute shader whose work group or shared variables are over the limits, fails to link.
+- In ES contexts, a block declared in two stages must have the same layout and the same sized
+  and unsized arrays in both, or the program does not link.
+- `glBindVertexBuffer` takes a buffer name from `glGenBuffers` that was never bound, and
+  deleting such a name frees it.
+- The stencil reference is clamped to 0..255 as GL says; -1 and 256 wrapped around instead.
+- A vertex attribute at an offset or stride that is not a multiple of 4, such as bytes at
+  offset 17, is read correctly; Metal cannot read it in place, so MGL converts a copy.
+- A texture deleted while attached to a framebuffer that is not bound stays attached and keeps
+  its image until it is detached; the framebuffer became incomplete.
+- `glBlitFramebuffer` honours the scissor test when it scales, and a scaled nearest blit picks
+  the source texel GL's formula names; some pixels whose centres fell on a texel edge took
+  the texel before it.
+- Float depth uploads are clamped to [0, 1].
+- Transform feedback records a triangle's or line's vertices in the order given when the
+  fragment shader has flat inputs; the reordering that gives flat values from the last vertex
+  is undone for the recording.
+- A program whose vertex inputs need more locations than `GL_MAX_VERTEX_ATTRIBS` fails to link.
+- Mip levels may be given in any order: levels set before the base image, or before a level
+  that shows the first guess at the texture's shape was wrong, keep their contents.
+- In ES contexts cube maps are always seamless, so their wrap modes no longer change what
+  the face edges sample.
+- A struct uniform larger than 256 bytes that was never set reads as zero throughout; its
+  zero buffer was only 256 bytes long.
+- `GL_FRAMEBUFFER_ATTACHMENT_COLOR_ENCODING` is `GL_LINEAR` for an attachment with no storage
+  yet. In ES contexts a new renderbuffer reports `GL_RGBA4`, a blit from an image onto the
+  same image is `GL_INVALID_OPERATION`, and `GL_EXT_conservative_depth` is listed.
+- `glGetTexLevelParameter` on a cube map face reads that face, not the first.
+- `glGetObjectLabel` with a `bufSize` of 0 gives the label's length; only a negative size is an
+  error. `glGetInternalformativ` writes only the values it has, leaving the rest of the buffer.
+- In ES contexts, `glGet` of a desktop-only capability such as `GL_FRAMEBUFFER_SRGB` is
+  `GL_INVALID_ENUM`.
+- `glBlendColor` takes effect; the constant blend factors used black.
+- Program introspection follows GL for blocks: a uniform-block array of arrays is listed one
+  uniform per outer element, every level of an array of structures in a block is listed, each
+  element of a block array lists the block's variables, an unused `shared` or `std140` block
+  is still active, and `GL_TOP_LEVEL_ARRAY_SIZE` and `_STRIDE` count only an array of
+  structures or arrays, with 0 for an unsized one.
+- `glGetTexLevelParameter` on a level with no image returns GL's defaults; only a level past
+  the largest a texture could have is `GL_INVALID_VALUE`.
+- `GL_DEBUG_LOGGED_MESSAGES`, `GL_DEBUG_NEXT_LOGGED_MESSAGE_LENGTH` and the debug group depth
+  can be read, and the `KHR`-suffixed `GL_KHR_debug` calls an ES program looks for exist.
+- Alpha and luminance textures in ES contexts hold their texels; they read as 0. RGB
+  framebuffers read back and blit with alpha 1, and a depth-only or stencil-only blit of a
+  packed depth-stencil image leaves the other part alone.
+- `glGetShaderPrecisionFormat` gives the range and precision of 32-bit integers for the int
+  types, and the elements of a sampler array with no `binding` all start at unit 0.
+- `glGet*` reads every capability, such as `GL_BLEND`, every hint, and the buffer, vertex
+  array, renderbuffer and sampler bindings, which read 0. `glGetInteger64v` returns every
+  value of a query with several, colours and depths read as integers span the integer range,
+  and values round rather than truncate. `GL_GENERATE_MIPMAP_HINT` exists in compatibility
+  and ES contexts.
+- Bool uniform arrays, and bools in struct uniforms, keep every element; past the first they
+  read back 0. Array uniforms are reported with `[0]` on the end, a uniform two stages use is
+  listed once, and a struct of nothing but samplers no longer leaves a stray member behind.
+- A 3D texture deeper than it is wide or tall has all its mip levels.
+- `glClearDepth` clamps to [0, 1], and a stencil clear value keeps only the stencil bits.
+- A new shader reports `GL_COMPILE_STATUS` false until it compiles, and
+  `GL_SHADER_SOURCE_LENGTH` counts the closing null.
+- Texture parameters set or read across float and integer round to the nearest value.
+- `glBlitFramebuffer` leaves alone the destination pixels whose source is outside the read
+  framebuffer.
+- Shader functions named like Metal's own, such as `plus` or `minus`, compile.
+- Scissored clears and draws with a scissor box partly or wholly off the left or bottom of the
+  target touch only the box. They covered the whole target.
+- `glBlitFramebuffer` mirrors when a rectangle runs backwards, filters with `GL_LINEAR`, and
+  clips a destination off the target. It also gives `GL_INVALID_OPERATION` for integer and
+  other colour together, a `GL_LINEAR` blit of integers, depth or stencil formats that differ,
+  and a multisampled side with rectangles of different sizes.
+- `GL_SAMPLE_COVERAGE` and `glSampleCoverage` work; they had no effect.
+- RGB formats read and blend with alpha 1. MooGL keeps them in RGBA, and clears wrote the
+  clear colour's alpha there.
+- `gl_FrontFacing` follows `glFrontFace` with culling off, and `glCullFace(GL_FRONT_AND_BACK)`
+  draws no polygons. Culling stayed on when it was turned off part way through a pass.
+- `gl_DepthRange` works. glslang leaves it out when making SPIR-V for GL.
+- `glProvokingVertex` is kept, and `GL_PROVOKING_VERTEX` starts as `GL_LAST_VERTEX_CONVENTION`.
+  In compatibility and ES contexts, flat inputs take the last vertex of each primitive.
+- A restart index in a point list draws nothing, and a 32-bit restart index with client arrays
+  no longer crashes.
+- `glClear` and `glClearBuffer*` do nothing while `GL_RASTERIZER_DISCARD` is on.
+- `GL_ACTIVE_ATTRIBUTES` and `GL_ACTIVE_ATTRIBUTE_MAX_LENGTH` count vertex inputs only.
+- `glVertexAttribIPointer` takes client memory in compatibility and ES contexts, and
+  `GL_FIXED` attributes can be tightly packed.
+- A shader or program name used where the other kind goes gives `GL_INVALID_OPERATION`, and a
+  name that is neither gives `GL_INVALID_VALUE`, across the program and shader calls.
+  `glDetachShader` of a shader that is not attached is `GL_INVALID_OPERATION`, and an unknown
+  `glGetProgramiv` pname is `GL_INVALID_ENUM`.
+- `glBindVertexArray`, `glBindTransformFeedback` and `glBeginQuery` take only generated names,
+  and a query name only becomes a query when first used. `glIsTransformFeedback(0)` is false.
+- A texture keeps the target it was first bound to; binding it to another is
+  `GL_INVALID_OPERATION`.
+- A deleted buffer stays readable in vertex arrays other than the bound one. It was freed
+  under them.
+- Deleting the bound framebuffer binds the window's, and `glBindFramebuffer` checks its target.
+- `glReadPixels` from a multisampled framebuffer is `GL_INVALID_OPERATION`.
+- `glBufferSubData` checks its range even with no data, and `glDeleteFramebuffers`,
+  `glGenTransformFeedbacks` and `glDeleteTransformFeedbacks` refuse a negative count.
+- Compressed images past the size limits and compressed updates past the last possible level
+  are `GL_INVALID_VALUE`. `glCopyTexImage2D` into a cube face needs a square image; a
+  rectangle crashed.
+- A texture's last possible level can be attached to a framebuffer.
+- Samplers in a struct uniform are listed and found under their GL names, such as `s.tex`.
+- A shader with a parameter named `atomic_uint` is refused again.
+- Defining a new mip level or cube face no longer loses what the GPU drew or copied into the
+  texture's other levels, and a cube face given in another format leaves the other faces alone.
+- `glCopyTexImage2D` into an alpha, luminance-alpha, RGB or integer format puts each channel
+  where it belongs, and copies from a slice of a 3D texture convert too.
+- Attaching a level a texture does not have makes the framebuffer incomplete rather than an
+  error; only a level no texture could have, or past an immutable texture's levels, is
+  `GL_INVALID_VALUE`.
+- Transform feedback records a whole array named without an index, such as `"attrib"` for
+  `out vec4 attrib[4]`. Before, the program failed to link.
+- A function that takes atomic counters counts on the counters it is given. Before, the
+  shader failed to build.
+- `GL_ACTIVE_UNIFORM_MAX_LENGTH` covers samplers, images and block members. It was 0 for a
+  program whose only uniforms are samplers.
+- Multisample textures keep `fixedsamplelocations`: `glGetTexLevelParameter` reports it, and a
+  framebuffer mixing fixed and varying sample locations is `GL_FRAMEBUFFER_INCOMPLETE_MULTISAMPLE`.
+- `glGetBooleanv(GL_SAMPLE_MASK)` and `glGetIntegeri_v(GL_SAMPLE_MASK_VALUE)` work.
+  `glGetMultisamplefv` gives `GL_INVALID_VALUE` for an index at or past `GL_SAMPLES`, and
+  `glTexStorage2DMultisample` refuses the array target.
+- `glFramebufferTextureLayer` takes only textures with layers or faces, and
+  `glFramebufferParameteri` refuses sizes past the `GL_MAX_FRAMEBUFFER_*` limits.
+- `glBlitFramebuffer` copies depth and stencil to and from the window's framebuffer, and a
+  `GL_LINEAR` blit of depth or stencil is `GL_INVALID_OPERATION`.
+- In compatibility contexts, `glGetTexImage` reads luminance and alpha formats back.
+- A clean build generated entry points that read the current context as a plain global and
+  crashed on the first GL call; they read the thread's context again.
 - `glCopyTexSubImage*` into a texture of another format, such as from the window into an
   RGBA texture, converts the colour. It copied the bytes, so red and blue came out swapped.
 - In compatibility contexts, a unit with texturing on and no complete texture now leaves the

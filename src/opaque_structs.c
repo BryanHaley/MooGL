@@ -230,9 +230,50 @@ static void markOpaque(Struct *st, int n)
     }
 }
 
+// Appends one part of a flattened name so it can be read back: "_" becomes
+// "_1", a "." before the part "_0", and each array level after it "_2"
+static void appendPart(char *path, size_t size, const char *name, size_t len, bool dot, int arrays)
+{
+    size_t at = strlen(path);
+
+    if (dot && at + 2 < size)
+    {
+        path[at++] = '_';
+        path[at++] = '0';
+    }
+
+    for (size_t i = 0; i < len && at + 2 < size; i++)
+    {
+        path[at++] = name[i];
+
+        if (name[i] == '_')
+            path[at++] = '1';
+    }
+
+    for (int i = 0; i < arrays && at + 2 < size; i++)
+    {
+        path[at++] = '_';
+        path[at++] = '2';
+    }
+
+    path[at] = 0;
+}
+
 // the sampler uniforms a struct uniform turns into, declared after it
+// Without arrays of arrays (before GLSL 4.30 and ES 3.10), a sampler that
+// would need one is one flat array whose name ends in its sizes, "_32x2".
+static void appendSizes(char *path, size_t size, const int *dims, int count)
+{
+    size_t at = strlen(path);
+
+    at += (size_t)snprintf(path + at, size - at, "_3");
+
+    for (int i = 0; i < count && at + 12 < size; i++)
+        at += (size_t)snprintf(path + at, size - at, i ? "x%d" : "%d", dims[i]);
+}
+
 static bool declareLeaves(Buf *out, Struct *st, int ns, Struct *s, const char *path,
-                          const int *dims, int dim_count)
+                          const int *dims, int dim_count, bool aoa)
 {
     for (int k = 0; k < s->count; k++)
     {
@@ -247,14 +288,28 @@ static bool declareLeaves(Buf *out, Struct *st, int ns, Struct *s, const char *p
         for (int j = 0; j < m->dim_count && dc < MAX_DIMS * 4; j++)
             d[dc++] = m->dims[j];
 
-        snprintf(sub, sizeof(sub), "%s_%s", path, m->name);
+        snprintf(sub, sizeof(sub), "%s", path);
+        appendPart(sub, sizeof(sub), m->name, strlen(m->name), true, opaqueType(m->type) ? 0 : m->dim_count);
 
         if (opaqueType(m->type))
         {
             char line[512];
-            int at = snprintf(line, sizeof(line), "uniform %s%s %s", m->quals, m->type, sub);
+            int at;
 
-            for (int j = 0; j < dc && at < (int)sizeof(line) - 16; j++)
+            if (!aoa && dc > 1)
+            {
+                int total = 1;
+
+                for (int j = 0; j < dc; j++)
+                    total *= d[j];
+
+                appendSizes(sub, sizeof(sub), d, dc);
+                at = snprintf(line, sizeof(line), "uniform %s%s %s[%d]", m->quals, m->type, sub, total);
+            }
+            else
+                at = snprintf(line, sizeof(line), "uniform %s%s %s", m->quals, m->type, sub);
+
+            for (int j = 0; (aoa || dc < 2) && j < dc && at < (int)sizeof(line) - 16; j++)
                 at += snprintf(line + at, sizeof(line) - (size_t)at, "[%d]", d[j]);
 
             snprintf(line + at, sizeof(line) - (size_t)at, ";\n");
@@ -264,12 +319,26 @@ static bool declareLeaves(Buf *out, Struct *st, int ns, Struct *s, const char *p
         }
         else if (inner && inner->opaque)
         {
-            if (!declareLeaves(out, st, ns, inner, sub, d, dc))
+            if (!declareLeaves(out, st, ns, inner, sub, d, dc, aoa))
                 return false;
         }
     }
 
     return true;
+}
+
+// whether a struct holds anything besides samplers and images
+static bool holdsData(Struct *st, int ns, Struct *s)
+{
+    for (int k = 0; k < s->count; k++)
+    {
+        Struct *inner = findStruct(st, ns, s->m[k].type);
+
+        if (!opaqueType(s->m[k].type) && (inner == NULL || holdsData(st, ns, inner)))
+            return true;
+    }
+
+    return false;
 }
 
 // the copy of a struct without its samplers, and of the structs it holds
@@ -306,8 +375,8 @@ static bool declareCopy(Buf *out, Struct *s, Struct *st, int ns)
         kept++;
     }
 
-    // GLSL has no empty struct
-    if (kept == 0 && !adds(out, "    float mglUnused;\n"))
+    // GLSL has no empty struct; an int has a default precision in every ES stage
+    if (kept == 0 && !adds(out, "    int mglUnused;\n"))
         return false;
 
     return adds(out, "};\n");
@@ -316,39 +385,60 @@ static bool declareCopy(Buf *out, Struct *s, Struct *st, int ns)
 typedef struct {
     char name[64];
     Struct *type;
+    int dims[MAX_DIMS];
+    int dim_count;
 } Uniform;
+
+#define MAX_INDICES 16
 
 // An access chain from a struct uniform: "s[1].b.a" or "s.c". When it reaches
 // a sampler, write the flattened name with the indices it collected and
 // return how far it went; otherwise 0, and it is left as it was.
-static size_t rewriteChain(const char *p, Uniform *u, Struct *st, int ns, Buf *out)
+// Reads one "[...]" at q, keeping where it is and the size of that level.
+static const char *readIndex(const char *q, const char **at, size_t *len)
+{
+    int depth = 0;
+
+    *at = q;
+
+    do
+    {
+        if (*q == '[') depth++;
+        else if (*q == ']') depth--;
+        q++;
+    } while (*q && depth > 0);
+
+    *len = (size_t)(q - *at);
+    return q;
+}
+
+static size_t rewriteChain(const char *p, Uniform *u, Struct *st, int ns, Buf *out, bool aoa)
 {
     char path[256];
-    char idx[512] = "";
+    const char *idx[MAX_INDICES];
+    size_t idx_len[MAX_INDICES];
+    int dims[MAX_INDICES];
+    int n = 0;
     const char *q = p + strlen(u->name);
     Struct *cur = u->type;
+    const int *level = u->dims;
+    int levels = u->dim_count;
 
-    snprintf(path, sizeof(path), "mglS_%s", u->name);
+    snprintf(path, sizeof(path), "mglS_");
+    appendPart(path, sizeof(path), u->name, strlen(u->name), false, 0);
 
     for (;;)
     {
-        // indices on what came before
-        while (*q == '[')
+        // indices on what came before, each an array level of the name
+        for (int j = 0; *q == '['; j++)
         {
-            int depth = 0;
-            const char *s = q;
-
-            do
-            {
-                if (*q == '[') depth++;
-                else if (*q == ']') depth--;
-                q++;
-            } while (*q && depth > 0);
-
-            if (strlen(idx) + (size_t)(q - s) + 1 >= sizeof(idx))
+            if (n >= MAX_INDICES || j >= levels)
                 return 0;
 
-            strncat(idx, s, (size_t)(q - s));
+            dims[n] = level[j];
+            q = readIndex(q, &idx[n], &idx_len[n]);
+            n++;
+            appendPart(path, sizeof(path), "", 0, false, 1);
         }
 
         if (*q != '.' || cur == NULL)
@@ -368,32 +458,54 @@ static size_t rewriteChain(const char *p, Uniform *u, Struct *st, int ns, Buf *o
         if (mem == NULL)
             return 0;
 
-        strncat(path, "_", sizeof(path) - strlen(path) - 1);
-        strncat(path, mem->name, sizeof(path) - strlen(path) - 1);
+        appendPart(path, sizeof(path), mem->name, strlen(mem->name), true, 0);
         q = m1;
+        level = mem->dims;
+        levels = mem->dim_count;
 
         if (opaqueType(mem->type))
         {
             // the sampler's own index, if any, comes last
-            while (*q == '[')
+            for (int j = 0; *q == '['; j++)
             {
-                int depth = 0;
-                const char *s = q;
-
-                do
-                {
-                    if (*q == '[') depth++;
-                    else if (*q == ']') depth--;
-                    q++;
-                } while (*q && depth > 0);
-
-                if (strlen(idx) + (size_t)(q - s) + 1 >= sizeof(idx))
+                if (n >= MAX_INDICES || j >= levels)
                     return 0;
 
-                strncat(idx, s, (size_t)(q - s));
+                dims[n] = level[j];
+                q = readIndex(q, &idx[n], &idx_len[n]);
+                n++;
             }
 
-            if (!adds(out, path) || !adds(out, idx))
+            if (aoa || n < 2)
+            {
+                if (!adds(out, path))
+                    return 0;
+
+                for (int k = 0; k < n; k++)
+                    if (!add(out, idx[k], idx_len[k]))
+                        return 0;
+
+                return (size_t)(q - p);
+            }
+
+            // one flat index: (((i0) * d1 + (i1)) * d2 + (i2)) ...
+            char flat[512];
+            int at = snprintf(flat, sizeof(flat), "(%.*s)", (int)idx_len[0] - 2, idx[0] + 1);
+
+            for (int k = 1; k < n && at < (int)sizeof(flat); k++)
+            {
+                char prev[512];
+
+                snprintf(prev, sizeof(prev), "%s", flat);
+                at = snprintf(flat, sizeof(flat), "(%s*%d+(%.*s))", prev, dims[k], (int)idx_len[k] - 2, idx[k] + 1);
+            }
+
+            if (at >= (int)sizeof(flat))
+                return 0;
+
+            appendSizes(path, sizeof(path), dims, n);
+
+            if (!adds(out, path) || !adds(out, "[") || !adds(out, flat) || !adds(out, "]"))
                 return 0;
 
             return (size_t)(q - p);
@@ -406,6 +518,24 @@ static size_t rewriteChain(const char *p, Uniform *u, Struct *st, int ns, Buf *o
     }
 }
 
+// GLSL 4.30 and ES 3.10 have arrays of arrays
+static bool allowsArraysOfArrays(const char *src)
+{
+    const char *v = strstr(src, "#version");
+    int number;
+
+    if (v == NULL)
+        return false;
+
+    v += 8;
+    number = atoi(v);
+
+    while (*v == ' ' || *v == '\t' || isdigit((unsigned char)*v))
+        v++;
+
+    return !strncmp(v, "es", 2) && !ident(v[2]) ? number >= 310 : number >= 430;
+}
+
 char *mglFlattenOpaqueStructs(const char *src)
 {
     Struct *st = calloc(MAX_STRUCTS, sizeof(Struct));
@@ -413,6 +543,7 @@ char *mglFlattenOpaqueStructs(const char *src)
     int ns = 0, nu = 0;
     Buf out = { 0 };
     char *result = NULL;
+    bool aoa = allowsArraysOfArrays(src);
 
     if (st == NULL || strstr(src, "struct") == NULL || strstr(src, "uniform") == NULL)
     {
@@ -492,8 +623,13 @@ char *mglFlattenOpaqueStructs(const char *src)
 
         if (s && s->opaque && v1 > v0)
         {
+            int dims[MAX_DIMS * 4], dc = 0;
+
             snprintf(uni[nu].name, sizeof(uni[nu].name), "%.*s", (int)(v1 - v0), v0);
             uni[nu].type = s;
+            readDims(v1, dims, &dc);
+            uni[nu].dim_count = dc < MAX_DIMS ? dc : MAX_DIMS;
+            memcpy(uni[nu].dims, dims, sizeof(int) * (size_t)uni[nu].dim_count);
             nu++;
         }
     }
@@ -570,14 +706,18 @@ char *mglFlattenOpaqueStructs(const char *src)
                     v1++;
 
                 int dims[MAX_DIMS * 4], dc = 0;
-                char path[128];
+                char path[256] = "mglS_";
 
                 readDims(v1, dims, &dc);
-                snprintf(path, sizeof(path), "mglS_%.*s", (int)(v1 - v0), v0);
+                appendPart(path, sizeof(path), v0, (size_t)(v1 - v0), false, dc);
 
-                if (!adds(&out, "uniform ") || !adds(&out, tn) || !adds(&out, "_mglNoOpaque") ||
-                    !add(&out, q, (size_t)(semi + 1 - q)) || !adds(&out, "\n") ||
-                    !declareLeaves(&out, st, ns, s, path, dims, dc))
+                // a struct of nothing but samplers leaves no uniform behind
+                if (holdsData(st, ns, s) &&
+                    (!adds(&out, "uniform ") || !adds(&out, tn) || !adds(&out, "_mglNoOpaque") ||
+                     !add(&out, q, (size_t)(semi + 1 - q)) || !adds(&out, "\n")))
+                    goto done;
+
+                if (!declareLeaves(&out, st, ns, s, path, dims, dc, aoa))
                     goto done;
 
                 p = semi + 1;
@@ -597,7 +737,7 @@ char *mglFlattenOpaqueStructs(const char *src)
                 if (strncmp(p, uni[i].name, n) || ident(p[n]))
                     continue;
 
-                size_t used = rewriteChain(p, &uni[i], st, ns, &out);
+                size_t used = rewriteChain(p, &uni[i], st, ns, &out, aoa);
 
                 if (used)
                 {
@@ -638,20 +778,28 @@ done:
     return result;
 }
 
-// "s[1].b.a" names what the rewrite above calls "mglS_s_b_a[1]"
+// "s[1].b.a" names what the rewrite above calls "mglS_s_2_0b_0a[1]"
 bool mglOpaqueStructUniformName(const char *gl_name, char *out, size_t size)
 {
     char idx[128] = "";
-    size_t at;
+    const char *p = gl_name;
 
-    if (strchr(gl_name, '.') == NULL)
+    if (strchr(gl_name, '.') == NULL || size < 8)
         return false;
 
-    at = (size_t)snprintf(out, size, "mglS_");
+    snprintf(out, size, "mglS_");
 
-    for (const char *p = gl_name; *p && at < size - 1; p++)
+    while (*p)
     {
-        if (*p == '[')
+        const char *n0 = p;
+        int arrays = 0;
+
+        while (*p && *p != '.' && *p != '[')
+            p++;
+
+        size_t len = (size_t)(p - n0);
+
+        while (*p == '[')
         {
             const char *e = strchr(p, ']');
 
@@ -661,15 +809,118 @@ bool mglOpaqueStructUniformName(const char *gl_name, char *out, size_t size)
             if ((size_t)(e + 1 - p) < sizeof(idx) - strlen(idx))
                 strncat(idx, p, (size_t)(e + 1 - p));
 
-            p = e;
-            continue;
+            arrays++;
+            p = e + 1;
         }
 
-        out[at++] = *p == '.' ? '_' : *p;
+        // the last part is the sampler, whose own index is not a level of the name
+        appendPart(out, size, n0, len, n0 != gl_name, *p == '.' ? arrays : 0);
+
+        if (*p == '.')
+            p++;
+        else if (*p)
+            return false;
     }
 
-    out[at] = 0;
     strncat(out, idx, size - strlen(out) - 1);
 
     return true;
+}
+
+// The GL name of one element of a struct array's sampler: "s[1].b.a" from
+// "mglS_s_2_0b_0a" and the index 1. Returns how many array levels the name has
+// before the sampler, or -1 when it is not such a name.
+int mglOpaqueStructGLNameAt(const char *flat, const int *idx, char *out, size_t size)
+{
+    size_t at = 0;
+    int levels = 0;
+
+    if (strncmp(flat, "mglS_", 5))
+        return -1;
+
+    for (const char *p = flat + 5; *p && at + 12 < size; p++)
+    {
+        if (*p != '_')
+        {
+            out[at++] = *p;
+            continue;
+        }
+
+        p++;
+
+        if (*p == '1')
+            out[at++] = '_';
+        else if (*p == '0')
+            out[at++] = '.';
+        else if (*p == '2')
+        {
+            at += (size_t)snprintf(out + at, size - at, "[%d]", idx ? idx[levels] : 0);
+            levels++;
+        }
+        else
+            return -1;
+    }
+
+    out[at] = 0;
+
+    return levels;
+}
+
+// The GL name of a sampler a struct uniform held, "s.b.a" from "mglS_s_0b_0a",
+// when no part of the path is an array; false otherwise
+bool mglOpaqueStructGLName(const char *flat, char *out, size_t size)
+{
+    size_t at = 0;
+
+    if (strncmp(flat, "mglS_", 5))
+        return false;
+
+    for (const char *p = flat + 5; *p && at + 1 < size; p++)
+    {
+        if (*p != '_')
+        {
+            out[at++] = *p;
+            continue;
+        }
+
+        p++;
+
+        if (*p == '1')
+            out[at++] = '_';
+        else if (*p == '0')
+            out[at++] = '.';
+        else
+            return false;
+    }
+
+    out[at] = 0;
+
+    return true;
+}
+
+// The sizes a flat sampler array's name ends in, "_32x2", taken off the name.
+// Returns how many there are, 0 when the name has none.
+int mglOpaqueStructTakeSizes(char *flat, int *dims, int max)
+{
+    char *m = strncmp(flat, "mglS_", 5) ? NULL : strstr(flat, "_3");
+    int n = 0;
+
+    if (m == NULL)
+        return 0;
+
+    for (const char *p = m + 2; *p && n < max; n++)
+    {
+        dims[n] = atoi(p);
+
+        while (isdigit((unsigned char)*p))
+            p++;
+
+        if (*p == 'x')
+            p++;
+        else if (*p)
+            return 0;
+    }
+
+    *m = 0;
+    return n;
 }

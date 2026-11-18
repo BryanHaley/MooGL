@@ -324,6 +324,7 @@ typedef struct BufferData_t {
         GLenum      type;
         GLint       size;
         GLboolean   normalized;
+        GLboolean   integer;
         size_t      offset;
         size_t      stride;
     } converted[4];
@@ -426,6 +427,11 @@ typedef struct TextureLevel_t {
     GLuint mtl_format;
     size_t  data_size;
     vm_address_t data;
+    // the CPU copy holds something the Metal texture does not have yet
+    GLboolean cpu_newer;
+    // the internal format the level was given; a cube face can differ from
+    // the rest, 0 when it is the texture's own
+    GLenum given_format;
 } TextureLevel;
 
 #define MGL_PROXY_LEVELS 16
@@ -507,6 +513,11 @@ typedef struct Texture_t {
     void    *mtl_image_views_base;
     GLuint  mtl_sample_key;
     GLsizei samples;
+    // glTex*Multisample's fixedsamplelocations was false
+    GLboolean variable_sample_locations;
+    // an ES texture given as plain GL_DEPTH_COMPONENT or GL_DEPTH_STENCIL,
+    // which can be sampled but not rendered to
+    GLboolean es_unsized_depth;
     // a buffer texture is a view of one MTLBuffer; which one, so a buffer given
     // new storage gets a new view instead of reading the freed one
     void    *mtl_buffer_src;
@@ -754,6 +765,7 @@ typedef struct CullInfo_t {
 } CullInfo;
 
 void  mglReadColorFormatAndType(GLMContext ctx, GLenum *format, GLenum *type);
+GLenum mglReadColorInternalFormat(GLMContext ctx);
 bool  mglDrawFramebufferComplete(GLMContext ctx);
 bool  mglConditionalRenderSkips(GLMContext ctx);
 void  mglAddStatistic(GLMContext ctx, GLenum target, GLuint64 n);
@@ -896,7 +908,14 @@ typedef struct SubroutineInfo_t {
 char *mglRewriteSubroutines(const char *src, SubroutineInfo *info, int stage);
 // opaque_structs.c: samplers held in uniform structs become uniforms of their own
 char *mglFlattenOpaqueStructs(const char *src);
+
+// GL_INVALID_OPERATION when the name is the other kind of object, else GL_INVALID_VALUE
+GLenum mglProgramNameError(GLMContext ctx, GLuint name);
+GLenum mglShaderNameError(GLMContext ctx, GLuint name);
 bool mglOpaqueStructUniformName(const char *gl_name, char *out, size_t size);
+bool mglOpaqueStructGLName(const char *flat, char *out, size_t size);
+int mglOpaqueStructGLNameAt(const char *flat, const int *idx, char *out, size_t size);
+int mglOpaqueStructTakeSizes(char *flat, int *dims, int max);
 void  mglForgetBufferTexture(GLuint texture);
 void  mglForgetObjectLabel(GLMContext ctx, GLenum identifier, GLuint name, const void *ptr);
 void  mglForgetContextLabels(GLMContext ctx);
@@ -1070,6 +1089,11 @@ typedef struct SpirvResource_t {
     GLboolean atomic;
     // an atomic counter uniform: the index of the buffer it lives in
     GLint   atomic_buffer;
+    // an ES varying's precision, 'h', 'm' or 'l', 0 when not known
+    char    precision;
+    GLboolean flat;             // a stage input or output declared flat
+    GLboolean is_array;         // an array uniform, which GL names "a[0]"
+    GLboolean has_binding;      // a sampler or image with a layout(binding)
 } SpirvResource;
 
 static inline GLint mglResourceUnit(const SpirvResource *res, GLint element)
@@ -1165,6 +1189,14 @@ typedef struct Program_t {
     GLint indexed_draw_loc;     // mglIndexedDraw, -1 when gl_BaseVertex is unused
     GLint nv_first_loc[2];      // GL_NV_mesh_shader's first group: task, mesh
     GLint sample_mask_off_loc;
+    GLint depth_range_loc;
+    // the samplers and images as GL lists them: once each, and one per
+    // element of an array of structs
+    struct SpirvResource_t *opaque_views;
+    GLuint opaque_view_count;
+    // GLSL ES 1.00 may bind two inputs to one attribute; the second reads a
+    // spare Metal attribute, and this is the GL one plus 1 for each spare
+    GLubyte attrib_alias[31];
 #ifdef MGL_COMPAT_PROFILE
     GLint alpha_func_loc;
     GLint alpha_ref_loc;
@@ -1326,11 +1358,24 @@ typedef struct DebugMessage_t {
     char text[MAX_DEBUG_MSG_LEN];
 } DebugMessage;
 
+// one glDebugMessageControl setting; GL_DONT_CARE matches anything
+typedef struct DebugRule_t {
+    GLenum source, type, severity;
+    GLuint id;
+    GLboolean by_id;
+    GLboolean enabled;
+} DebugRule;
+
+#define MAX_DEBUG_RULES 1024
+
 typedef struct DebugState_t {
     DebugMessage messages[MAX_DEBUG_MESSAGES];
     GLuint head;              // where the next message goes
     GLuint count;             // how many are queued
-    GLboolean messages_enabled;
+    // applied in order; a group's own settings come after its parent's
+    DebugRule rules[MAX_DEBUG_RULES];
+    GLuint rule_count;
+    GLuint group_rules[MAX_DEBUG_GROUPS];   // rule_count when each group was pushed
     DebugMessage groups[MAX_DEBUG_GROUPS];
     GLuint group_depth;
 } DebugState;
@@ -1468,6 +1513,8 @@ size_t mglPixelStoreSkipBytes2D(const PixelStore *ps, GLuint pixel_size, size_t 
 #define MGL_SAMPLE_MASK_FORCE "mglSampleMaskOff"
 // 1 while an element draw runs, 0 for an array draw; scales gl_BaseVertex
 #define MGL_INDEXED_DRAW_NAME "mglIndexedDraw"
+// gl_DepthRange's near, far and diff, which SPIR-V for GL leaves out
+#define MGL_DEPTH_RANGE_NAME "mglDepthRange"
 // same length as gl_SampleMask, so the rewrite swaps it in place
 #define MGL_SAMPLE_MASK_TMP   "mglSMaskValue"
 #define MGL_SAMPLE_MASK_BODY  "mglSampleMaskBody"
@@ -1493,7 +1540,7 @@ static inline bool mglIsDriverUniform(const char *name)
         return false;
 
     if (!strcmp(name, MGL_NUM_SAMPLES_NAME) || !strcmp(name, MGL_SAMPLE_MASK_FORCE) ||
-        !strcmp(name, MGL_INDEXED_DRAW_NAME) || !strncmp(name, "mglNv", 5))
+        !strcmp(name, MGL_INDEXED_DRAW_NAME) || !strcmp(name, MGL_DEPTH_RANGE_NAME) || !strncmp(name, "mglNv", 5))
         return true;
 
     // the alpha test and the geometry rewrite add their own, in any profile
@@ -1525,6 +1572,8 @@ static inline bool mglTargetIsMultisample(GLenum target)
 
 // Samples in the framebuffer GL is drawing to; 0 when it is single-sampled.
 GLsizei mglDrawFramebufferSamples(GLMContext ctx);
+GLsizei mglFramebufferSamples(Framebuffer *fbo);
+int mglCapState(GLMContext ctx, GLenum cap);
 
 TransformFeedback *getTransformFeedback(GLMContext ctx, GLuint name);
 
@@ -1535,6 +1584,9 @@ GLint mglFindUniformByName(Program *pptr, const char *name);
 bool mglUniformIsActive(Program *p, const char *name);
 GLint mglArrayOfArraysElement(const char *subs, const GLint *dims, GLint dim_count);
 void mglWriteNumSamples(GLMContext ctx, Program *pptr, GLint samples);
+void mglWriteDepthRange(GLMContext ctx, Program *pptr);
+void mglBuildOpaqueViews(Program *ptr);
+void mglFreeOpaqueViews(Program *ptr);
 void mglWriteIndexedDraw(GLMContext ctx, Program *pptr, GLint indexed);
 void mglWriteNvMeshFirst(GLMContext ctx, Program *pptr, GLuint first);
 char *mglRewriteNvMesh(const char *src, bool task);
@@ -1694,6 +1746,9 @@ typedef struct {
     GLMParams   var;
     // the draw about to run reads an element array
     GLboolean draw_indexed;
+    // the draw's indices were turned round so flat values come from GL's
+    // provoking vertex; feedback recording turns them back
+    GLboolean draw_rotated;
 } GLMState;
 
 static_assert(TEXTURE_UNITS == 128, "active_texture_mask relies on this");
@@ -1799,6 +1854,9 @@ struct GLMMetalFuncs {
 
     void (*mtlGenerateMipmaps)(GLMContext glm_ctx, Texture *tex);
     bool (*mtlUpdateTexRegion)(GLMContext glm_ctx, Texture *tex, GLuint face, GLuint level, size_t x, size_t y, size_t z, size_t w, size_t h, size_t d);
+    // remakes the Metal texture now, keeping what the GPU wrote into the levels
+    // the CPU copy has nothing newer for
+    bool (*mtlRefreshTexture)(GLMContext glm_ctx, Texture *tex);
     void (*mtlInvalidateAttachments)(GLMContext glm_ctx, Framebuffer *fbo, GLuint mask);
     bool (*mtlClearTexRegion)(GLMContext glm_ctx, Texture *tex, GLuint face, GLuint level, size_t x, size_t y, size_t z, size_t w, size_t h, size_t d, const void *texel);
     void (*mtlTexSubImage)(GLMContext glm_ctx, Texture *tex, Buffer *buf, size_t src_offset, size_t src_pitch, size_t src_image_size, size_t src_size, GLuint slice, GLuint level, size_t width, size_t height, size_t depth, size_t xoffset, size_t yoffset, size_t zoffset);
@@ -1856,8 +1914,9 @@ typedef struct GLMContextRec_t {
     struct MGLCompat_t *compat;
 #endif
 
-#ifdef MGL_GL_ES
-    struct GLM_ES_DispatchTable dispatch;
+#ifdef MGL_OGL_ES
+    // an OpenGL ES context's own state; NULL in a desktop one
+    struct MGLES_t *es;
 #endif
 
     struct GLMMetalFuncs mtl_funcs;
@@ -1954,6 +2013,8 @@ enum {
     MGL_STAT_ATTRIB_CONVERSIONS,    // vertex attributes converted to a format Metal reads
     MGL_STAT_FRAMES_PRESENTED       // swaps that showed a frame in the window
 };
+
+#define MGL_CONTEXT_ES_PROFILE_BIT 0x00000004
 
 #ifdef __cplusplus
 extern "C" {

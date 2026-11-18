@@ -122,3 +122,30 @@ GPU_TEST(vertex_binding_stride, a_zero_stride_binding_repeats_one_element)
     glDeleteBuffers(1, &tint_vbo);
     mgl_target_destroy(&t);
 }
+
+// glBindVertexBuffer takes a name glGenBuffers handed out, even one never bound
+GPU_TEST(vertex_binding_stride, a_generated_buffer_binds_before_its_first_bind)
+{
+    GLuint vao, buf;
+    GLint got = 0;
+
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    glGenBuffers(1, &buf);
+    mgl_drain_errors();
+
+    glBindVertexBuffer(1, buf, 0, 32);
+    CHECK_EQ_UINT(glGetError(), GL_NO_ERROR);
+    glGetIntegeri_v(GL_VERTEX_BINDING_STRIDE, 1, &got);
+    CHECK_EQ_INT(got, 32);
+    glGetIntegeri_v(GL_VERTEX_BINDING_BUFFER, 1, &got);
+    CHECK_EQ_INT(got, (GLint)buf);
+
+    // once deleted, the name is no buffer at all
+    glDeleteBuffers(1, &buf);
+    glBindVertexBuffer(1, buf, 0, 32);
+    CHECK_EQ_UINT(glGetError(), GL_INVALID_OPERATION);
+
+    glBindVertexArray(0);
+    glDeleteVertexArrays(1, &vao);
+}

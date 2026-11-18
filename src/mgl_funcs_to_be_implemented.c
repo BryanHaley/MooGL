@@ -157,6 +157,8 @@ void mglBindTransformFeedback(GLMContext ctx, GLenum target, GLuint id)
     // It is a real object that is always there, not the absence of one --
     // treating it as NULL made glBeginTransformFeedback fail before any
     // application had bound anything.
+    ERROR_CHECK_RETURN(id == 0 || findTransformFeedback(ctx, id), GL_INVALID_OPERATION);
+
     TransformFeedback *ptr = getTransformFeedback(ctx, id);
 
     if (ptr)
@@ -543,6 +545,8 @@ void mglCreateTransformFeedbacks(GLMContext ctx, GLsizei n, GLuint *ids)
 
 void mglDeleteTransformFeedbacks(GLMContext ctx, GLsizei n, const GLuint *ids)
 {
+    ERROR_CHECK_RETURN(n >= 0, GL_INVALID_VALUE);
+
     for (GLsizei i = 0; i < n; i++)
     {
         if (ids[i] == 0)
@@ -614,6 +618,8 @@ void mglEndTransformFeedback(GLMContext ctx)
 
 void mglGenTransformFeedbacks(GLMContext ctx, GLsizei n, GLuint *ids)
 {
+    ERROR_CHECK_RETURN(n >= 0, GL_INVALID_VALUE);
+
     for (GLsizei i = 0; i < n; i++)
     {
         ids[i] = getNewName(&STATE(transform_feedback_table));
@@ -662,9 +668,7 @@ void mglGetMultisamplefv(GLMContext ctx, GLenum pname, GLuint index, GLfloat *va
 
 	samples = mglDrawFramebufferSamples(ctx);
 
-	if (samples < 1)
-		samples = 1;
-
+	// GL 4.6 14.3.1: index has to be below GL_SAMPLES, which is 0 when not multisampled
 	ERROR_CHECK_RETURN((GLsizei)index < samples, GL_INVALID_VALUE);
 
 	switch (samples)
@@ -749,13 +753,15 @@ void mglGetShaderPrecisionFormat(GLMContext ctx, GLenum shadertype, GLenum preci
 			ERROR_RETURN(GL_INVALID_ENUM);
 	}
 
-	// Metal is full precision throughout, so every type reports the same
+	// Metal is full precision throughout: 32-bit floats and 32-bit ints
+	bool integer = precisiontype == GL_LOW_INT || precisiontype == GL_MEDIUM_INT || precisiontype == GL_HIGH_INT;
+
 	if (range) {
-		range[0] = 127;
-		range[1] = 127;
+		range[0] = integer ? 31 : 127;
+		range[1] = integer ? 30 : 127;
 	}
 	if (precision) {
-		*precision = 23;
+		*precision = integer ? 0 : 23;
 	}
 }
 
@@ -815,7 +821,7 @@ void mglGetnPixelMapusv(GLMContext ctx, GLenum map, GLsizei bufSize, GLushort *v
 GLboolean mglIsTransformFeedback(GLMContext ctx, GLuint id)
 {
 	TransformFeedback *ptr = findTransformFeedback(ctx, id);
-	return (ptr && ptr->created) ? GL_TRUE : GL_FALSE;
+	return (id && ptr && ptr->created) ? GL_TRUE : GL_FALSE;
 }
 
 
@@ -908,12 +914,12 @@ void mglPauseTransformFeedback(GLMContext ctx)
 
 void mglProvokingVertex(GLMContext ctx, GLenum mode)
 {
-	// Set provoking vertex mode - no-op
 	if (mode != GL_FIRST_VERTEX_CONVENTION && mode != GL_LAST_VERTEX_CONVENTION) {
 		STATE(error) = GL_INVALID_ENUM;
 		return;
 	}
-	// State not tracked
+
+	STATE_VAR(provoking_vertex) = mode;
 }
 
 
@@ -1071,18 +1077,3 @@ void mglVertexP4uiv(GLMContext ctx, GLenum type, const GLuint *value)
 	// TODO: Implement
 	(void)ctx;
 }
-
-
-
-
-#ifdef MGL_GL_ES
-void  mglBlendBarrier(GLMContext ctx)
-{
-    // Metal already orders fragment writes to the same pixel
-}
-
-void mglPrimitiveBoundingBox(GLMContext ctx, GLfloat minX, GLfloat minY, GLfloat minZ, GLfloat minW, GLfloat maxX, GLfloat maxY, GLfloat maxZ, GLfloat maxW)
-{
-    
-}
-#endif

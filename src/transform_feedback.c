@@ -56,7 +56,7 @@ void mglTransformFeedbackVaryings(GLMContext ctx, GLuint program, GLsizei count,
     Program *prog = findProgram(ctx, program);
     char **names = NULL;
 
-    ERROR_CHECK_RETURN(prog, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(prog, mglProgramNameError(ctx, program));
     ERROR_CHECK_RETURN(count >= 0, GL_INVALID_VALUE);
     ERROR_CHECK_RETURN(count == 0 || varyings, GL_INVALID_VALUE);
     ERROR_CHECK_RETURN(bufferMode == GL_INTERLEAVED_ATTRIBS ||
@@ -122,7 +122,7 @@ void mglGetTransformFeedbackVarying(GLMContext ctx, GLuint program, GLuint index
     Program *prog = findProgram(ctx, program);
     GLsizei n;
 
-    ERROR_CHECK_RETURN(prog, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(prog, mglProgramNameError(ctx, program));
     ERROR_CHECK_RETURN(bufSize >= 0, GL_INVALID_VALUE);
     ERROR_CHECK_RETURN(index < (GLuint)prog->xfb_varying_count, GL_INVALID_VALUE);
 

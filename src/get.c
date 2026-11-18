@@ -18,6 +18,7 @@
  *
  */
 
+#include <math.h>
 #include <stdio.h>
 #include "glm_context.h"
 #include "mgl_log.h"
@@ -30,9 +31,10 @@ GLuint textureIndexFromTarget(GLMContext ctx, GLenum target);
 
 // these cast a void ptr to a type and value
 #define RET_BOOL(__value__) *((GLboolean *)data) = ((__value__) != 0) ? GL_TRUE : GL_FALSE; break;
-#define RET_INT(__value__) *((GLint *)data) = (GLint)__value__; break;
-#define RET_FLOAT(__value__) *((GLfloat *)data) = (GLfloat)__value__; break;
-#define RET_DOUBLE(__value__) *((GLdouble *)data) = (GLdouble)__value__; break;
+#define RET_INT(__value__) *((GLint *)data) = (GLint)lround((double)(__value__)); break;
+#define RET_INT64(__value__) *((GLint64 *)data) = (GLint64)llround((double)(__value__)); break;
+#define RET_FLOAT(__value__) *((GLfloat *)data) = (GLfloat)(__value__); break;
+#define RET_DOUBLE(__value__) *((GLdouble *)data) = (GLdouble)(__value__); break;
 
 // same as RET_TYPE_VAR but for a limit we answer with a constant
 #define RET_TYPE_CONST(__TYPE__, __VALUE__) \
@@ -41,10 +43,11 @@ switch(type) {  \
     case kInt: RET_INT(__VALUE__)    \
     case kFloat: RET_FLOAT(__VALUE__)    \
     case kDouble: RET_DOUBLE(__VALUE__)    \
+    case kInt64: RET_INT64(__VALUE__)    \
 }
 
 enum {
-    kBool, kInt, kFloat, kDouble
+    kBool, kInt, kFloat, kDouble, kInt64
 };
 
 // set value based on type from ctx->state.var
@@ -54,16 +57,18 @@ case kBool: RET_BOOL(ctx->state.var.__VALUE__);   \
     case kInt: RET_INT(ctx->state.var.__VALUE__)    \
     case kFloat: RET_FLOAT(ctx->state.var.__VALUE__)    \
     case kDouble: RET_DOUBLE(ctx->state.var.__VALUE__)    \
+    case kInt64: RET_INT64(ctx->state.var.__VALUE__)    \
 }
 
 // set count values based on type
 #define RET_TYPE_VAR_COUNT(__TYPE__, __VALUE__, __COUNT__) \
-for(int i=0, counts[]={1,4,4,8};i<__COUNT__; data+=counts[__TYPE__], i++) \
+for(int i=0, counts[]={1,4,4,8,8};i<__COUNT__; data+=counts[__TYPE__], i++) \
     switch(type) {  \
         case kBool: RET_BOOL(ctx->state.var.__VALUE__[i])    \
         case kInt: RET_INT(ctx->state.var.__VALUE__[i])    \
         case kFloat: RET_FLOAT(ctx->state.var.__VALUE__[i])    \
         case kDouble: RET_DOUBLE(ctx->state.var.__VALUE__[i])    \
+        case kInt64: RET_INT64(ctx->state.var.__VALUE__[i])    \
 }
 
 // two fixed numbers, for the ranges GL reports as a pair
@@ -76,6 +81,7 @@ for(int i=0, counts[]={1,4,4,8};i<__COUNT__; data+=counts[__TYPE__], i++) \
             case kInt:    ((GLint *)data)[i] = (GLint)pair_[i]; break; \
             case kFloat:  ((GLfloat *)data)[i] = (GLfloat)pair_[i]; break; \
             case kDouble: ((GLdouble *)data)[i] = pair_[i]; break; \
+            case kInt64:  ((GLint64 *)data)[i] = (GLint64)pair_[i]; break; \
         } \
 }
 
@@ -86,16 +92,18 @@ switch(type) {  \
     case kInt: RET_INT(ctx->state.__VALUE__)    \
     case kFloat: RET_FLOAT(ctx->state.__VALUE__)    \
     case kDouble: RET_DOUBLE(ctx->state.__VALUE__)    \
+    case kInt64: RET_INT64(ctx->state.__VALUE__)    \
 }
 
 // set count values based on type
 #define RET_TYPE_COUNT(__TYPE__, __VALUE__, __COUNT__) \
-for(int i=0, counts[]={1,4,4,8};i<__COUNT__; data+=counts[__TYPE__], i++) \
+for(int i=0, counts[]={1,4,4,8,8};i<__COUNT__; data+=counts[__TYPE__], i++) \
     switch(type) {  \
         case kBool: RET_BOOL(ctx->state.__VALUE__[i])    \
         case kInt: RET_INT(ctx->state.__VALUE__[i])    \
         case kFloat: RET_FLOAT(ctx->state.__VALUE__[i])    \
         case kDouble: RET_DOUBLE(ctx->state.__VALUE__[i])    \
+        case kInt64: RET_INT64(ctx->state.__VALUE__[i])    \
 }
 
 
@@ -305,6 +313,11 @@ int mglIndexedStateValues(GLMContext ctx, GLenum pname, GLuint index, GLdouble *
             return 1;
         }
 
+        case GL_SAMPLE_MASK_VALUE:
+            if (index >= 1) return -1;
+            out[0] = (GLdouble)(GLint)ctx->state.var.sample_mask_value;
+            return 1;
+
         case GL_CURRENT_VERTEX_ATTRIB:
             if (index >= ctx->state.max_vertex_attribs) return -1;
             for(int i=0; i<4; i++)
@@ -329,9 +342,10 @@ void mglWriteTypedValues(void *data, GLuint type, const GLdouble *v, int count)
         switch(type)
         {
             case kBool:   ((GLboolean *)data)[i] = (v[i] != 0.0); break;
-            case kInt:    ((GLint *)data)[i]     = (GLint)v[i];   break;
+            case kInt:    ((GLint *)data)[i]     = (GLint)lround(v[i]); break;
             case kFloat:  ((GLfloat *)data)[i]   = (GLfloat)v[i]; break;
             case kDouble: ((GLdouble *)data)[i]  = v[i];          break;
+            case kInt64:  ((GLint64 *)data)[i]   = (GLint64)llround(v[i]); break;
         }
     }
 }
@@ -348,6 +362,28 @@ void mglWriteTypedValues(void *data, GLuint type, const GLdouble *v, int count)
 
 static void mglGet(GLMContext ctx, GLenum pname, GLuint type, void *data)
 {
+    // GL 4.6 2.2.2: colours and depths read as integers span the whole integer range
+    if ((type == kInt || type == kInt64) && (pname == GL_COLOR_CLEAR_VALUE || pname == GL_BLEND_COLOR ||
+                                             pname == GL_DEPTH_CLEAR_VALUE || pname == GL_DEPTH_RANGE))
+    {
+        GLdouble v[4];
+        int n = pname == GL_DEPTH_CLEAR_VALUE ? 1 : pname == GL_DEPTH_RANGE ? 2 : 4;
+
+        mglGet(ctx, pname, kDouble, v);
+
+        for (int i = 0; i < n; i++)
+        {
+            double r = fmin(fmax((4294967295.0 * v[i] - 1.0) / 2.0, -2147483648.0), 2147483647.0);
+
+            if (type == kInt)
+                ((GLint *)data)[i] = (GLint)llround(r);
+            else
+                ((GLint64 *)data)[i] = (GLint64)llround(r);
+        }
+
+        return;
+    }
+
     switch(pname)
     {
         case 0x0B11: RET_TYPE_VAR(type, point_size); break; // GL_POINT_SIZE
@@ -360,6 +396,11 @@ static void mglGet(GLMContext ctx, GLenum pname, GLuint type, void *data)
         case 0x0B23: RET_TYPE_VAR(type, line_width_granularity); break; // GL_LINE_WIDTH_GRANULARITY
         case 0x0B40: RET_TYPE_VAR(type, polygon_mode); break; // GL_POLYGON_MODE
         case 0x0B45: RET_TYPE_VAR(type, cull_face_mode); break; // GL_CULL_FACE_MODE
+        case 0x0C52: RET_TYPE_CONST(type, ctx->state.hints.line_smooth_hint); break; // GL_LINE_SMOOTH_HINT
+        case 0x0C53: RET_TYPE_CONST(type, ctx->state.hints.polygon_smooth_hint); break; // GL_POLYGON_SMOOTH_HINT
+        case 0x84EF: RET_TYPE_CONST(type, ctx->state.hints.texture_compression_hint); break; // GL_TEXTURE_COMPRESSION_HINT
+        case 0x8B8B: RET_TYPE_CONST(type, ctx->state.hints.fragment_shader_derivative_hint); break; // GL_FRAGMENT_SHADER_DERIVATIVE_HINT
+        case 0x8192: RET_TYPE_CONST(type, ctx->state.hints.generate_mipmap_hint); break; // GL_GENERATE_MIPMAP_HINT
         case 0x0B46: RET_TYPE_VAR(type, front_face); break; // GL_FRONT_FACE
 
         case 0x0B70: { GLdouble v[4]; int n = mglIndexedStateValues(ctx, GL_DEPTH_RANGE, 0, v); mglWriteTypedValues(data, type, v, n); } break; // GL_DEPTH_RANGE
@@ -404,9 +445,10 @@ static void mglGet(GLMContext ctx, GLenum pname, GLuint type, void *data)
                     case kInt:    *((GLint *)data)     = (GLint)d;    break;
                     case kFloat:  *((GLfloat *)data)   = (GLfloat)d;  break;
                     case kDouble: *((GLdouble *)data)  = (GLdouble)d; break;
+                    case kInt64:  *((GLint64 *)data)   = (GLint64)d;  break;
                 }
 
-                data += (type == kBool) ? 1 : (type == kDouble ? 8 : 4);
+                data += (type == kBool) ? 1 : (type == kDouble || type == kInt64 ? 8 : 4);
             }
 
             break;
@@ -522,6 +564,7 @@ static void mglGet(GLMContext ctx, GLenum pname, GLuint type, void *data)
                 case kInt: RET_INT(0)
                 case kFloat: RET_FLOAT(0)
                 case kDouble: RET_DOUBLE(0)
+                case kInt64: RET_INT64(0)
             }
             break;
         // GL_ACTIVE_TEXTURE reads back as the GL_TEXTUREi enum, not the unit
@@ -534,6 +577,7 @@ static void mglGet(GLMContext ctx, GLenum pname, GLuint type, void *data)
                 case kInt: RET_INT(active_texture_enum)
                 case kFloat: RET_FLOAT(active_texture_enum)
                 case kDouble: RET_DOUBLE(active_texture_enum)
+                case kInt64: RET_INT64(active_texture_enum)
             }
         } break;
         // GL_SAMPLES / GL_SAMPLE_BUFFERS describe the framebuffer being drawn
@@ -545,6 +589,7 @@ static void mglGet(GLMContext ctx, GLenum pname, GLuint type, void *data)
                 case kInt: RET_INT(n)
                 case kFloat: RET_FLOAT(n)
                 case kDouble: RET_DOUBLE(n)
+                case kInt64: RET_INT64(n)
             }
         } break;
         case 0x80A8: { // GL_SAMPLE_BUFFERS
@@ -554,6 +599,7 @@ static void mglGet(GLMContext ctx, GLenum pname, GLuint type, void *data)
                 case kInt: RET_INT(n)
                 case kFloat: RET_FLOAT(n)
                 case kDouble: RET_DOUBLE(n)
+                case kInt64: RET_INT64(n)
             }
         } break;
         case 0x80AA: RET_TYPE_VAR(type, sample_coverage_value); break; // GL_SAMPLE_COVERAGE_VALUE
@@ -568,17 +614,19 @@ static void mglGet(GLMContext ctx, GLenum pname, GLuint type, void *data)
                 case kInt: RET_INT(n)
                 case kFloat: RET_FLOAT(n)
                 case kDouble: RET_DOUBLE(n)
+                case kInt64: RET_INT64(n)
             }
         } break;
         case 0x86A3: { // GL_COMPRESSED_TEXTURE_FORMATS
             GLenum list[128];
             GLsizei n = mglFormatCompressedFormatList(list, 128);
-            for(int i=0, counts[]={1,4,4,8}; i<n; data+=counts[type], i++)
+            for(int i=0, counts[]={1,4,4,8,8}; i<n; data+=counts[type], i++)
                 switch(type) {
                     case kBool: RET_BOOL(list[i])
                     case kInt: RET_INT(list[i])
                     case kFloat: RET_FLOAT(list[i])
                     case kDouble: RET_DOUBLE(list[i])
+                    case kInt64: RET_INT64(list[i])
                 }
         } break;
 
@@ -591,8 +639,9 @@ static void mglGet(GLMContext ctx, GLenum pname, GLuint type, void *data)
 
         case 0x8005: RET_TYPE_VAR_COUNT(type, blend_color,4); break; // GL_BLEND_COLOR
 
-        case 0x8894: RET_TYPE_VAR(type, array_buffer_binding); break; // GL_ARRAY_BUFFER_BINDING
-        case 0x8895: RET_TYPE_VAR(type, element_array_buffer_binding); break; // GL_ELEMENT_ARRAY_BUFFER_BINDING
+        // the bindings come from the bound objects
+        case 0x8894: RET_TYPE_CONST(type, ctx->state.buffers[_ARRAY_BUFFER] ? ctx->state.buffers[_ARRAY_BUFFER]->name : 0); break; // GL_ARRAY_BUFFER_BINDING
+        case 0x8895: RET_TYPE_CONST(type, ctx->state.vao && ctx->state.vao->element_array.buffer ? ctx->state.vao->element_array.buffer->name : 0); break; // GL_ELEMENT_ARRAY_BUFFER_BINDING
         case 0x8009: RET_TYPE_VAR(type, blend_equation_rgb[0]); break; // GL_BLEND_EQUATION_RGB
         case 0x8800: RET_TYPE_VAR(type, stencil_back_func); break; // GL_STENCIL_BACK_FUNC
         case 0x8801: RET_TYPE_VAR(type, stencil_back_fail); break; // GL_STENCIL_BACK_FAIL
@@ -616,8 +665,8 @@ static void mglGet(GLMContext ctx, GLenum pname, GLuint type, void *data)
         case 0x8CA3: RET_TYPE_VAR(type, stencil_back_ref); break; // GL_STENCIL_BACK_REF
         case 0x8CA4: RET_TYPE_VAR(type, stencil_back_value_mask); break; // GL_STENCIL_BACK_VALUE_MASK
         case 0x8CA5: RET_TYPE_VAR(type, stencil_back_writemask); break; // GL_STENCIL_BACK_WRITEMASK
-        case 0x88ED: RET_TYPE_VAR(type, pixel_pack_buffer_binding); break; // GL_PIXEL_PACK_BUFFER_BINDING
-        case 0x88EF: RET_TYPE_VAR(type, pixel_unpack_buffer_binding); break; // GL_PIXEL_UNPACK_BUFFER_BINDING
+        case 0x88ED: RET_TYPE_CONST(type, ctx->state.buffers[_PIXEL_PACK_BUFFER] ? ctx->state.buffers[_PIXEL_PACK_BUFFER]->name : 0); break; // GL_PIXEL_PACK_BUFFER_BINDING
+        case 0x88EF: RET_TYPE_CONST(type, ctx->state.buffers[_PIXEL_UNPACK_BUFFER] ? ctx->state.buffers[_PIXEL_UNPACK_BUFFER]->name : 0); break; // GL_PIXEL_UNPACK_BUFFER_BINDING
         // Framebuffer-dependent state, so it has to be worked out rather than
         // stored: what ReadPixels will take for whatever is being read now.
         case 0x8B9B: // GL_IMPLEMENTATION_COLOR_READ_FORMAT
@@ -635,7 +684,7 @@ static void mglGet(GLMContext ctx, GLenum pname, GLuint type, void *data)
         case 0x821D: RET_TYPE_VAR(type, num_extensions); break; // GL_NUM_EXTENSIONS
         case 0x821E: RET_TYPE_VAR(type, context_flags); break; // GL_CONTEXT_FLAGS
         case 0x88FF: RET_TYPE_VAR(type, max_array_texture_layers); break; // GL_MAX_ARRAY_TEXTURE_LAYERS
-        case 0x8904: RET_TYPE_VAR(type, min_program_texel_offset); break; // GL_MIN_PROGRAM_TEXEL_OFFSET
+        case 0x8904: RET_TYPE_CONST(type, (GLint)ctx->state.var.min_program_texel_offset); break; // GL_MIN_PROGRAM_TEXEL_OFFSET
         case 0x8905: RET_TYPE_VAR(type, max_program_texel_offset); break; // GL_MAX_PROGRAM_TEXEL_OFFSET
         case 0x8C1C: RET_TYPE_VAR(type, texture_binding_1d_array); break; // GL_TEXTURE_BINDING_1D_ARRAY
         case 0x8C1D: RET_TYPE_VAR(type, texture_binding_2d_array); break; // GL_TEXTURE_BINDING_2D_ARRAY
@@ -643,9 +692,9 @@ static void mglGet(GLMContext ctx, GLenum pname, GLuint type, void *data)
         case 0x900A: { GLdouble v[4]; int n = mglIndexedStateValues(ctx, GL_TEXTURE_BINDING_CUBE_MAP_ARRAY, ctx->state.active_texture, v); mglWriteTypedValues(data, type, v, n); } break; // GL_TEXTURE_BINDING_CUBE_MAP_ARRAY
         case 0x84E8: RET_TYPE_VAR(type, max_renderbuffer_size); break; // GL_MAX_RENDERBUFFER_SIZE
         case 0x8CA6: RET_TYPE_VAR(type, draw_framebuffer_binding); break; // GL_DRAW_FRAMEBUFFER_BINDING
-        case 0x8CA7: RET_TYPE_VAR(type, renderbuffer_binding); break; // GL_RENDERBUFFER_BINDING
+        case 0x8CA7: RET_TYPE_CONST(type, ctx->state.renderbuffer ? ctx->state.renderbuffer->name : 0); break; // GL_RENDERBUFFER_BINDING
         case 0x8CAA: RET_TYPE_VAR(type, read_framebuffer_binding); break; // GL_READ_FRAMEBUFFER_BINDING
-        case 0x85B5: RET_TYPE_VAR(type, vertex_array_binding); break; // GL_VERTEX_ARRAY_BINDING
+        case 0x85B5: RET_TYPE_CONST(type, ctx->state.vao ? ctx->state.vao->name : 0); break; // GL_VERTEX_ARRAY_BINDING
         case 0x8C2B: RET_TYPE_VAR(type, max_texture_buffer_size); break; // GL_MAX_TEXTURE_BUFFER_SIZE
         case 0x8C2C: RET_TYPE_VAR(type, texture_binding_buffer); break; // GL_TEXTURE_BINDING_BUFFER
         case 0x84F6: RET_TYPE_VAR(type, texture_binding_rectangle); break; // GL_TEXTURE_BINDING_RECTANGLE
@@ -688,7 +737,7 @@ static void mglGet(GLMContext ctx, GLenum pname, GLuint type, void *data)
         case 0x910F: RET_TYPE_VAR(type, max_depth_texture_samples); break; // GL_MAX_DEPTH_TEXTURE_SAMPLES
         case 0x9110: RET_TYPE_VAR(type, max_integer_samples); break; // GL_MAX_INTEGER_SAMPLES
         case 0x88FC: RET_TYPE_VAR(type, max_dual_source_draw_buffers); break; // GL_MAX_DUAL_SOURCE_DRAW_BUFFERS
-        case 0x8919: RET_TYPE_VAR(type, sampler_binding); break; // GL_SAMPLER_BINDING
+        case 0x8919: RET_TYPE_CONST(type, ctx->state.texture_samplers[ctx->state.active_texture] ? ctx->state.texture_samplers[ctx->state.active_texture]->name : 0); break; // GL_SAMPLER_BINDING
         case 0x8E89: RET_TYPE_VAR(type, max_tess_control_uniform_blocks); break; // GL_MAX_TESS_CONTROL_UNIFORM_BLOCKS
         case 0x8E8A: RET_TYPE_VAR(type, max_tess_evaluation_uniform_blocks); break; // GL_MAX_TESS_EVALUATION_UNIFORM_BLOCKS
         case 0x8DFA: RET_TYPE_VAR(type, shader_compiler); break; // GL_SHADER_COMPILER
@@ -738,8 +787,17 @@ static void mglGet(GLMContext ctx, GLenum pname, GLuint type, void *data)
         case 0x8F37: RET_BOUND_BUFFER(_COPY_WRITE_BUFFER); break;        // GL_COPY_WRITE_BUFFER_BINDING
         case 0x9193: RET_BOUND_BUFFER(_QUERY_BUFFER); break;             // GL_QUERY_BUFFER_BINDING
         case 0x8C2A: RET_BOUND_BUFFER(_TEXTURE_BUFFER); break;           // GL_TEXTURE_BUFFER_BINDING
-        case 0x826C: RET_TYPE_VAR(type, max_debug_group_stack_depth); break; // GL_MAX_DEBUG_GROUP_STACK_DEPTH
-        case 0x826D: RET_TYPE_VAR(type, debug_group_stack_depth); break; // GL_DEBUG_GROUP_STACK_DEPTH
+        // the debug log's own state; the stack counts the default group
+        case 0x826C: RET_TYPE_CONST(type, MAX_DEBUG_GROUPS + 1); break; // GL_MAX_DEBUG_GROUP_STACK_DEPTH
+        case 0x826D: RET_TYPE_CONST(type, ctx->state.debug.group_depth + 1); break; // GL_DEBUG_GROUP_STACK_DEPTH
+        case 0x9145: RET_TYPE_CONST(type, ctx->state.debug.count); break; // GL_DEBUG_LOGGED_MESSAGES
+        case 0x8243: // GL_DEBUG_NEXT_LOGGED_MESSAGE_LENGTH
+        {
+            DebugState *d = &ctx->state.debug;
+            GLuint tail = (d->head + MAX_DEBUG_MESSAGES - d->count) % MAX_DEBUG_MESSAGES;
+
+            RET_TYPE_CONST(type, d->count ? d->messages[tail].length + 1 : 0);
+        } break;
         case 0x82E8: RET_TYPE_VAR(type, max_label_length); break; // GL_MAX_LABEL_LENGTH
         case 0x91B0: { GLdouble v = ctx->max_shader_compiler_threads; mglWriteTypedValues(data, type, &v, 1); } break; // GL_MAX_SHADER_COMPILER_THREADS_KHR
         case GL_MAX_SPARSE_TEXTURE_SIZE_ARB: { GLdouble v = MGL_MAX_SPARSE_SIZE; mglWriteTypedValues(data, type, &v, 1); } break;
@@ -877,8 +935,8 @@ static void mglGet(GLMContext ctx, GLenum pname, GLuint type, void *data)
         case 0x8E24: RET_TYPE_CONST(type, (GLint)(ctx->state.transform_feedback &&
                                           ctx->state.transform_feedback->active)); break;
 
-        case 0x9143: RET_TYPE_CONST(type, 1024); break; // GL_MAX_DEBUG_MESSAGE_LENGTH
-        case 0x9144: RET_TYPE_CONST(type, 64); break;   // GL_MAX_DEBUG_LOGGED_MESSAGES
+        case 0x9143: RET_TYPE_CONST(type, MAX_DEBUG_MSG_LEN); break; // GL_MAX_DEBUG_MESSAGE_LENGTH
+        case 0x9144: RET_TYPE_CONST(type, MAX_DEBUG_MESSAGES); break;   // GL_MAX_DEBUG_LOGGED_MESSAGES
 
         case 0x8E72: RET_TYPE_VAR(type, patch_vertices); break;       // GL_PATCH_VERTICES
         case 0x8E73: RET_TYPE_VAR_COUNT(type, patch_default_inner, 2); break; // GL_PATCH_DEFAULT_INNER_LEVEL
@@ -970,6 +1028,7 @@ static void mglGet(GLMContext ctx, GLenum pname, GLuint type, void *data)
         }
 
         case 0x8C37: RET_TYPE_VAR(type, min_sample_shading); break; // GL_MIN_SAMPLE_SHADING_VALUE
+        case 0x8E51: RET_TYPE_CONST(type, ctx->state.caps.sample_mask); break; // GL_SAMPLE_MASK
         case 0x8E1B: RET_TYPE_VAR(type, polygon_offset_clamp); break; // GL_POLYGON_OFFSET_CLAMP
         case 0x84FF: RET_TYPE_CONST(type, 16); break; // GL_MAX_TEXTURE_MAX_ANISOTROPY, Metal's limit
         case 0x9554: RET_TYPE_CONST(type, 0); break; // GL_NUM_SPIR_V_EXTENSIONS
@@ -980,6 +1039,13 @@ static void mglGet(GLMContext ctx, GLenum pname, GLuint type, void *data)
 
             // pixel store state lives on the context, not in the var table
             if (mglPixelStoreGet(ctx, pname, &v))
+            {
+                RET_TYPE_CONST(type, v);
+                break;
+            }
+
+            // and every capability can be read back with glGet too
+            if ((v = mglCapState(ctx, pname)) >= 0)
             {
                 RET_TYPE_CONST(type, v);
                 break;
@@ -1199,8 +1265,6 @@ const GLubyte *mglGetStringi(GLMContext ctx, GLenum name, GLuint index)
 
 void mglGetInteger64v(GLMContext ctx, GLenum pname, GLint64 *data)
 {
-    GLint tmp = 0;
-
     ERROR_CHECK_RETURN(data, GL_INVALID_VALUE);
 
     switch(pname)
@@ -1222,9 +1286,7 @@ void mglGetInteger64v(GLMContext ctx, GLenum pname, GLint64 *data)
             break;
     }
 
-    mglGet(ctx, pname, kInt, (void *)&tmp);
-
-    *data = (GLint64)tmp;
+    mglGet(ctx, pname, kInt64, (void *)data);
 }
 
 void mglGetInteger64i_v(GLMContext ctx, GLenum target, GLuint index, GLint64 *data)
@@ -1440,9 +1502,6 @@ void mglGetInternalformativ(GLMContext ctx, GLenum target, GLenum internalformat
         return;
 
     params[0] = internalFormatQuery(ctx, target, internalformat, pname);
-
-    for(GLsizei i=1; i<count; i++)
-        params[i] = 0;
 }
 
 void mglGetInternalformati64v(GLMContext ctx, GLenum target, GLenum internalformat, GLenum pname, GLsizei count, GLint64 *params)
@@ -1455,9 +1514,6 @@ void mglGetInternalformati64v(GLMContext ctx, GLenum target, GLenum internalform
         return;
 
     params[0] = (GLint64)internalFormatQuery(ctx, target, internalformat, pname);
-
-    for(GLsizei i=1; i<count; i++)
-        params[i] = 0;
 }
 
 /* ---------- indexed getters ---------- */

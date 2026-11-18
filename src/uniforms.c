@@ -87,7 +87,7 @@ GLint  mglGetUniformLocation(GLMContext ctx, GLuint program, const GLchar *name)
 {
     if (isProgram(ctx, program) == GL_FALSE)
     {
-        ERROR_RETURN_VALUE(GL_INVALID_OPERATION, 0); // also may be GL_INVALID_VALUE ????
+        ERROR_RETURN_VALUE(mglProgramNameError(ctx, program), -1);
 
         return -1;
     }
@@ -238,6 +238,134 @@ static const int mgl_opaque_res_types[] = {
 };
 #define MGL_OPAQUE_RES_COUNT (int)(sizeof(mgl_opaque_res_types)/sizeof(mgl_opaque_res_types[0]))
 
+// A uniform two stages use is one uniform: the later stage's copy is skipped
+static bool namedInEarlierStage(Program *ptr, const int *types, int ntypes, int stage, const char *name)
+{
+    for (int st = _VERTEX_SHADER; st < stage && name; st++)
+        for (int t = 0; t < ntypes; t++)
+        {
+            SpirvResourceList *list = &ptr->spirv_resources_list[st][types[t]];
+
+            for (GLuint i = 0; i < list->count; i++)
+                if (list->list[i].name && !strcmp(list->list[i].name, name))
+                    return true;
+        }
+
+    return false;
+}
+
+void mglFreeOpaqueViews(Program *ptr)
+{
+    for (GLuint i = 0; i < ptr->opaque_view_count; i++)
+        free((void *)ptr->opaque_views[i].name);
+
+    free(ptr->opaque_views);
+    ptr->opaque_views = NULL;
+    ptr->opaque_view_count = 0;
+}
+
+static bool addView(Program *ptr, GLuint *cap, const SpirvResource *res, const char *name)
+{
+    if (ptr->opaque_view_count == *cap)
+    {
+        GLuint want = *cap ? *cap * 2 : 16;
+        SpirvResource *grown = (SpirvResource *)realloc(ptr->opaque_views, want * sizeof(SpirvResource));
+
+        if (grown == NULL)
+            return false;
+
+        ptr->opaque_views = grown;
+        *cap = want;
+    }
+
+    SpirvResource *v = &ptr->opaque_views[ptr->opaque_view_count++];
+
+    *v = *res;
+    v->name = strdup(name);
+    v->element_unit = NULL;
+    return v->name != NULL;
+}
+
+// Called after a link: the samplers and images glGetActiveUniform lists. One
+// two stages use is listed once, and a sampler in an array of structs, which
+// MGL keeps as one flat array, is listed per struct element as GL names it.
+void mglBuildOpaqueViews(Program *ptr)
+{
+    GLuint cap = 0;
+
+    mglFreeOpaqueViews(ptr);
+
+    for (int stage = _VERTEX_SHADER; stage < _MAX_SHADER_TYPES; stage++)
+        for (int t = 0; t < MGL_OPAQUE_RES_COUNT; t++)
+        {
+            SpirvResourceList *list = &ptr->spirv_resources_list[stage][mgl_opaque_res_types[t]];
+
+            for (GLuint i = 0; i < list->count; i++)
+            {
+                SpirvResource *res = &list->list[i];
+                GLint dims[8], nd = 0, outer = 1, leaf = 1;
+                char name[288];
+                int levels;
+
+                if (res->name == NULL ||
+                    namedInEarlierStage(ptr, mgl_opaque_res_types, MGL_OPAQUE_RES_COUNT, stage, res->name))
+                    continue;
+
+                levels = mglOpaqueStructGLNameAt(res->name, NULL, name, sizeof name);
+
+                if (res->dim_count > 1)
+                    for (GLint d = 0; d < res->dim_count && nd < 8; d++)
+                        dims[nd++] = res->dims[d];
+                else if (res->is_array)
+                    dims[nd++] = res->array_size;
+
+                if (levels <= 0 || levels > nd)
+                {
+                    addView(ptr, &cap, res, res->name);
+                    continue;
+                }
+
+                for (int d = 0; d < nd; d++)
+                    *(d < levels ? &outer : &leaf) *= dims[d];
+
+                for (GLint o = 0; o < outer; o++)
+                {
+                    int idx[8];
+                    GLint rest = o;
+
+                    for (int d = levels - 1; d >= 0; d--)
+                    {
+                        idx[d] = rest % dims[d];
+                        rest /= dims[d];
+                    }
+
+                    mglOpaqueStructGLNameAt(res->name, idx, name, sizeof name);
+
+                    if (!addView(ptr, &cap, res, name))
+                        return;
+
+                    SpirvResource *v = &ptr->opaque_views[ptr->opaque_view_count - 1];
+
+                    v->is_array = nd > levels;
+                    v->array_size = leaf;
+                    v->dim_count = 0;
+                    v->location = res->location == MGL_NO_LOCATION ? MGL_NO_LOCATION : res->location + (GLuint)(o * leaf);
+                }
+            }
+        }
+}
+
+// the samplers and images glGetActiveUniform lists
+static int queryOpaqueCount(Program *ptr)
+{
+    return (int)ptr->opaque_view_count;
+}
+
+static SpirvResource *queryOpaqueAt(Program *ptr, GLuint index)
+{
+    return index < ptr->opaque_view_count ? &ptr->opaque_views[index] : NULL;
+}
+
 static int opaqueCount(Program *ptr)
 {
     int n = 0;
@@ -299,13 +427,16 @@ static bool uniformIsStructOwner(const SpirvResource *r)
     return r->gl_type == 0 && r->offset < 0;
 }
 
+static const int mgl_plain_res_type[1] = { SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT };
+
 static GLuint plainUniformCount(Program *ptr, int stage)
 {
     SpirvResourceList *list = &ptr->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT];
     GLuint n = 0;
 
     for (GLuint i = 0; i < list->count; i++)
-        if (!uniformIsStructOwner(&list->list[i]) && !mglIsDriverUniform(list->list[i].name))
+        if (!uniformIsStructOwner(&list->list[i]) && !mglIsDriverUniform(list->list[i].name) &&
+            !namedInEarlierStage(ptr, mgl_plain_res_type, 1, stage, list->list[i].name))
             n++;
 
     return n;
@@ -318,7 +449,8 @@ static SpirvResource *plainUniformAt(Program *ptr, int stage, GLuint index)
 
     for (GLuint i = 0; i < list->count; i++)
     {
-        if (uniformIsStructOwner(&list->list[i]) || mglIsDriverUniform(list->list[i].name))
+        if (uniformIsStructOwner(&list->list[i]) || mglIsDriverUniform(list->list[i].name) ||
+            namedInEarlierStage(ptr, mgl_plain_res_type, 1, stage, list->list[i].name))
             continue;
 
         if (n == index)
@@ -348,7 +480,7 @@ static int uniformCount(Program *ptr)
     for (int stage = _VERTEX_SHADER; stage < _MAX_SHADER_TYPES; stage++)
         n += ptr->block_uniforms[stage].count;
 
-    return n + opaqueCount(ptr) + (int)ptr->atomic_uniforms.count;
+    return n + queryOpaqueCount(ptr) + (int)ptr->atomic_uniforms.count;
 }
 
 static SpirvResource *uniformAt(Program *ptr, GLuint index)
@@ -375,12 +507,42 @@ static SpirvResource *uniformAt(Program *ptr, GLuint index)
         seen += list->count;
     }
 
-    if (index - seen < (GLuint)opaqueCount(ptr))
-        return opaqueAt(ptr, index - seen);
+    if (index - seen < (GLuint)queryOpaqueCount(ptr))
+        return queryOpaqueAt(ptr, index - seen);
 
-    seen += opaqueCount(ptr);
+    seen += queryOpaqueCount(ptr);
 
     return index - seen < ptr->atomic_uniforms.count ? &ptr->atomic_uniforms.list[index - seen] : NULL;
+}
+
+// The name GL reports for a uniform: a sampler or image array ends in "[0]"
+static const char *activeName(const SpirvResource *r, char *buf, size_t size)
+{
+    size_t n = strlen(r->name);
+
+    if (!r->is_array || (n && r->name[n - 1] == ']'))
+        return r->name;
+
+    snprintf(buf, size, "%s[0]", r->name);
+    return buf;
+}
+
+// what GL_ACTIVE_UNIFORM_MAX_LENGTH reports, over the names glGetActiveUniform hands out
+int mglActiveUniformMaxLength(Program *ptr)
+{
+    int longest = 0;
+
+    for (int i = 0; i < uniformCount(ptr); i++)
+    {
+        SpirvResource *r = uniformAt(ptr, (GLuint)i);
+        char buf[288];
+        int len = r && r->name ? (int)strlen(activeName(r, buf, sizeof buf)) + 1 : 0;
+
+        if (len > longest)
+            longest = len;
+    }
+
+    return longest;
 }
 
 // GL 4.6 section 7.3.1: an array uniform is named with "[0]" on the end, and
@@ -433,11 +595,11 @@ static int uniformIndexByName(Program *ptr, const char *name)
     }
 
     {
-        int n = opaqueCount(ptr);
+        int n = queryOpaqueCount(ptr);
 
         for (int i = 0; i < n; i++)
         {
-            SpirvResource *res = opaqueAt(ptr, (GLuint)i);
+            SpirvResource *res = queryOpaqueAt(ptr, (GLuint)i);
 
             if (res && uniformNameMatches(res->name, name))
                 return (int)(seen + i);
@@ -449,6 +611,14 @@ static int uniformIndexByName(Program *ptr, const char *name)
     for (GLuint i = 0; i < ptr->atomic_uniforms.count; i++)
         if (uniformNameMatches(ptr->atomic_uniforms.list[i].name, name))
             return (int)(seen + i);
+
+    // a sampler an array of structs held keeps its flattened name
+    {
+        char flat[256];
+
+        if (strncmp(name, "mglS_", 5) && mglOpaqueStructUniformName(name, flat, sizeof flat))
+            return uniformIndexByName(ptr, flat);
+    }
 
     return -1;
 }
@@ -585,8 +755,7 @@ GLboolean isShader(GLMContext ctx, GLuint shader);
 // a shader's name in place of a program's is the wrong kind of object
 #define GET_UNIFORM_PROGRAM(ptr) \
     do { \
-        ERROR_CHECK_RETURN((ptr) || !isShader(ctx, program), GL_INVALID_OPERATION); \
-        ERROR_CHECK_RETURN((ptr), GL_INVALID_VALUE); \
+        ERROR_CHECK_RETURN((ptr), mglProgramNameError(ctx, program)); \
     } while (0)
 static SpirvResource *plainUniformByLocation(Program *ptr, GLint location, GLint *element);
 static GLsizei glTypeSizeBytes(GLenum type);
@@ -642,7 +811,7 @@ void mglGetUniformIndices(GLMContext ctx, GLuint program, GLsizei uniformCountAr
 {
     Program *ptr = findProgram(ctx, program);
 
-    ERROR_CHECK_RETURN(ptr, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(ptr, mglProgramNameError(ctx, program));
     ERROR_CHECK_RETURN(uniformCountArg >= 0, GL_INVALID_VALUE);
     ERROR_CHECK_RETURN(uniformNames && uniformIndices, GL_INVALID_VALUE);
 
@@ -659,7 +828,7 @@ void mglGetActiveUniformsiv(GLMContext ctx, GLuint program, GLsizei uniformCount
     Program *ptr = findProgram(ctx, program);
     int total;
 
-    ERROR_CHECK_RETURN(ptr, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(ptr, mglProgramNameError(ctx, program));
     ERROR_CHECK_RETURN(uniformCountArg >= 0, GL_INVALID_VALUE);
     ERROR_CHECK_RETURN(uniformIndices && params, GL_INVALID_VALUE);
 
@@ -676,8 +845,12 @@ void mglGetActiveUniformsiv(GLMContext ctx, GLuint program, GLsizei uniformCount
         switch(pname)
         {
             case GL_UNIFORM_NAME_LENGTH:
-                params[i] = (GLint)strlen(res->name) + 1;
+            {
+                char buf[288];
+
+                params[i] = (GLint)strlen(activeName(res, buf, sizeof buf)) + 1;
                 break;
+            }
 
             case GL_UNIFORM_SIZE:
                 params[i] = res->array_size ? res->array_size : 1;
@@ -722,13 +895,17 @@ void mglGetActiveUniformName(GLMContext ctx, GLuint program, GLuint uniformIndex
     Program *ptr = findProgram(ctx, program);
     SpirvResource *res;
 
-    ERROR_CHECK_RETURN(ptr, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(ptr, mglProgramNameError(ctx, program));
     ERROR_CHECK_RETURN(bufSize >= 0, GL_INVALID_VALUE);
     ERROR_CHECK_RETURN(uniformIndex < (GLuint)uniformCount(ptr), GL_INVALID_VALUE);
 
     res = uniformAt(ptr, uniformIndex);
 
-    copyName(res->name, bufSize, length, uniformName);
+    {
+        char buf[288];
+
+        copyName(activeName(res, buf, sizeof buf), bufSize, length, uniformName);
+    }
 }
 
 void mglGetActiveUniform(GLMContext ctx, GLuint program, GLuint index, GLsizei bufSize, GLsizei *length, GLint *size, GLenum *type, GLchar *name)
@@ -736,7 +913,7 @@ void mglGetActiveUniform(GLMContext ctx, GLuint program, GLuint index, GLsizei b
     Program *ptr = findProgram(ctx, program);
     SpirvResource *res;
 
-    ERROR_CHECK_RETURN(ptr, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(ptr, mglProgramNameError(ctx, program));
     ERROR_CHECK_RETURN(bufSize >= 0, GL_INVALID_VALUE);
     ERROR_CHECK_RETURN(index < (GLuint)uniformCount(ptr), GL_INVALID_VALUE);
 
@@ -747,7 +924,12 @@ void mglGetActiveUniform(GLMContext ctx, GLuint program, GLuint index, GLsizei b
     if (size) *size = res->array_size ? res->array_size : 1;
     if (type) *type = res->gl_type;
 
-    if (name) copyName(res->name, bufSize, length, name);
+    if (name)
+    {
+        char buf[288];
+
+        copyName(activeName(res, buf, sizeof buf), bufSize, length, name);
+    }
     else if (length) *length = 0;
 }
 
@@ -813,7 +995,7 @@ void mglGetActiveUniformBlockiv(GLMContext ctx, GLuint program, GLuint uniformBl
     Program *ptr = findProgram(ctx, program);
     SpirvResource *blk;
 
-    ERROR_CHECK_RETURN(ptr, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(ptr, mglProgramNameError(ctx, program));
     ERROR_CHECK_RETURN(params, GL_INVALID_VALUE);
     ERROR_CHECK_RETURN(uniformBlockIndex < (GLuint)uniformBlockCount(ptr), GL_INVALID_VALUE);
 
@@ -910,7 +1092,7 @@ void mglGetActiveUniformBlockName(GLMContext ctx, GLuint program, GLuint uniform
     Program *ptr = findProgram(ctx, program);
     SpirvResource *blk;
 
-    ERROR_CHECK_RETURN(ptr, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(ptr, mglProgramNameError(ctx, program));
     ERROR_CHECK_RETURN(bufSize >= 0, GL_INVALID_VALUE);
     ERROR_CHECK_RETURN(uniformBlockIndex < (GLuint)uniformBlockCount(ptr), GL_INVALID_VALUE);
 
@@ -947,7 +1129,7 @@ void mglUniformBlockBinding(GLMContext ctx, GLuint program, GLuint uniformBlockI
 {
     Program *ptr = findProgram(ctx, program);
 
-    ERROR_CHECK_RETURN(ptr, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(ptr, mglProgramNameError(ctx, program));
     ERROR_CHECK_RETURN(uniformBlockIndex < (GLuint)uniformBlockCount(ptr), GL_INVALID_VALUE);
     ERROR_CHECK_RETURN(uniformBlockBinding < MAX_UNIFORM_BUFFER_BINDINGS, GL_INVALID_VALUE);
 
@@ -1010,9 +1192,7 @@ Program *programForUniform(GLMContext ctx, GLuint program)
 {
     Program *pptr = findProgram(ctx, program);
 
-    // MGL numbers shaders and programs apart, so a program's old name may
-    // also be some shader's; it is still no program
-    ERROR_CHECK_RETURN_VALUE(pptr, GL_INVALID_VALUE, NULL);
+    ERROR_CHECK_RETURN_VALUE(pptr, mglProgramNameError(ctx, program), NULL);
 
     ERROR_CHECK_RETURN_VALUE(pptr->link_status == GL_TRUE && pptr->executable,
                              GL_INVALID_OPERATION, NULL);
@@ -1181,7 +1361,6 @@ static GLsizei packBoolUniform(GLenum gl_type, const void *src, GLsizei size,
 
     elements = size / (GLsizei)(4 * comps);
     total = elements * (GLsizei)stride;
-    total = (total + 3) & ~3;
 
     if (total > out_max)
         return 0;
@@ -1195,8 +1374,48 @@ static GLsizei packBoolUniform(GLenum gl_type, const void *src, GLsizei size,
     return total;
 }
 
+// In a struct, SPIRV-Cross makes each bool a short, and a bvec3 a short4.
+static GLsizei packStructBools(GLenum gl_type, const void *src, GLsizei size, GLubyte *out, GLsizei out_max)
+{
+    GLuint comps = boolComponentsFor(gl_type);
+    GLuint stride = comps == 3 ? 4 : comps;
+    const GLuint *in = (const GLuint *)src;
+    GLushort *o = (GLushort *)out;
+    GLsizei elements, total;
+
+    if (comps == 0 || size <= 0 || (size % (GLsizei)(4 * comps)) != 0)
+        return 0;
+
+    elements = size / (GLsizei)(4 * comps);
+    total = elements * (GLsizei)stride * 2;
+
+    if (total > out_max)
+        return 0;
+
+    memset(out, 0, (size_t)total);
+
+    for (GLsizei e = 0; e < elements; e++)
+        for (GLuint c = 0; c < comps; c++)
+            o[e * (GLsizei)stride + (GLsizei)c] = in[e * (GLsizei)comps + c] ? 1 : 0;
+
+    return total;
+}
+
 // A uniform inside a plain struct shares one buffer with the rest of the
 // struct, so it is written in place rather than replacing the whole thing.
+// Metal pads each three-row column of a float matrix in a struct to 16 bytes
+static GLuint paddedColumns(GLenum gl_type)
+{
+    switch (gl_type)
+    {
+        case GL_FLOAT_MAT2x3: return 2;
+        case GL_FLOAT_MAT3:   return 3;
+        case GL_FLOAT_MAT4x3: return 4;
+    }
+
+    return 0;
+}
+
 static bool writeStructLeaf(GLMContext ctx, Program *pptr, SpirvResource *res,
                             GLint element, const void *ptr, GLsizei size)
 {
@@ -1232,7 +1451,7 @@ static bool writeStructLeaf(GLMContext ctx, Program *pptr, SpirvResource *res,
 
     if (boolComponentsFor(res->gl_type))
     {
-        packed_size = packBoolUniform(res->gl_type, ptr, size, packed, (GLsizei)sizeof packed);
+        packed_size = packStructBools(res->gl_type, ptr, size, packed, (GLsizei)sizeof packed);
 
         if (packed_size)
         {
@@ -1243,10 +1462,26 @@ static bool writeStructLeaf(GLMContext ctx, Program *pptr, SpirvResource *res,
 
     offset = res->offset + element * res->array_stride;
 
-    if (offset < 0 || offset + size > res->block_size)
-        return false;
+    if (paddedColumns(res->gl_type))
+    {
+        GLuint cols = paddedColumns(res->gl_type);
+        GLsizei count = size / (GLsizei)(cols * 12);
 
-    memcpy((void *)(buf->data.buffer_data + offset), ptr, (size_t)size);
+        for (GLsizei m = 0; m < count; m++)
+            for (GLuint c = 0; c < cols; c++)
+            {
+                GLint at = offset + m * res->array_stride + (GLint)c * 16;
+
+                if (at < 0 || at + 12 > res->block_size)
+                    return false;
+
+                memcpy((void *)(buf->data.buffer_data + at), (const GLubyte *)ptr + (m * cols + c) * 12, 12);
+            }
+    }
+    else if (offset < 0 || offset + size > res->block_size)
+        return false;
+    else
+        memcpy((void *)(buf->data.buffer_data + offset), ptr, (size_t)size);
     buf->data.dirty_bits |= DIRTY_BUFFER_DATA;
 
     if (pptr->uniform_constants.elem_size[owner] == 0)
@@ -1423,6 +1658,21 @@ void mglWriteNumSamples(GLMContext ctx, Program *pptr, GLint samples)
     programUniformWrite(ctx, pptr, pptr->num_samples_loc, &samples, sizeof(GLint));
 }
 
+void mglWriteDepthRange(GLMContext ctx, Program *pptr)
+{
+    GLfloat r[3];
+
+    if (pptr == NULL || pptr->depth_range_loc < 0)
+        return;
+
+    r[0] = (GLfloat)ctx->state.depth_range[0].znear;
+    r[1] = (GLfloat)ctx->state.depth_range[0].zfar;
+    r[2] = r[1] - r[0];
+
+    ctx->uniform_setter = 0;
+    programUniformWrite(ctx, pptr, pptr->depth_range_loc, r, sizeof r);
+}
+
 // One means the draw target has a single sample, where GL ignores whatever the
 // shader put in gl_SampleMask.
 void mglWriteSampleMaskOff(GLMContext ctx, Program *pptr, GLint off)
@@ -1513,7 +1763,10 @@ void programUniformWrite(GLMContext ctx, Program *pptr, GLint location, const vo
     // that starts further in lands part way along it
     if (res && storedElementSize(pptr, res) > 0)
     {
-        offset = (size_t)element * storedElementSize(pptr, res);
+        GLuint comps = boolComponentsFor(res->gl_type);
+
+        // bools are Metal's one-byte bools, as packBoolUniform lays them out
+        offset = (size_t)element * (comps ? (comps == 1 ? 1 : comps == 2 ? 2 : 4) : storedElementSize(pptr, res));
         location = (GLint)res->location;
     }
 
@@ -1594,13 +1847,42 @@ void mglUniformD(GLMContext ctx, GLint location, void *ptr, GLsizei size)
     programUniformWriteD(ctx, pptr, location, ptr, size);
 }
 
+// The most a uniform at this location takes: a whole struct, or 64 bytes (a
+// dmat2x4 or a mat4) for each element of an array.
+static size_t defaultUniformBytes(Program *pptr, GLint location)
+{
+    size_t most = 256;
+
+    for (int stage = 0; stage < _MAX_SHADER_TYPES; stage++)
+    {
+        SpirvResourceList *list = &pptr->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT];
+
+        for (GLuint i = 0; i < list->count; i++)
+        {
+            SpirvResource *r = &list->list[i];
+
+            size_t want = 0;
+
+            if (r->block_index == -1 && r->block_size > 0 && (GLint)r->binding == location)
+                want = (size_t)r->block_size;
+            else if ((GLint)r->location == location)
+                want = (size_t)64 * (size_t)(r->array_size > 1 ? r->array_size : 1);
+
+            if (want > most)
+                most = want;
+        }
+    }
+
+    return most;
+}
+
 // A uniform the app never wrote still reads as zero in GL, so hand the draw a
-// zero filled buffer instead of failing it. 256 bytes covers every uniform
-// type the MSL side can ask for, including a mat4 array.
+// zero filled buffer instead of failing it
 Buffer *programUniformDefaultBuffer(GLMContext ctx, Program *pptr, GLint location)
 {
-    static const GLubyte zeros[256] = {0};
     Buffer *buf;
+    void *zeros;
+    size_t bytes;
 
     if (pptr == NULL)
         return NULL;
@@ -1620,7 +1902,10 @@ Buffer *programUniformDefaultBuffer(GLMContext ctx, Program *pptr, GLint locatio
 
     pptr->uniform_constants.buffers[location].buf = buf;
 
-    initBufferData(ctx, buf, sizeof(zeros), (void *)zeros, true);
+    bytes = defaultUniformBytes(pptr, location);
+    zeros = calloc(1, bytes);
+    initBufferData(ctx, buf, bytes, zeros, true);
+    free(zeros);
 
     return buf;
 }
@@ -2792,7 +3077,18 @@ static void getUniformFrom(GLMContext ctx, Program *pp, GLint location,
     {
         GLuint comps = boolComponentsFor(res->gl_type);
         size_t stride = comps == 1 ? 1 : comps == 2 ? 2 : 4;
-        size_t at = (size_t)element * stride;
+        size_t at = (size_t)element * stride, width = 1;
+
+        // a member of a plain struct sits at its offset in the struct's buffer
+        if (res->offset >= 0 && res->block_size > 0 && res->block_index == -1)
+        {
+            GLint owner = (GLint)res->binding;
+
+            buf = (owner >= 0 && owner < MAX_UNIFORM_LOCATIONS) ? pp->uniform_constants.buffers[owner].buf : NULL;
+            have = (buf && buf->data.buffer_data) ? (size_t)buf->size : 0;
+            at = (size_t)res->offset + (size_t)element * (size_t)res->array_stride;
+            width = 2;
+        }
 
         if (bufSize >= 0)
             ERROR_CHECK_RETURN((size_t)comps * (dst_type == GL_DOUBLE ? 8 : 4) <= (size_t)bufSize,
@@ -2800,7 +3096,14 @@ static void getUniformFrom(GLMContext ctx, Program *pp, GLint location,
 
         for (GLuint c = 0; c < comps; c++)
         {
-            bool on = have > at + c && ((const GLubyte *)buf->data.buffer_data)[at + c] != 0;
+            bool on = false;
+
+            if (have >= at + (c + 1) * width)
+            {
+                const GLubyte *b = (const GLubyte *)buf->data.buffer_data + at + c * width;
+
+                on = b[0] || (width == 2 && b[1]);
+            }
 
             if (dst_type == GL_FLOAT)
                 ((GLfloat *)params)[c] = on ? 1.0f : 0.0f;
@@ -2842,7 +3145,13 @@ static void getUniformFrom(GLMContext ctx, Program *pp, GLint location,
         return;
 
     // what was written, and zero for the rest
-    if (have > offset)
+    if (res && res->offset >= 0 && res->block_size > 0 && res->block_index == -1 && paddedColumns(res->gl_type))
+    {
+        for (GLuint c = 0; c < paddedColumns(res->gl_type); c++)
+            if (have >= offset + c * 16 + 12)
+                memcpy(value + c * 12, (const GLubyte *)buf->data.buffer_data + offset + c * 16, 12);
+    }
+    else if (have > offset)
         memcpy(value, (const GLubyte *)buf->data.buffer_data + offset,
                have - offset < per ? have - offset : per);
 

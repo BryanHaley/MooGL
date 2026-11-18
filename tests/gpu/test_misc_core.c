@@ -243,7 +243,7 @@ GPU_TEST(misc_core, object_label_rejects_nonexistent_name)
     CHECK_EQ_UINT(mgl_drain_errors(), GL_INVALID_OPERATION);
 }
 
-GPU_TEST(misc_core, object_label_rejects_zero_bufsize)
+GPU_TEST(misc_core, object_label_rejects_negative_bufsize)
 {
     GLuint b = 0;
     char tmp[8] = { 0 };
@@ -251,8 +251,7 @@ GPU_TEST(misc_core, object_label_rejects_zero_bufsize)
     glGenBuffers(1, &b);
     glObjectLabel(GL_BUFFER, b, -1, "tag");
 
-    // bufSize == 0 should give GL_INVALID_VALUE
-    glGetObjectLabel(GL_BUFFER, b, 0, NULL, tmp);
+    glGetObjectLabel(GL_BUFFER, b, -1, NULL, tmp);
     CHECK_EQ_UINT(mgl_drain_errors(), GL_INVALID_VALUE);
 
     glDeleteBuffers(1, &b);
@@ -301,7 +300,7 @@ GPU_TEST(misc_core, object_ptr_label_rejects_invalid_ptr)
     CHECK_EQ_UINT(mgl_drain_errors(), GL_INVALID_VALUE);
 }
 
-GPU_TEST(misc_core, object_ptr_label_rejects_zero_bufsize)
+GPU_TEST(misc_core, object_ptr_label_rejects_negative_bufsize)
 {
     GLsync sync;
     char tmp[8] = { 0 };
@@ -310,8 +309,7 @@ GPU_TEST(misc_core, object_ptr_label_rejects_zero_bufsize)
     CHECK(sync != NULL);
     glObjectPtrLabel(sync, -1, "tag");
 
-    // bufSize == 0 should give GL_INVALID_VALUE
-    glGetObjectPtrLabel(sync, 0, NULL, tmp);
+    glGetObjectPtrLabel(sync, -1, NULL, tmp);
     CHECK_EQ_UINT(mgl_drain_errors(), GL_INVALID_VALUE);
 
     glDeleteSync(sync);
@@ -330,9 +328,12 @@ GPU_TEST(misc_core, shader_precision_returns_reasonable_values)
     CHECK(range[1] > 0);
     CHECK(prec > 0);
 
-    glGetShaderPrecisionFormat(GL_FRAGMENT_SHADER, GL_HIGH_INT, range, &prec);
+    // ints are 32-bit integers: no fraction, and a range of 31 bits
+    glGetShaderPrecisionFormat(GL_FRAGMENT_SHADER, GL_LOW_INT, range, &prec);
     CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
-    CHECK(range[0] > 0);
+    CHECK_EQ_INT(range[0], 31);
+    CHECK_EQ_INT(range[1], 30);
+    CHECK_EQ_INT(prec, 0);
 }
 
 GPU_TEST(misc_core, shader_precision_rejects_bad_enums)
@@ -1358,6 +1359,68 @@ GPU_TEST(misc_core, a_failed_relink_keeps_the_pipeline_stage)
     mgl_target_destroy(&t);
 }
 
+// Draws one full-target triangle through a vertex and a fragment program and
+// returns the pixel in the middle
+static void pipelineDraw(GLuint vp, GLuint fp, unsigned char out[4])
+{
+    MGLTestTarget t;
+    GLuint pipe, vao;
+    unsigned char *px;
+
+    memset(out, 0, 4);
+    if (!mgl_target_create(&t, 4, 4, GL_RGBA8, 0)) { CHECK(0); return; }
+
+    glGenProgramPipelines(1, &pipe);
+    glUseProgramStages(pipe, GL_VERTEX_SHADER_BIT, vp);
+    glUseProgramStages(pipe, GL_FRAGMENT_SHADER_BIT, fp);
+    glBindProgramPipeline(pipe);
+    mgl_target_bind(&t);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+
+    px = mgl_read_rgba8(&t);
+    if (px)
+        mgl_pixel_at(px, &t, 1, 1, out);
+    free(px);
+
+    glBindProgramPipeline(0);
+    glDeleteProgramPipelines(1, &pipe);
+    glDeleteVertexArrays(1, &vao);
+    mgl_target_destroy(&t);
+}
+
+#define FULL_TRIANGLE \
+    "    vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2)) * 2.0 - 1.0;\n" \
+    "    gl_Position = vec4(p, 0.0, 1.0);\n"
+
+// Each separate program keeps its own value for a uniform both declare
+GPU_TEST(misc_core, pipeline_stages_keep_their_own_same_named_uniform)
+{
+    static const char *VS =
+        "#version 450 core\n"
+        "out gl_PerVertex { vec4 gl_Position; };\n"
+        "uniform float s;\n"
+        "out float v;\n"
+        "void main() {\n" FULL_TRIANGLE "    v = s;\n}\n";
+    static const char *FS =
+        "#version 450 core\nuniform float s;\nin float v;\nout vec4 o;\nvoid main() { o = vec4(v, s, 0.0, 1.0); }\n";
+    GLuint vp = glCreateShaderProgramv(GL_VERTEX_SHADER, 1, &VS);
+    GLuint fp = glCreateShaderProgramv(GL_FRAGMENT_SHADER, 1, &FS);
+    unsigned char px[4];
+
+    glProgramUniform1f(vp, glGetUniformLocation(vp, "s"), 0.25f);
+    glProgramUniform1f(fp, glGetUniformLocation(fp, "s"), 0.75f);
+    pipelineDraw(vp, fp, px);
+    CHECK_MSG(abs(px[0] - 64) <= 2 && abs(px[1] - 191) <= 2, "drew %d %d, want 64 191", px[0], px[1]);
+
+    glDeleteProgram(vp);
+    glDeleteProgram(fp);
+}
+
 // gl_PointCoord's t runs from the point's top under the default upper-left
 // origin, and from its bottom under lower-left
 GPU_TEST(misc_core, point_coord_follows_the_sprite_origin)
@@ -1412,4 +1475,520 @@ GPU_TEST(misc_core, point_coord_follows_the_sprite_origin)
     glDeleteVertexArrays(1, &vao);
     glDeleteProgram(prog);
     mgl_target_destroy(&target);
+}
+
+GPU_TEST(misc_core, an_unset_variable_reads_zero)
+{
+    // z is never written, as some shipped shaders do; drivers give it zero
+    static const char *VS =
+        "#version 330 core\n"
+        "layout(location = 0) in vec2 pos;\n"
+        "void main() { vec4 p; p.w = 1.0; p.xy = pos; gl_Position = p; }\n";
+    static const char *FS =
+        "#version 330 core\n"
+        "out vec4 c;\n"
+        "void main() { c = vec4(1.0, 0.0, 0.0, 1.0); }\n";
+    MGLTestTarget t;
+    char log[1024] = { 0 };
+    unsigned char *px, c[4] = { 0 };
+    GLuint vbo = 0, vao, prog = mgl_build_program(VS, FS, log, sizeof log);
+
+    CHECK_MSG(prog != 0, "link: %s", log);
+    if (!prog) return;
+
+    mgl_target_create(&t, 4, 4, GL_RGBA8, 0);
+    mgl_target_bind(&t);
+    glViewport(0, 0, 4, 4);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glUseProgram(prog);
+    vao = mgl_fullscreen_quad(&vbo);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+
+    px = mgl_read_rgba8(&t);
+    if (px)
+        mgl_pixel_at(px, &t, 2, 2, c);
+    free(px);
+    CHECK_MSG(c[0] == 255, "reads %d %d %d", c[0], c[1], c[2]);
+
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo);
+    glDeleteProgram(prog);
+    mgl_target_destroy(&t);
+}
+
+GPU_TEST(misc_core, active_attributes_are_vertex_inputs_only)
+{
+    static const char *VS =
+        "#version 330 core\n"
+        "in vec4 a_0;\n"
+        "out vec4 v_color;\n"
+        "void main() { v_color = a_0; gl_Position = a_0; }\n";
+    static const char *FS =
+        "#version 330 core\n"
+        "in vec4 v_color;\n"
+        "out vec4 color;\n"
+        "void main() { color = v_color; }\n";
+    char log[1024] = "";
+    GLuint prog = mgl_build_program(VS, FS, log, sizeof log);
+    GLint count = -1, longest = -1;
+
+    CHECK_MSG(prog != 0, "program did not build: %s", log);
+    if (!prog)
+        return;
+
+    glGetProgramiv(prog, GL_ACTIVE_ATTRIBUTES, &count);
+    glGetProgramiv(prog, GL_ACTIVE_ATTRIBUTE_MAX_LENGTH, &longest);
+    CHECK_EQ_INT(count, 1);
+    CHECK_EQ_INT(longest, 4);
+
+    glDeleteProgram(prog);
+}
+
+GPU_TEST(misc_core, get_reads_caps_hints_and_scaled_values)
+{
+    GLboolean b = GL_FALSE;
+    GLint i[4] = { 0 }, hint = 0;
+    GLint64 v[4] = { -1, -1, -1, -1 };
+
+    // capabilities read back through glGet too
+    glEnable(GL_BLEND);
+    glGetBooleanv(GL_BLEND, &b);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+    CHECK(b == GL_TRUE);
+    glDisable(GL_BLEND);
+
+    // every value of a multi-value query arrives as 64 bits
+    glViewport(1, 2, 3, 4);
+    glGetInteger64v(GL_VIEWPORT, v);
+    CHECK_MSG(v[0] == 1 && v[1] == 2 && v[2] == 3 && v[3] == 4, "viewport %lld %lld %lld %lld",
+              (long long)v[0], (long long)v[1], (long long)v[2], (long long)v[3]);
+
+    // colours and depths read as integers span the integer range, and the clear depth is clamped
+    glClearDepth(2.0);
+    glGetIntegerv(GL_DEPTH_CLEAR_VALUE, i);
+    CHECK_EQ_INT(i[0], 0x7fffffff);
+    glClearDepth(1.0);
+
+    glHint(GL_FRAGMENT_SHADER_DERIVATIVE_HINT, GL_NICEST);
+    glGetIntegerv(GL_FRAGMENT_SHADER_DERIVATIVE_HINT, &hint);
+    CHECK_EQ_INT(hint, GL_NICEST);
+    glHint(GL_FRAGMENT_SHADER_DERIVATIVE_HINT, GL_DONT_CARE);
+    glHint(GL_FRAGMENT_SHADER_DERIVATIVE_HINT, GL_RED);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_INVALID_ENUM);
+}
+
+GPU_TEST(misc_core, deep_3d_textures_and_copy_limits)
+{
+    static GLubyte texels[4 * 4 * 2 * 8];
+    GLuint tex;
+    GLint most = 0;
+
+    // a 3D texture deeper than it is wide has levels down to 1x1x1
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_3D, tex);
+    glTexImage3D(GL_TEXTURE_3D, 0, GL_RGBA8, 2, 2, 8, 0, GL_RGBA, GL_UNSIGNED_BYTE, texels);
+    glTexImage3D(GL_TEXTURE_3D, 3, GL_RGBA8, 1, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, texels);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+    glDeleteTextures(1, &tex);
+
+    // a copy bigger than any texture
+    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &most);
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 0, 0, most + 1, 1, 0);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_INVALID_VALUE);
+    glDeleteTextures(1, &tex);
+}
+
+GPU_TEST(misc_core, state_queries_read_the_bound_objects)
+{
+    static const char *src = "#version 330 core\nvoid main() { gl_Position = vec4(0.0); }\n";
+    GLuint buf, vao, sh = glCreateShader(GL_VERTEX_SHADER), tex;
+    GLint v = -1;
+    GLfloat f = 0;
+    GLboolean b = GL_FALSE;
+
+    glGenBuffers(1, &buf);
+    glBindBuffer(GL_ARRAY_BUFFER, buf);
+    glGetBooleanv(GL_ARRAY_BUFFER_BINDING, &b);
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &v);
+    CHECK(b == GL_TRUE);
+    CHECK_EQ_INT(v, (GLint)buf);
+
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &v);
+    CHECK_EQ_INT(v, (GLint)vao);
+    glBindVertexArray(0);
+
+    glGetFloatv(GL_MIN_PROGRAM_TEXEL_OFFSET, &f);
+    CHECK_MSG(f <= -8.0f, "min texel offset %f", f);
+
+    // a shader never compiled has not compiled, and its length counts the null
+    glGetShaderiv(sh, GL_COMPILE_STATUS, &v);
+    CHECK_EQ_INT(v, GL_FALSE);
+    glShaderSource(sh, 1, &src, NULL);
+    glGetShaderiv(sh, GL_SHADER_SOURCE_LENGTH, &v);
+    CHECK_EQ_INT(v, (GLint)strlen(src) + 1);
+
+    // float parameters round to the nearest integer
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_LOD, -74.6f);
+    glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MIN_LOD, &v);
+    CHECK_EQ_INT(v, -75);
+    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 2.7f);
+    glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, &v);
+    CHECK_EQ_INT(v, 3);
+
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glDeleteBuffers(1, &buf);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteShader(sh);
+    glDeleteTextures(1, &tex);
+}
+
+GPU_TEST(misc_core, debug_log_state_queries)
+{
+    GLint n = -1, len = -1, depth = -1;
+
+    glEnable(GL_DEBUG_OUTPUT);
+    glDebugMessageInsert(GL_DEBUG_SOURCE_APPLICATION, GL_DEBUG_TYPE_MARKER, 1, GL_DEBUG_SEVERITY_NOTIFICATION, -1, "hello");
+    glGetIntegerv(GL_DEBUG_LOGGED_MESSAGES, &n);
+    glGetIntegerv(GL_DEBUG_NEXT_LOGGED_MESSAGE_LENGTH, &len);
+    glGetIntegerv(GL_DEBUG_GROUP_STACK_DEPTH, &depth);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+    CHECK(n >= 1);
+    CHECK_EQ_INT(len, 6);
+    CHECK_EQ_INT(depth, 1);
+
+    // empty the log again
+    while (glGetDebugMessageLog(16, 0, NULL, NULL, NULL, NULL, NULL, NULL) > 0)
+        ;
+    glDisable(GL_DEBUG_OUTPUT);
+}
+
+// with no buffer, glGetObjectLabel gives the label's whole length
+GPU_TEST(misc_core, object_label_length_can_be_asked_alone)
+{
+    GLuint buf;
+    GLsizei len = -1;
+
+    glGenBuffers(1, &buf);
+    glBindBuffer(GL_ARRAY_BUFFER, buf);
+    glObjectLabel(GL_BUFFER, buf, -1, "a label");
+    glGetObjectLabel(GL_BUFFER, buf, 0, &len, NULL);
+    CHECK_EQ_UINT(glGetError(), GL_NO_ERROR);
+    CHECK_EQ_INT(len, 7);
+
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glDeleteBuffers(1, &buf);
+}
+
+// glGetInternalformativ writes only the values the query has
+GPU_TEST(misc_core, internalformat_query_leaves_the_rest_of_the_buffer)
+{
+    GLint v[3] = { -7, -7, -7 };
+
+    glGetInternalformativ(GL_RENDERBUFFER, GL_RGBA8, GL_NUM_SAMPLE_COUNTS, 3, v);
+    CHECK_EQ_INT(v[0], 1);
+    CHECK_EQ_INT(v[1], -7);
+    CHECK_EQ_INT(v[2], -7);
+}
+
+// a member named like a bool member of another struct keeps its own type
+GPU_TEST(misc_core, struct_member_type_comes_from_its_own_struct)
+{
+    static const char *VS =
+        "#version 330 core\n"
+        "struct A { uvec2 d; };\n"
+        "uniform A a;\n"
+        "struct B { bvec3 d; };\n"
+        "uniform B b;\n"
+        "void main() { gl_Position = vec4(float(a.d.x) + (b.d.x ? 1.0 : 0.0)); }\n";
+    static const char *FS = "#version 330 core\nout vec4 o;\nvoid main() { o = vec4(1.0); }\n";
+    static const GLuint u[2] = { 1, 2 };
+    char log[1024] = { 0 };
+    GLuint p = mgl_build_program(VS, FS, log, sizeof log);
+    GLint type = 0, size = 0;
+    GLenum t = 0;
+    char name[32];
+
+    CHECK_MSG(p != 0, "%s", log);
+    if (!p)
+        return;
+
+    glUseProgram(p);
+    mgl_drain_errors();
+    glUniform2uiv(glGetUniformLocation(p, "a.d"), 1, u);
+    CHECK_EQ_UINT(glGetError(), GL_NO_ERROR);
+
+    for (GLint i = 0; i < 2; i++)
+    {
+        glGetActiveUniform(p, (GLuint)i, sizeof name, NULL, &size, &t, name);
+        if (!strcmp(name, "a.d"))
+            type = (GLint)t;
+    }
+    CHECK_EQ_INT(type, GL_UNSIGNED_INT_VEC2);
+
+    glUseProgram(0);
+    glDeleteProgram(p);
+}
+
+// a viewport larger than GL_MAX_VIEWPORT_DIMS is clamped to it
+GPU_TEST(misc_core, viewport_size_is_clamped_to_the_maximum)
+{
+    GLint most[2] = { 0, 0 }, vp[4] = { 0, 0, 0, 0 }, was[4];
+
+    glGetIntegerv(GL_VIEWPORT, was);
+    glGetIntegerv(GL_MAX_VIEWPORT_DIMS, most);
+    glViewport(0, 0, most[0] * 2, most[1] * 2);
+    glGetIntegerv(GL_VIEWPORT, vp);
+    CHECK_EQ_INT(vp[2], most[0]);
+    CHECK_EQ_INT(vp[3], most[1]);
+    glViewport(was[0], was[1], was[2], was[3]);
+}
+
+// a compute program over its block, shared memory or work group limits does not link
+GPU_TEST(misc_core, compute_programs_over_their_limits_do_not_link)
+{
+    GLint blocks = 0, shared = 0;
+    char src[1024], log[1024];
+
+    glGetIntegerv(GL_MAX_COMPUTE_UNIFORM_BLOCKS, &blocks);
+    glGetIntegerv(GL_MAX_COMPUTE_SHARED_MEMORY_SIZE, &shared);
+
+    snprintf(src, sizeof src,
+             "#version 450 core\nlayout(local_size_x = 1) in;\n"
+             "layout(std140, binding = 0) uniform B { vec4 v; } b[%d];\n"
+             "layout(std430, binding = 0) buffer O { vec4 o; };\n"
+             "void main() { o = b[0].v; }\n", blocks + 1);
+    CHECK(mgl_build_compute_program(src, log, sizeof log) == 0);
+
+    snprintf(src, sizeof src,
+             "#version 450 core\nlayout(local_size_x = 1) in;\n"
+             "shared uint s[%d];\n"
+             "layout(std430, binding = 0) buffer O { uint o; };\n"
+             "void main() { s[0] = 1u; barrier(); o = s[%d]; }\n", shared / 4 + 1, shared / 4);
+    CHECK(mgl_build_compute_program(src, log, sizeof log) == 0);
+
+    snprintf(src, sizeof src,
+             "#version 450 core\nlayout(local_size_x = 1024, local_size_y = 1024) in;\nvoid main() {}\n");
+    CHECK(mgl_build_compute_program(src, log, sizeof log) == 0);
+
+    // right at the limits still links
+    snprintf(src, sizeof src,
+             "#version 450 core\nlayout(local_size_x = 1) in;\n"
+             "shared uint s[%d];\n"
+             "layout(std430, binding = 0) buffer O { uint o; };\n"
+             "void main() { s[0] = 1u; barrier(); o = s[%d]; }\n", shared / 4, shared / 4 - 1);
+    GLuint ok = mgl_build_compute_program(src, log, sizeof log);
+    CHECK_MSG(ok != 0, "%s", log);
+    glDeleteProgram(ok);
+    mgl_drain_errors();
+}
+
+static const char *QUAD_VS =
+    "#version 330 core\n"
+    "layout(location = 0) in vec2 pos;\n"
+    "layout(location = 1) in float shade;\n"
+    "out float v;\n"
+    "void main() { gl_Position = vec4(pos, 0.0, 1.0); v = shade; }\n";
+static const char *SHADE_FS = "#version 330 core\nin float v;\nout vec4 o;\nvoid main() { o = vec4(v, 0.0, 0.0, 1.0); }\n";
+
+static void centrePixel(MGLTestTarget *t, unsigned char out[4])
+{
+    unsigned char *px = mgl_read_rgba8(t);
+
+    memset(out, 0, 4);
+    if (px)
+        mgl_pixel_at(px, t, t->width / 2, t->height / 2, out);
+    free(px);
+}
+
+// GL clamps the stencil reference to what the stencil bits hold
+GPU_TEST(misc_core, stencil_reference_is_clamped)
+{
+    MGLTestTarget t;
+    char log[1024] = { 0 };
+    GLuint prog = mgl_build_program(QUAD_VS, SHADE_FS, log, sizeof log), vbo = 0, vao;
+    unsigned char c[4];
+
+    if (!prog || !mgl_target_create(&t, 8, 8, GL_RGBA8, 1)) { CHECK_MSG(0, "%s", log); return; }
+
+    mgl_target_bind(&t);
+    glClearColor(0, 0, 0, 1);
+    glClearStencil(0);
+    glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+    glEnable(GL_STENCIL_TEST);
+    glStencilFunc(GL_EQUAL, -1, 0xFF);
+    glUseProgram(prog);
+    vao = mgl_fullscreen_quad(&vbo);
+    glVertexAttrib1f(1, 1.0f);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glDisable(GL_STENCIL_TEST);
+    centrePixel(&t, c);
+    CHECK_MSG(c[0] == 255, "drew %d, want 255", c[0]);
+
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo);
+    glUseProgram(0);
+    glDeleteProgram(prog);
+    mgl_target_destroy(&t);
+}
+
+// a texture deleted while attached to a framebuffer that is not bound stays attached
+GPU_TEST(misc_core, deleted_texture_stays_attached_to_an_unbound_framebuffer)
+{
+    GLuint tex, fbo;
+    GLubyte px[4] = { 0 };
+
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 4, 4, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteTextures(1, &tex);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    CHECK_EQ_UINT(glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE);
+    glViewport(0, 0, 4, 4);
+    glClearColor(1, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glReadPixels(1, 1, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    CHECK_EQ_UINT(glGetError(), GL_NO_ERROR);
+    CHECK_MSG(px[0] == 255, "read %d, want 255", px[0]);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &fbo);
+}
+
+// the scissor test limits what a blit writes
+GPU_TEST(misc_core, blit_honours_the_scissor)
+{
+    MGLTestTarget a, b;
+    unsigned char *px;
+    unsigned char in[4] = { 0 }, out[4] = { 0 };
+
+    if (!mgl_target_create(&a, 8, 8, GL_RGBA8, 0) || !mgl_target_create(&b, 8, 8, GL_RGBA8, 0)) { CHECK(0); return; }
+
+    mgl_target_bind(&a);
+    glClearColor(1, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    mgl_target_bind(&b);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, a.fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, b.fbo);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, 0, 4, 4);
+    // a scaled blit, which is drawn rather than copied
+    glBlitFramebuffer(0, 0, 4, 4, 0, 0, 8, 8, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glDisable(GL_SCISSOR_TEST);
+
+    px = mgl_read_rgba8(&b);
+    if (px)
+    {
+        mgl_pixel_at(px, &b, 1, 1, in);
+        mgl_pixel_at(px, &b, 6, 6, out);
+    }
+    free(px);
+    CHECK_MSG(in[0] == 255 && out[0] == 0, "inside %d, outside %d", in[0], out[0]);
+
+    mgl_target_destroy(&a);
+    mgl_target_destroy(&b);
+}
+
+// float depth is clamped to [0, 1] as it is uploaded
+GPU_TEST(misc_core, float_depth_uploads_are_clamped)
+{
+    static const GLfloat in[4] = { -0.5f, 0.25f, 1.5f, 1.0f };
+    GLfloat got[4] = { 9, 9, 9, 9 };
+    GLuint tex;
+
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT32F, 2, 2, 0, GL_DEPTH_COMPONENT, GL_FLOAT, in);
+    glGetTexImage(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT, GL_FLOAT, got);
+    CHECK_EQ_UINT(glGetError(), GL_NO_ERROR);
+    CHECK_MSG(got[0] == 0.0f && got[1] == 0.25f && got[2] == 1.0f, "got %g %g %g", got[0], got[1], got[2]);
+
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glDeleteTextures(1, &tex);
+}
+
+// GL takes floor(source position of the pixel centre) for a nearest blit.
+// At 54 texels onto 81 pixels some centres land exactly on texel edges.
+GPU_TEST(misc_core, nearest_blit_picks_the_texel_gl_names)
+{
+    GLuint tex[2], fbo[2];
+    GLubyte in[80 * 4], out[100 * 4] = { 0 };
+    int wrong = 0, first = -1;
+
+    for (int i = 0; i < 80; i++)
+    {
+        in[i * 4 + 0] = (GLubyte)(i * 3);
+        in[i * 4 + 1] = 0;
+        in[i * 4 + 2] = 0;
+        in[i * 4 + 3] = 255;
+    }
+
+    glGenTextures(2, tex);
+    glGenFramebuffers(2, fbo);
+    glBindTexture(GL_TEXTURE_2D, tex[0]);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 80, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, in);
+    glBindTexture(GL_TEXTURE_2D, tex[1]);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 100, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo[0]);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex[0], 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo[1]);
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex[1], 0);
+
+    glBlitFramebuffer(20, 0, 74, 1, 10, 0, 91, 1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo[1]);
+    glReadPixels(0, 0, 100, 1, GL_RGBA, GL_UNSIGNED_BYTE, out);
+    CHECK_EQ_UINT(glGetError(), GL_NO_ERROR);
+
+    for (int x = 10; x < 91; x++)
+    {
+        int want = 20 + (int)((x - 10 + 0.5) * 54.0 / 81.0);
+
+        if (out[x * 4] != want * 3)
+        {
+            wrong++;
+            if (first < 0)
+                first = x;
+        }
+    }
+    CHECK_MSG(wrong == 0, "%d pixels wrong, first at %d", wrong, first);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(2, fbo);
+    glDeleteTextures(2, tex);
+}
+
+// a vertex shader whose inputs need more locations than GL_MAX_VERTEX_ATTRIBS does not link
+GPU_TEST(misc_core, too_many_vertex_inputs_do_not_link)
+{
+    char vs[4096], log[1024];
+    GLint most = 0;
+    int at;
+
+    glGetIntegerv(GL_MAX_VERTEX_ATTRIBS, &most);
+    at = snprintf(vs, sizeof vs, "#version 330 core\n");
+    for (int i = 0; i <= most; i++)
+        at += snprintf(vs + at, sizeof vs - (size_t)at, "in vec4 a%d;\n", i);
+    at += snprintf(vs + at, sizeof vs - (size_t)at, "void main() { gl_Position = vec4(0.0)");
+    for (int i = 0; i <= most; i++)
+        at += snprintf(vs + at, sizeof vs - (size_t)at, " + a%d", i);
+    snprintf(vs + at, sizeof vs - (size_t)at, "; }\n");
+
+    GLuint p = mgl_build_program(vs, "#version 330 core\nout vec4 o;\nvoid main() { o = vec4(1.0); }\n", log, sizeof log);
+    CHECK_EQ_UINT(p, 0u);
+    glDeleteProgram(p);
+    mgl_drain_errors();
 }

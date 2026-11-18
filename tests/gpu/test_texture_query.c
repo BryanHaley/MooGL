@@ -271,8 +271,13 @@ GPU_TEST(texture_query, level_parameter_rejects_bad_arguments)
     glBindTexture(GL_TEXTURE_2D, tex);
     glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 8, 8);
 
-    /* Level out of range */
+    /* A level the texture does not have reads as an empty one; only one past
+       the largest any texture could have is an error */
+    iv = -1;
     glGetTexLevelParameteriv(GL_TEXTURE_2D, 5, GL_TEXTURE_WIDTH, &iv);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+    CHECK_EQ_INT(iv, 0);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 20, GL_TEXTURE_WIDTH, &iv);
     CHECK_EQ_UINT(mgl_drain_errors(), GL_INVALID_VALUE);
 
     /* Negative level */
@@ -759,5 +764,55 @@ GPU_TEST(texture_query, proxy_textures_report_what_would_fit)
     CHECK_EQ_UINT(glGetError(), GL_NO_ERROR);
     CHECK_EQ_INT(w, 16);
 
+    glDeleteTextures(1, &tex);
+}
+
+// a cube face's level size is that face's, even when the other faces have none
+GPU_TEST(texture_query, level_parameter_reads_the_cube_face_asked_for)
+{
+    GLuint tex;
+    GLint w = -1;
+
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, tex);
+    glTexImage2D(GL_TEXTURE_CUBE_MAP_NEGATIVE_Y, 0, GL_RGBA8, 16, 16, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+
+    glGetTexLevelParameteriv(GL_TEXTURE_CUBE_MAP_NEGATIVE_Y, 0, GL_TEXTURE_WIDTH, &w);
+    CHECK_EQ_INT(w, 16);
+    glGetTexLevelParameteriv(GL_TEXTURE_CUBE_MAP_POSITIVE_X, 0, GL_TEXTURE_WIDTH, &w);
+    CHECK_EQ_INT(w, 0);
+    CHECK_EQ_UINT(glGetError(), GL_NO_ERROR);
+
+    glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
+    glDeleteTextures(1, &tex);
+}
+
+// levels may come in any order; the ones given before the base image keep
+// their contents once it arrives
+GPU_TEST(texture_query, levels_given_before_the_base_are_kept)
+{
+    static const GLubyte one[4] = { 10, 20, 30, 255 }, two[2 * 4] = { 40, 50, 60, 255, 40, 50, 60, 255 };
+    GLubyte got[2 * 4] = { 0 };
+    GLuint tex;
+    GLint w = 0;
+
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    // a 4x1 texture, given from its smallest level up
+    glTexImage2D(GL_TEXTURE_2D, 2, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, one);
+    glTexImage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 2, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, two);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 4, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    CHECK_EQ_UINT(glGetError(), GL_NO_ERROR);
+
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 1, GL_TEXTURE_WIDTH, &w);
+    CHECK_EQ_INT(w, 2);
+    glGetTexImage(GL_TEXTURE_2D, 1, GL_RGBA, GL_UNSIGNED_BYTE, got);
+    CHECK_MSG(got[0] == 40 && got[6] == 60, "level 1 holds %d %d", got[0], got[6]);
+    glGetTexImage(GL_TEXTURE_2D, 2, GL_RGBA, GL_UNSIGNED_BYTE, got);
+    CHECK_MSG(got[0] == 10 && got[2] == 30, "level 2 holds %d %d", got[0], got[2]);
+
+    glBindTexture(GL_TEXTURE_2D, 0);
     glDeleteTextures(1, &tex);
 }

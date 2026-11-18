@@ -277,6 +277,79 @@ GPU_TEST(transform_feedback, block_members_and_array_elements_by_name)
     mgl_target_destroy(&t);
 }
 
+// an array named without an index is recorded whole, element after element
+GPU_TEST(transform_feedback, a_whole_array_is_recorded)
+{
+    static const GLfloat pts[2] = { 0.0f, 0.0f };
+    static const char *vs =
+        "#version 430\n"
+        "layout(location = 0) in vec2 p;\n"
+        "out vec2 arr[3];\n"
+        "flat out uint u;\n"
+        "void main() {\n"
+        "  for (int i = 0; i < 3; i++) arr[i] = vec2(float(i), float(10 + i));\n"
+        "  u = 7u;\n"
+        "  gl_Position = vec4(p, 0.0, 1.0);\n"
+        "}\n";
+    static const char *fs =
+        "#version 430\n"
+        "in vec2 arr[3];\n"
+        "flat in uint u;\n"
+        "out vec4 o;\n"
+        "void main() { o = vec4(arr[0], arr[2]) + float(u); }\n";
+    static const char *varyings[] = { "arr", "u" };
+    static const GLfloat want[6] = { 0, 10, 1, 11, 2, 12 };
+    MGLTestTarget t;
+    GLuint prog, vao, vbo, tf;
+    GLfloat got[7];
+    char log[2048];
+
+    prog = linkRecording(vs, fs, varyings, 2, GL_INTERLEAVED_ATTRIBS, log, sizeof log);
+    CHECK_MSG(prog != 0, "whole array feedback did not link: %s", log);
+
+    if (!prog || !mgl_target_create(&t, 16, 16, GL_RGBA8, 0))
+        return;
+
+    mgl_target_bind(&t);
+    glUseProgram(prog);
+
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    glGenBuffers(1, &vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof pts, pts, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
+    glEnableVertexAttribArray(0);
+
+    tf = recordingBuffer(0, 256);
+    glViewport(0, 0, 16, 16);
+
+    glBeginTransformFeedback(GL_POINTS);
+    glDrawArrays(GL_POINTS, 0, 1);
+    glEndTransformFeedback();
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+
+    memset(got, 0, sizeof got);
+    glGetBufferSubData(GL_TRANSFORM_FEEDBACK_BUFFER, 0, sizeof got, got);
+
+    for (int i = 0; i < 6; i++)
+        CHECK_MSG(got[i] == want[i], "word %d captured %g, want %g", i, got[i], want[i]);
+
+    {
+        GLuint bits;
+
+        memcpy(&bits, &got[6], 4);
+        CHECK_EQ_UINT(bits, 7);
+    }
+
+    glUseProgram(0);
+    glDeleteProgram(prog);
+    glDeleteBuffers(1, &tf);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo);
+    mgl_target_destroy(&t);
+}
+
 // GL records an instanced draw one instance after another. The capture
 // placed each vertex by its vertex id alone, so every instance wrote over
 // the first, and the instanced and base-vertex draws set up no capture at all.

@@ -15,7 +15,8 @@
  * limitations under the License.
  *
  * SDL_Renderer's opengl backend on MooGL: a compatibility context drawing
- * with client arrays, the matrix stacks and render-target textures.
+ * with client arrays, the matrix stacks and render-target textures. With
+ * opengles2 as its argument, the same on an ES context.
  */
 
 #include <SDL2/SDL.h>
@@ -43,20 +44,21 @@ static int pixelIs(SDL_Renderer *r, int x, int y, int red, int green, int blue)
     return near(px[0], red) && near(px[1], green) && near(px[2], blue);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    const char *driver = argc > 1 ? argv[1] : "opengl";
     SDL_RendererInfo info;
 
     if (SDL_Init(SDL_INIT_VIDEO) != 0)
         return 77;
 
-    SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengl");
+    SDL_SetHint(SDL_HINT_RENDER_DRIVER, driver);
 
     SDL_Window *window = SDL_CreateWindow("MooGL SDL renderer test", SDL_WINDOWPOS_UNDEFINED,
                                           SDL_WINDOWPOS_UNDEFINED, 64, 64, SDL_WINDOW_HIDDEN);
     SDL_Renderer *r = window ? SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED) : NULL;
 
-    check(r != NULL, "SDL makes an opengl renderer");
+    check(r != NULL, "SDL makes the renderer");
     if (r == NULL)
     {
         printf("  %s\nFAILED\n", SDL_GetError());
@@ -64,7 +66,7 @@ int main(void)
     }
 
     SDL_GetRendererInfo(r, &info);
-    check(strcmp(info.name, "opengl") == 0, "and it is the opengl one, not Metal");
+    check(strcmp(info.name, driver) == 0, "and it is the one asked for, not Metal");
     check((info.flags & SDL_RENDERER_TARGETTEXTURE) != 0, "it can render to a texture");
 
     // a fill and a rectangle

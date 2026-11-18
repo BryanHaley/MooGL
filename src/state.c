@@ -244,13 +244,18 @@ void mglFrontFace(GLMContext ctx, GLenum mode)
 #define HINT(_target_) ctx->state.hints._target_ = mode; break;
 void mglHint(GLMContext ctx, GLenum target, GLenum mode)
 {
+    ERROR_CHECK_RETURN(mode == GL_FASTEST || mode == GL_NICEST || mode == GL_DONT_CARE, GL_INVALID_ENUM);
+
     switch(target)
     {
         case GL_LINE_SMOOTH_HINT: HINT(line_smooth_hint);
-        case GL_POLYGON_SMOOTH_HINT: HINT(polygon_smooth_hint)
+        case GL_POLYGON_SMOOTH_HINT: HINT(polygon_smooth_hint);
         case GL_TEXTURE_COMPRESSION_HINT: HINT(texture_compression_hint);
         case GL_FRAGMENT_SHADER_DERIVATIVE_HINT: HINT(fragment_shader_derivative_hint);
-            break;
+        // gone from the core profile
+        case GL_GENERATE_MIPMAP_HINT:
+            ERROR_CHECK_RETURN(ctx->compat, GL_INVALID_ENUM);
+            HINT(generate_mipmap_hint);
 
         default:
             ERROR_RETURN(GL_INVALID_ENUM);
@@ -597,6 +602,14 @@ void mglDepthRange(GLMContext ctx, GLdouble n, GLdouble f)
     ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
 }
 
+// GL clamps a viewport's size to GL_MAX_VIEWPORT_DIMS
+static GLfloat viewportSize(GLMContext ctx, GLfloat v)
+{
+    GLfloat most = (GLfloat)(ctx->state.var.max_viewport_dims ? ctx->state.var.max_viewport_dims : 16384);
+
+    return v > most ? most : v;
+}
+
 void mglViewport(GLMContext ctx, GLint x, GLint y, GLsizei width, GLsizei height)
 {
     // only a negative size is an error; zero is legal and the CTS uses it
@@ -608,22 +621,23 @@ void mglViewport(GLMContext ctx, GLint x, GLint y, GLsizei width, GLsizei height
     {
         ctx->state.viewport[i].x = (GLfloat)x;
         ctx->state.viewport[i].y = (GLfloat)y;
-        ctx->state.viewport[i].w = (GLfloat)width;
-        ctx->state.viewport[i].h = (GLfloat)height;
+        ctx->state.viewport[i].w = viewportSize(ctx, (GLfloat)width);
+        ctx->state.viewport[i].h = viewportSize(ctx, (GLfloat)height);
     }
 
     ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
 }
 
 #define RET_VAR(_VAR_, _DEFAULT_)  return (ctx->state.var._VAR_ == _DEFAULT_)
-#define RET_CAP(_CAP_)  return ctx->state.caps._CAP_
+#define RET_CAP(_CAP_)  return ctx->state.caps._CAP_ ? 1 : 0
 
-GLboolean mglIsEnabled(GLMContext ctx, GLenum cap)
+// 1 or 0 for a capability, -1 for something that is not one
+int mglCapState(GLMContext ctx, GLenum cap)
 {
     GLuint cd;
 
     if (clipDistanceCap(ctx, cap, &cd))
-        return ctx->state.caps.clip_distances[cd] ? GL_TRUE : GL_FALSE;
+        return ctx->state.caps.clip_distances[cd] ? 1 : 0;
 
     switch(cap)
     {
@@ -657,12 +671,17 @@ GLboolean mglIsEnabled(GLMContext ctx, GLenum cap)
         case GL_SCISSOR_TEST: RET_CAP(scissor_test);
         case GL_STENCIL_TEST: RET_CAP(stencil_test);
         case GL_TEXTURE_CUBE_MAP_SEAMLESS: RET_CAP(texture_cube_map_seamless);
-
-        default:
-            ERROR_RETURN_VALUE(GL_INVALID_ENUM, GL_FALSE);
     }
 
-    return false;
+    return -1;
+}
+
+GLboolean mglIsEnabled(GLMContext ctx, GLenum cap)
+{
+    int on = mglCapState(ctx, cap);
+
+    ERROR_CHECK_RETURN_VALUE(on >= 0, GL_INVALID_ENUM, GL_FALSE);
+    return on ? GL_TRUE : GL_FALSE;
 }
 
 // GL 4.6 table 17.2: BLEND and SCISSOR_TEST are the capabilities that take an
@@ -757,7 +776,7 @@ GLboolean mglIsEnabledi(GLMContext ctx, GLenum target, GLuint index)
 
 void mglClearDepthf(GLMContext ctx, GLfloat d)
 {
-    ctx->state.var.depth_clear_value = d;
+    ctx->state.var.depth_clear_value = d < 0.0f ? 0.0f : d > 1.0f ? 1.0f : d;
 }
 
 void mglBlendColor(GLMContext ctx, GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha)
@@ -1108,8 +1127,8 @@ void mglViewportArrayv(GLMContext ctx, GLuint first, GLsizei count, const GLfloa
     {
         ctx->state.viewport[first + i].x = v[i * 4 + 0];
         ctx->state.viewport[first + i].y = v[i * 4 + 1];
-        ctx->state.viewport[first + i].w = v[i * 4 + 2];
-        ctx->state.viewport[first + i].h = v[i * 4 + 3];
+        ctx->state.viewport[first + i].w = viewportSize(ctx, v[i * 4 + 2]);
+        ctx->state.viewport[first + i].h = viewportSize(ctx, v[i * 4 + 3]);
     }
 
     ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
@@ -1122,8 +1141,8 @@ void mglViewportIndexedf(GLMContext ctx, GLuint index, GLfloat x, GLfloat y, GLf
 
     ctx->state.viewport[index].x = x;
     ctx->state.viewport[index].y = y;
-    ctx->state.viewport[index].w = w;
-    ctx->state.viewport[index].h = h;
+    ctx->state.viewport[index].w = viewportSize(ctx, w);
+    ctx->state.viewport[index].h = viewportSize(ctx, h);
 
     ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
 }

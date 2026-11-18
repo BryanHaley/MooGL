@@ -92,6 +92,9 @@ static GLuint getNewNameUnlocked(HashTable *table)
     if (table->current_name == 0)
         table->current_name = 1;
 
+    while (table->current_name < table->size && table->keys[table->current_name].data != NULL)
+        table->current_name++;
+
     return table->current_name++;
 }
 
@@ -109,7 +112,8 @@ static bool isFreeNameUnlocked(HashTable *table, GLuint name)
 // list is harmless -- the name is simply never reused.
 static void releaseName(HashTable *table, GLuint name)
 {
-    if (name == 0)
+    // a name bound back to life after its delete is still listed
+    if (name == 0 || isFreeNameUnlocked(table, name))
         return;
 
     if (table->free_count == table->free_capacity)

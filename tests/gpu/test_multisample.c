@@ -809,3 +809,138 @@ GPU_TEST(multisample, sample_shading_gives_each_sample_its_own_value)
     CHECK_MSG(on == 4, "with sample shading %d distinct values in a pixel, want 4", on);
     CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
 }
+
+// GL 4.6 9.4.2: textures agree on fixed sample locations, and beside a
+// renderbuffer every texture has them
+GPU_TEST(multisample, fixed_sample_locations_must_agree)
+{
+    GLuint tex[2], rbo, fbo;
+    GLint fixed = -1;
+
+    glGenTextures(2, tex);
+    glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, tex[0]);
+    glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 4, GL_RGBA8, 8, 8, GL_FALSE);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D_MULTISAMPLE, 0, GL_TEXTURE_FIXED_SAMPLE_LOCATIONS, &fixed);
+    CHECK_EQ_INT(fixed, GL_FALSE);
+
+    glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, tex[1]);
+    glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 4, GL_RGBA8, 8, 8, GL_TRUE);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D_MULTISAMPLE, 0, GL_TEXTURE_FIXED_SAMPLE_LOCATIONS, &fixed);
+    CHECK_EQ_INT(fixed, GL_TRUE);
+
+    glGenRenderbuffers(1, &rbo);
+    glBindRenderbuffer(GL_RENDERBUFFER, rbo);
+    glRenderbufferStorageMultisample(GL_RENDERBUFFER, 4, GL_RGBA8, 8, 8);
+
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D_MULTISAMPLE, tex[0], 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D_MULTISAMPLE, tex[1], 0);
+    CHECK_EQ_UINT(glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_INCOMPLETE_MULTISAMPLE);
+
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D_MULTISAMPLE, 0, 0);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_RENDERBUFFER, rbo);
+    CHECK_EQ_UINT(glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_INCOMPLETE_MULTISAMPLE);
+
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D_MULTISAMPLE, tex[1], 0);
+    CHECK_EQ_UINT(glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &fbo);
+    glDeleteRenderbuffers(1, &rbo);
+    glDeleteTextures(2, tex);
+    mgl_drain_errors();
+}
+
+GPU_TEST(multisample, sample_state_queries)
+{
+    MGLTestTarget t;
+    GLboolean on = GL_TRUE;
+    GLint mask = 0;
+    GLfloat pos[2];
+    GLuint tex;
+
+    mgl_drain_errors();
+    glGetBooleanv(GL_SAMPLE_MASK, &on);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+    CHECK_EQ_INT(on, GL_FALSE);
+
+    glSampleMaski(0, 0xFFFFFFFFu);
+    glGetIntegeri_v(GL_SAMPLE_MASK_VALUE, 0, &mask);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+    CHECK_EQ_INT(mask, -1);
+    glGetIntegeri_v(GL_SAMPLE_MASK_VALUE, 1, &mask);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_INVALID_VALUE);
+
+    // GL_SAMPLES is 0 here, so there is no sample 0 to ask about
+    if (mgl_target_create(&t, 8, 8, GL_RGBA8, 0))
+    {
+        mgl_target_bind(&t);
+        glGetMultisamplefv(GL_SAMPLE_POSITION, 0, pos);
+        CHECK_EQ_UINT(mgl_drain_errors(), GL_INVALID_VALUE);
+        mgl_target_destroy(&t);
+    }
+
+    // the 2D call does not take the array target
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D_MULTISAMPLE_ARRAY, tex);
+    glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE_ARRAY, 4, GL_RGBA8, 8, 8, GL_TRUE);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_INVALID_ENUM);
+    glDeleteTextures(1, &tex);
+    glSampleMaski(0, 0xFFFFFFFFu);
+}
+
+GPU_TEST(multisample, sample_coverage_limits_the_samples)
+{
+    GLuint ms_tex, ms_fbo, prog, vao, vbo, rbo, fbo;
+    unsigned char px[4];
+
+    prog = buildFor("#version 420\nout vec4 o;\nvoid main() { o = vec4(1, 0, 0, 1); }\n");
+    CHECK(prog != 0);
+    if (!prog)
+        return;
+
+    ms_fbo = msTarget(4, &ms_tex);
+    vao = mgl_fullscreen_quad(&vbo);
+    glViewport(0, 0, 64, 64);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glUseProgram(prog);
+
+    // no samples at all, then half of them
+    glEnable(GL_SAMPLE_COVERAGE);
+    glSampleCoverage(0.0f, GL_FALSE);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+
+    glGenRenderbuffers(1, &rbo);
+    glBindRenderbuffer(GL_RENDERBUFFER, rbo);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 64, 64);
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo);
+    glFramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, rbo);
+    glBlitFramebuffer(0, 0, 64, 64, 0, 0, 64, 64, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
+    glReadPixels(32, 32, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    CHECK_MSG(px[0] < 10, "coverage 0 drew %d", px[0]);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, ms_fbo);
+    glSampleCoverage(0.5f, GL_FALSE);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo);
+    glBlitFramebuffer(0, 0, 64, 64, 0, 0, 64, 64, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
+    glReadPixels(32, 32, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    CHECK_MSG(px[0] > 100 && px[0] < 155, "coverage 0.5 drew %d", px[0]);
+
+    glDisable(GL_SAMPLE_COVERAGE);
+    glSampleCoverage(1.0f, GL_FALSE);
+    glUseProgram(0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &fbo);
+    glDeleteFramebuffers(1, &ms_fbo);
+    glDeleteRenderbuffers(1, &rbo);
+    glDeleteTextures(1, &ms_tex);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo);
+    glDeleteProgram(prog);
+}

@@ -83,20 +83,68 @@ void mtlCopyTexSubImage(GLMContext glm_ctx, Texture *tex, GLint level,
             return;
         }
 
-        // a blit copies bytes, so colour in another format -- the BGRA window
-        // into an RGBA texture -- is drawn across
-        if (from == GL_RGBA && srcTex.pixelFormat != dstTex.pixelFormat && fd->kind == MGL_FMT_COLOR_FLOAT &&
-            srcTex.textureType == MTLTextureType2D && srcTex.sampleCount == 1 && [renderer readPlane] == 0 &&
-            dstTex.textureType != MTLTextureType3D && dstTex.sampleCount == 1)
+        // A blit copies bytes. Colour in another format -- the BGRA window into
+        // an RGBA texture, RGBA into RG -- is drawn across instead, and so is
+        // anything whose channels move: alpha lives in R for GL_ALPHA and in G
+        // for GL_LUMINANCE_ALPHA, and an RGB format kept in RGBA reads alpha 1.
+        int legacy = mglLegacyFormatClass(tex->internalformat);
+        bool rgb_in_rgba = (fd->base_format == GL_RGB || fd->base_format == GL_RGB_INTEGER) && legacy < 2;
+        bool converts = fd->kind == MGL_FMT_COLOR_FLOAT || fd->kind == MGL_FMT_COLOR_INT ||
+                        fd->kind == MGL_FMT_COLOR_UINT;
+
+        if (from == GL_RGBA && converts &&
+            (srcTex.pixelFormat != dstTex.pixelFormat || legacy == 2 || legacy == 4 || rgb_in_rgba) &&
+            srcTex.sampleCount == 1 && dstTex.textureType != MTLTextureType3D && dstTex.sampleCount == 1)
         {
+            // a slice of a 3D texture goes through a 2D one first
+            if (srcTex.textureType != MTLTextureType2D || [renderer readPlane] != 0)
+            {
+                MTLTextureDescriptor *d =
+                    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat: srcTex.pixelFormat
+                                                                       width: (NSUInteger)width
+                                                                      height: (NSUInteger)height
+                                                                   mipmapped: NO];
+                d.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+                d.storageMode = MTLStorageModePrivate;
+
+                id<MTLTexture> flat = [srcTex.device newTextureWithDescriptor: d];
+                id<MTLBlitCommandEncoder> copy = [[renderer liveCommandBuffer] blitCommandEncoder];
+
+                [copy copyFromTexture: srcTex sourceSlice: 0 sourceLevel: 0
+                         sourceOrigin: MTLOriginMake((NSUInteger)x, (NSUInteger)y, [renderer readPlane])
+                           sourceSize: MTLSizeMake((NSUInteger)width, (NSUInteger)height, 1)
+                            toTexture: flat destinationSlice: 0 destinationLevel: 0
+                    destinationOrigin: MTLOriginMake(0, 0, 0)];
+                [copy endEncoding];
+
+                srcTex = flat;
+                x = y = 0;
+            }
+
+            id<MTLTexture> view = srcTex;
             id<MTLTexture> target = dstTex;
+
+            if (legacy == 2 || legacy == 4 || rgb_in_rgba)
+            {
+                MTLTextureSwizzleChannels sw =
+                    legacy == 2 ? MTLTextureSwizzleChannelsMake(MTLTextureSwizzleAlpha, MTLTextureSwizzleAlpha,
+                                                                MTLTextureSwizzleAlpha, MTLTextureSwizzleAlpha) :
+                    legacy == 4 ? MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleAlpha,
+                                                                MTLTextureSwizzleRed, MTLTextureSwizzleAlpha) :
+                                  MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen,
+                                                                MTLTextureSwizzleBlue, MTLTextureSwizzleOne);
+
+                view = [srcTex newTextureViewWithPixelFormat:srcTex.pixelFormat textureType:MTLTextureType2D
+                                                      levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1)
+                                                     swizzle:sw];
+            }
 
             if (level != 0 || slice != 0 || dstTex.textureType != MTLTextureType2D)
                 target = [dstTex newTextureViewWithPixelFormat:dstTex.pixelFormat textureType:MTLTextureType2D
                                                         levels:NSMakeRange((NSUInteger)level, 1)
                                                         slices:NSMakeRange((NSUInteger)slice, 1)];
 
-            [renderer shaderBlitFrom:srcTex origin:MTLOriginMake((NSUInteger)x, (NSUInteger)y, 0)
+            [renderer shaderBlitFrom:view origin:MTLOriginMake((NSUInteger)x, (NSUInteger)y, 0)
                                 size:MTLSizeMake((NSUInteger)width, (NSUInteger)height, 1)
                                   to:target origin:MTLOriginMake((NSUInteger)xoffset, (NSUInteger)yoffset, 0)
                                 size:MTLSizeMake((NSUInteger)width, (NSUInteger)height, 1)];

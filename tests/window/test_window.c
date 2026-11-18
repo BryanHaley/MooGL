@@ -57,10 +57,23 @@ static const char *fs =
     "out vec4 color;\n"
     "void main() { color = vec4(0.0, 1.0, 0.0, 1.0); }\n";
 
-static GLuint program(void)
+static const char *es_vs =
+    "#version 300 es\n"
+    "void main() {\n"
+    "    vec2 p = vec2(float(gl_VertexID & 1) * 4.0 - 1.0, float(gl_VertexID & 2) * 2.0 - 1.0);\n"
+    "    gl_Position = vec4(p, 0.0, 1.0);\n"
+    "}\n";
+
+static const char *es_fs =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "out vec4 color;\n"
+    "void main() { color = vec4(0.0, 1.0, 0.0, 1.0); }\n";
+
+static GLuint programOf(const char *v, const char *f)
 {
     GLuint p = glCreateProgram();
-    const char *src[2] = { vs, fs };
+    const char *src[2] = { v, f };
     GLenum stage[2] = { GL_VERTEX_SHADER, GL_FRAGMENT_SHADER };
 
     for (int i = 0; i < 2; i++) {
@@ -71,6 +84,11 @@ static GLuint program(void)
     }
     glLinkProgram(p);
     return p;
+}
+
+static GLuint program(void)
+{
+    return programOf(vs, fs);
 }
 
 static void pixel(int x, int y, unsigned char out[4])
@@ -271,6 +289,42 @@ int main(void)
         glfwMakeContextCurrent(window);
         glfwDestroyWindow(legacy);
     }
+
+#ifdef MGL_OGL_ES
+    // an OpenGL ES window
+    glfwDefaultWindowHints();
+    glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+    glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_ES_API);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
+    GLFWwindow *es = glfwCreateWindow(64, 64, "es", NULL, NULL);
+    check(es != NULL, "an OpenGL ES 3.0 request makes a context");
+    if (es)
+    {
+        GLuint vao, prog;
+        unsigned char p[4];
+
+        glfwMakeContextCurrent(es);
+        check(!strncmp((const char *)glGetString(GL_VERSION), "OpenGL ES 3.1", 13), "and gets ES 3.1");
+        check(glfwGetWindowAttrib(es, GLFW_CLIENT_API) == GLFW_OPENGL_ES_API &&
+              glfwGetWindowAttrib(es, GLFW_CONTEXT_VERSION_MINOR) == 1, "GLFW agrees it is ES 3.1");
+
+        prog = programOf(es_vs, es_fs);
+        glGenVertexArrays(1, &vao);
+        glBindVertexArray(vao);
+        glUseProgram(prog);
+        glClearColor(1, 0, 0, 1);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        pixel(32, 32, p);
+        check(green(p), "a GLSL ES 3.00 program draws in it");
+        check(glGetError() == GL_NO_ERROR, "no GL errors in it");
+        glfwSwapBuffers(es);
+
+        glfwMakeContextCurrent(window);
+        glfwDestroyWindow(es);
+    }
+#endif
 
     glfwTerminate();
     printf("%s\n", fails ? "FAILED" : "passed");

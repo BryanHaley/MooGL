@@ -74,3 +74,7 @@
 [submodule "submodules/raylib"]
 	path = submodules/raylib
 	url = https://github.com/raysan5/raylib.git
+[submodule "submodules/OpenGLESDemo"]
+	path = submodules/OpenGLESDemo
+	url = https://github.com/BryanHaley/OpenGLESDemo.git
+	branch = mgl

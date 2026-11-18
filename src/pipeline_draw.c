@@ -23,6 +23,8 @@
  * before every draw, since those are what the application sets.
  */
 
+#include <ctype.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -157,6 +159,152 @@ static Program *lastVertexStage(ProgramPipeline *pp)
     return NULL;
 }
 
+static const int named_kinds[] = { SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT, SPVC_RESOURCE_TYPE_SAMPLED_IMAGE,
+                                   SPVC_RESOURCE_TYPE_STORAGE_IMAGE, SPVC_RESOURCE_TYPE_SEPARATE_IMAGE };
+
+static size_t baseLength(const char *name)
+{
+    return strcspn(name, ".[");
+}
+
+static bool declares(Program *p, int s, const char *base, size_t len)
+{
+    for (unsigned k = 0; k < sizeof(named_kinds) / sizeof(named_kinds[0]); k++)
+    {
+        SpirvResourceList *list = &p->spirv_resources_list[s][named_kinds[k]];
+
+        for (GLuint i = 0; i < list->count; i++)
+        {
+            const char *n = list->list[i].name;
+
+            if (n && baseLength(n) == len && !strncmp(n, base, len))
+                return true;
+        }
+    }
+
+    return false;
+}
+
+// Separate programs keep separate uniforms, but in the merged program two
+// stages naming the same uniform would share it, so the later stage's copy
+// gets renamed.
+static bool clashes(ProgramPipeline *pp, int s, const char *base, size_t len)
+{
+    Program *p = pp->stage_programs[s];
+
+    for (unsigned i = 0; i < sizeof(graphics_stages) / sizeof(graphics_stages[0]) && graphics_stages[i] != s; i++)
+    {
+        int e = graphics_stages[i];
+        Program *q = pp->stage_programs[e];
+
+        if (q && q != p && declares(q, e, base, len))
+            return true;
+    }
+
+    return false;
+}
+
+static void stageName(ProgramPipeline *pp, int s, const char *name, char *out, size_t size)
+{
+    size_t len = baseLength(name);
+
+    if (clashes(pp, s, name, len))
+        snprintf(out, size, "%.*s_mgls%d%s", (int)len, name, s, name + len);
+    else
+        snprintf(out, size, "%s", name);
+}
+
+static bool identChar(char c)
+{
+    return isalnum((unsigned char)c) || c == '_';
+}
+
+static bool swizzle(const char *s, size_t len)
+{
+    if (len > 4)
+        return false;
+
+    for (size_t i = 0; i < len; i++)
+        if (!strchr("xyzwrgbastpq", s[i]))
+            return false;
+
+    return true;
+}
+
+static char *renameIdent(const char *src, const char *from, const char *to)
+{
+    size_t flen = strlen(from), tlen = strlen(to), n = 0;
+
+    for (const char *c = strstr(src, from); c; c = strstr(c + flen, from))
+        n++;
+
+    char *out = malloc(strlen(src) + n * tlen + 1);
+    char *o = out;
+    const char *c = src;
+
+    for (const char *hit = strstr(c, from); hit; hit = strstr(c, from))
+    {
+        bool whole = (hit == src || !identChar(hit[-1])) && !identChar(hit[flen]);
+
+        if (whole && hit > src && hit[-1] == '.' && swizzle(from, flen))
+            whole = false;
+
+        memcpy(o, c, (size_t)(hit - c));
+        o += hit - c;
+
+        if (whole)
+        {
+            memcpy(o, to, tlen);
+            o += tlen;
+        }
+        else
+        {
+            memcpy(o, from, flen);
+            o += flen;
+        }
+
+        c = hit + flen;
+    }
+
+    strcpy(o, c);
+    return out;
+}
+
+// The stage's source with its clashing uniforms renamed; the caller frees it.
+static char *stageSource(ProgramPipeline *pp, int s)
+{
+    Program *p = pp->stage_programs[s];
+    char *src = strdup(p->stage_src[s]);
+
+    for (unsigned k = 0; k < sizeof(named_kinds) / sizeof(named_kinds[0]); k++)
+    {
+        SpirvResourceList *list = &p->spirv_resources_list[s][named_kinds[k]];
+
+        for (GLuint i = 0; i < list->count; i++)
+        {
+            const char *n = list->list[i].name;
+            char base[256], renamed[300];
+            size_t len;
+
+            if (n == NULL || (len = baseLength(n)) >= sizeof(base) || !clashes(pp, s, n, len))
+                continue;
+
+            snprintf(base, sizeof(base), "%.*s", (int)len, n);
+            snprintf(renamed, sizeof(renamed), "%s_mgls%d", base, s);
+
+            // already done for an earlier member of the same struct
+            if (strstr(src, renamed))
+                continue;
+
+            char *next = renameIdent(src, base, renamed);
+            free(src);
+            src = next;
+        }
+    }
+
+    return src;
+}
+
 static Program *linkMerged(GLMContext ctx, ProgramPipeline *pp)
 {
     GLuint name = mglCreateProgram(ctx);
@@ -174,10 +322,12 @@ static Program *linkMerged(GLMContext ctx, ProgramPipeline *pp)
         if (from == NULL || from->stage_src[s] == NULL)
             continue;
 
-        const GLchar *src = from->stage_src[s];
+        char *text = stageSource(pp, s);
+        const GLchar *src = text;
 
         shaders[s] = mglCreateShader(ctx, glStage(s));
         mglShaderSource(ctx, shaders[s], 1, &src, NULL);
+        free(text);
         mglCompileShader(ctx, shaders[s]);
         mglAttachShader(ctx, name, shaders[s]);
     }
@@ -307,7 +457,10 @@ static void copyStageState(GLMContext ctx, ProgramPipeline *pp, Program *merged)
             if (r->name == NULL || r->gl_type == 0 || r->location == MGL_NO_LOCATION)
                 continue;
 
-            to = sameUniform(merged, r->name);
+            char name[300];
+
+            stageName(pp, s, r->name, name, sizeof(name));
+            to = sameUniform(merged, name);
 
             if (to == NULL)
                 continue;
@@ -329,8 +482,13 @@ static void copyStageState(GLMContext ctx, ProgramPipeline *pp, Program *merged)
                 for (GLuint j = 0; j < dst->count; j++)
                 {
                     SpirvResource *a = &src->list[i], *b = &dst->list[j];
+                    char name[300];
 
-                    if (!a->name || !b->name || strcmp(a->name, b->name))
+                    if (!a->name || !b->name)
+                        continue;
+
+                    stageName(pp, s, a->name, name, sizeof(name));
+                    if (strcmp(name, b->name))
                         continue;
 
                     b->tex_unit = a->tex_unit;
@@ -433,6 +591,11 @@ static Program *pipelineProgram(GLMContext ctx, ProgramPipeline *pp)
         copyStageState(ctx, pp, pp->merged);
 
     return pp->merged;
+}
+
+bool mglPipelineLinks(GLMContext ctx, ProgramPipeline *pp)
+{
+    return pipelineProgram(ctx, pp) != NULL;
 }
 
 enum { RUN, RUN_SWAPPED, SKIP };

@@ -94,6 +94,7 @@ static bool validateMultisample(GLMContext ctx, GLenum target, GLsizei samples,
             break;
         case GL_TEXTURE_2D_MULTISAMPLE_ARRAY:
         case GL_PROXY_TEXTURE_2D_MULTISAMPLE_ARRAY:
+            if (!is_3d) goto invalid_enum;
             break;
         default:
             goto invalid_enum;
@@ -173,7 +174,7 @@ void mglTexStorage2DMultisample(GLMContext ctx, GLenum target, GLsizei samples,
     }
 
     tex->samples = mglRoundSamples(samples);
-    (void)fixedsamplelocations; /* no per-texture field yet */
+    tex->variable_sample_locations = !fixedsamplelocations;
 
     texStorage(ctx, tex, 1, 1, false, internalformat, width, height, 1, proxy);
 }
@@ -209,7 +210,7 @@ void mglTexStorage3DMultisample(GLMContext ctx, GLenum target, GLsizei samples,
     }
 
     tex->samples = mglRoundSamples(samples);
-    (void)fixedsamplelocations;
+    tex->variable_sample_locations = !fixedsamplelocations;
 
     texStorage(ctx, tex, 1, 1, is_array, internalformat,
                width, height, depth, proxy);
@@ -243,7 +244,7 @@ void mglTexImage2DMultisample(GLMContext ctx, GLenum target, GLsizei samples,
         invalidateTexture(ctx, tex);
 
     tex->samples = mglRoundSamples(samples);
-    (void)fixedsamplelocations;
+    tex->variable_sample_locations = !fixedsamplelocations;
 
     createTextureLevel(ctx, tex, 0, 0, false, internalformat,
                        width, height, 1, 0, 0, NULL,
@@ -283,7 +284,7 @@ void mglTexImage3DMultisample(GLMContext ctx, GLenum target, GLsizei samples,
         invalidateTexture(ctx, tex);
 
     tex->samples = mglRoundSamples(samples);
-    (void)fixedsamplelocations;
+    tex->variable_sample_locations = !fixedsamplelocations;
 
     createTextureLevel(ctx, tex, 0, 0, is_array, internalformat,
                        width, height, depth, 0, 0, NULL,
@@ -319,7 +320,7 @@ void mglTextureStorage2DMultisample(GLMContext ctx, GLuint texture,
     }
 
     tex->samples = mglRoundSamples(samples);
-    (void)fixedsamplelocations;
+    tex->variable_sample_locations = !fixedsamplelocations;
 
     texStorage(ctx, tex, 1, 1, false, internalformat, width, height, 1, false);
 }
@@ -355,7 +356,7 @@ void mglTextureStorage3DMultisample(GLMContext ctx, GLuint texture,
     }
 
     tex->samples = mglRoundSamples(samples);
-    (void)fixedsamplelocations;
+    tex->variable_sample_locations = !fixedsamplelocations;
 
     texStorage(ctx, tex, 1, 1, is_array, internalformat,
                width, height, depth, false);

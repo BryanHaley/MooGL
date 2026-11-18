@@ -26,6 +26,7 @@
 bool isBuffer(GLMContext ctx, GLuint buffer);
 
 extern Buffer *findBuffer(GLMContext ctx, GLuint buffer);
+extern Buffer *mglGeneratedBuffer(GLMContext ctx, GLuint buffer);
 extern int isVAO(GLMContext ctx, GLuint vao);
 extern VertexArray *getVAO(GLMContext ctx, GLuint vao);
 extern VertexArray *namedVAO(GLMContext ctx, GLuint vao);
@@ -57,7 +58,7 @@ bool bindVertexBuffer(GLMContext ctx, GLuint vaobj, GLuint bindingindex, GLuint 
     // zero unbinds whatever is on this binding point
     if (buffer)
     {
-        buf = findBuffer(ctx, buffer);
+        buf = mglGeneratedBuffer(ctx, buffer);
         ERROR_CHECK_RETURN_VALUE(buf, GL_INVALID_OPERATION, false);
     }
     else
@@ -99,7 +100,7 @@ void mglBindVertexBuffers(GLMContext ctx, GLuint first, GLsizei count, const GLu
         GLuint buffer = buffers ? buffers[i] : 0;
 
         // a bad name is an error for its own binding only; the rest still bind
-        if (buffer && !isBuffer(ctx, buffer))
+        if (buffer && !mglGeneratedBuffer(ctx, buffer))
         {
             ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
             continue;

@@ -4,8 +4,8 @@
  * test_sdl3.c
  * MGL
  *
- * MooGL's SDL3: core and compatibility contexts, sharing, and SDL's opengl
- * renderer drawing through a compatibility context.
+ * MooGL's SDL3: core, compatibility and ES contexts, sharing, and SDL's
+ * opengl and opengles2 renderers.
  */
 
 #include <GL/glcorearb.h>
@@ -102,6 +102,29 @@ static void contexts(void)
         SDL_GL_DestroyContext(compat);
     }
 
+#ifdef MGL_OGL_ES
+    SDL_GL_ResetAttributes();
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+    SDL_GLContext es = SDL_GL_CreateContext(window);
+    SDL_GL_GetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, &profile);
+    SDL_GL_GetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, &major);
+    SDL_GL_GetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, &minor);
+    check(es != NULL && profile == SDL_GL_CONTEXT_PROFILE_ES && major == 3 && minor == 1,
+          "an ES 3.0 request gets ES 3.1");
+    if (es)
+    {
+        const char *version = (const char *)glGetString(GL_VERSION);
+        check(version && strncmp(version, "OpenGL ES 3.1", 13) == 0, "GL_VERSION says OpenGL ES 3.1");
+        glClearColor(0, 0, 1, 1);
+        glClear(GL_COLOR_BUFFER_BIT);
+        check(glPixelIs(32, 32, 0, 0, 255), "it clears");
+        check(glGetError() == GL_NO_ERROR, "no GL errors in the ES context");
+        SDL_GL_DestroyContext(es);
+    }
+#endif
+
     SDL_DestroyWindow(window);
 }
 
@@ -119,12 +142,13 @@ static int rendererPixelIs(SDL_Renderer *r, int x, int y, int red, int green, in
     return ok && near(cr, red) && near(cg, green) && near(cb, blue);
 }
 
-static void renderer(void)
+static void renderer(const char *driver)
 {
     SDL_Window *window = SDL_CreateWindow("MooGL SDL3 renderer test", 64, 64, SDL_WINDOW_HIDDEN);
-    SDL_Renderer *r = window ? SDL_CreateRenderer(window, "opengl") : NULL;
+    SDL_Renderer *r = window ? SDL_CreateRenderer(window, driver) : NULL;
 
-    check(r != NULL && strcmp(SDL_GetRendererName(r), "opengl") == 0, "SDL makes an opengl renderer");
+    printf(" %s:\n", driver);
+    check(r != NULL && strcmp(SDL_GetRendererName(r), driver) == 0, "SDL makes the renderer");
     if (!r)
     {
         printf("  %s\n", SDL_GetError());
@@ -168,7 +192,10 @@ int main(void)
         return 77;
 
     contexts();
-    renderer();
+    renderer("opengl");
+#ifdef MGL_OGL_ES
+    renderer("opengles2");
+#endif
 
     SDL_Quit();
     printf("%s\n", fails ? "FAILED" : "passed");

@@ -317,6 +317,9 @@ typedef struct {
     // attachments glInvalidateFramebuffer said need not be loaded, for the
     // next pass on that framebuffer if nothing writes textures first
     Framebuffer *_invalidFbo;
+    // a remade texture keeps its GPU contents; only at GL-call time, never
+    // while a draw is being set up
+    bool _keepContents;
     GLuint _invalidMask;
     // buffers a whole-buffer write retired, back for reuse once the GPU is done
     NSMutableDictionary<NSString *, NSMutableArray<id<MTLBuffer>> *> *_bufferPool;
@@ -486,6 +489,7 @@ typedef struct {
     MTLPrimitiveTopologyClass  _drawTopology;
 
     id<MTLSamplerState>        _defaultSampler;
+    id<MTLSamplerState>        _linearBlitSampler;
     id<MTLTexture>             _dummyTextures[8];
 
     // the shader blit, for copies Metal's own cannot make
@@ -705,6 +709,10 @@ static bool attribNeedsConversion(GLMContext ctx, int a)
     if (VAO_ATTRIB_STATE(a).is_long)
         return false;
 
+    // Metal reads an attribute only at a 4 byte aligned offset and stride
+    if ((VAO_ATTRIB_BINDING(a)->offset + VAO_ATTRIB_STATE(a).relativeoffset) & 3 || VAO_ATTRIB_BINDING(a)->stride & 3)
+        return true;
+
     // Metal turns bytes and shorts into floats, but not 32-bit integers,
     // normalised or not
     if (!VAO_ATTRIB_STATE(a).is_integer &&
@@ -713,6 +721,24 @@ static bool attribNeedsConversion(GLMContext ctx, int a)
 
     return glTypeSizeToMtlType(VAO_ATTRIB_STATE(a).type, VAO_ATTRIB_STATE(a).size,
                                VAO_ATTRIB_STATE(a).normalized) == MTLVertexFormatInvalid;
+}
+
+// An integer attribute's element as four 32-bit integers
+static void convertAttribElementInt(GLenum type, GLint size, const uint8_t *src, int32_t out[4])
+{
+    out[0] = 0; out[1] = 0; out[2] = 0; out[3] = 1;
+
+    for (GLint c = 0; c < size && c < 4; c++)
+    {
+        switch (type)
+        {
+            case GL_BYTE:           out[c] = (int8_t)src[c]; break;
+            case GL_UNSIGNED_BYTE:  out[c] = src[c]; break;
+            case GL_SHORT:          { int16_t v; memcpy(&v, src + c * 2, 2); out[c] = v; break; }
+            case GL_UNSIGNED_SHORT: { uint16_t v; memcpy(&v, src + c * 2, 2); out[c] = v; break; }
+            default:                memcpy(&out[c], src + c * 4, 4); break;
+        }
+    }
 }
 
 // One element of such an attribute as four floats, with the components it
@@ -759,6 +785,65 @@ static void convertAttribElement(GLenum type, GLint size, bool normalized, const
                 out[c] = (float)v / 65536.0f;
             }
             break;
+
+        case GL_BYTE:
+        case GL_UNSIGNED_BYTE:
+        case GL_SHORT:
+        case GL_UNSIGNED_SHORT:
+        case GL_HALF_FLOAT:
+        case GL_FLOAT:
+        {
+            GLint n = size == GL_BGRA ? 4 : size;
+
+            for (GLint c = 0; c < n && c < 4; c++)
+            {
+                switch (type)
+                {
+                    case GL_BYTE:
+                    {
+                        int8_t v = (int8_t)src[c];
+                        out[c] = normalized ? fmaxf((float)v / 127.0f, -1.0f) : (float)v;
+                        break;
+                    }
+                    case GL_UNSIGNED_BYTE:
+                        out[c] = normalized ? (float)src[c] / 255.0f : (float)src[c];
+                        break;
+                    case GL_SHORT:
+                    {
+                        int16_t v;
+                        memcpy(&v, src + c * 2, 2);
+                        out[c] = normalized ? fmaxf((float)v / 32767.0f, -1.0f) : (float)v;
+                        break;
+                    }
+                    case GL_UNSIGNED_SHORT:
+                    {
+                        uint16_t v;
+                        memcpy(&v, src + c * 2, 2);
+                        out[c] = normalized ? (float)v / 65535.0f : (float)v;
+                        break;
+                    }
+                    case GL_HALF_FLOAT:
+                    {
+                        __fp16 v;
+                        memcpy(&v, src + c * 2, 2);
+                        out[c] = (float)v;
+                        break;
+                    }
+                    default:
+                        memcpy(&out[c], src + c * 4, 4);
+                        break;
+                }
+            }
+
+            if (size == GL_BGRA)
+            {
+                float t = out[0];
+
+                out[0] = out[2];
+                out[2] = t;
+            }
+            break;
+        }
 
         case GL_INT_2_10_10_10_REV:
         case GL_UNSIGNED_INT_2_10_10_10_REV:
@@ -1618,7 +1703,8 @@ static bool bufferSizesFor(Program *program, int stage, const BufferMapList *lis
         typeof(bd->converted[0]) *c = &bd->converted[i];
 
         if (c->mtl_data && c->version == bd->version && c->type == type && c->size == size &&
-            c->normalized == VAO_ATTRIB_STATE(a).normalized && c->offset == (size_t)map->offset &&
+            c->normalized == VAO_ATTRIB_STATE(a).normalized && c->integer == VAO_ATTRIB_STATE(a).is_integer &&
+            c->offset == (size_t)map->offset &&
             c->stride == key_stride)
             return (__bridge id<MTLBuffer>)c->mtl_data;
 
@@ -1652,7 +1738,12 @@ static bool bufferSizesFor(Program *program, int stage, const BufferMapList *lis
     memset(dst, 0, bytes);
 
     for (size_t k = 0; k < n; k++)
-        convertAttribElement(type, size, VAO_ATTRIB_STATE(a).normalized, src + k * stride, dst + k * 4);
+    {
+        if (VAO_ATTRIB_STATE(a).is_integer)
+            convertAttribElementInt(type, size, src + k * stride, (int32_t *)(dst + k * 4));
+        else
+            convertAttribElement(type, size, VAO_ATTRIB_STATE(a).normalized, src + k * stride, dst + k * 4);
+    }
 
     if (cache)
     {
@@ -1667,6 +1758,7 @@ static bool bufferSizesFor(Program *program, int stage, const BufferMapList *lis
         c->type = type;
         c->size = size;
         c->normalized = VAO_ATTRIB_STATE(a).normalized;
+        c->integer = VAO_ATTRIB_STATE(a).is_integer;
         c->offset = (size_t)map->offset;
         c->stride = key_stride;
     }
@@ -1749,8 +1841,21 @@ static bool bufferSizesFor(Program *program, int stage, const BufferMapList *lis
 // or there is only one sample
 - (void) bindSampleMask
 {
-    uint32_t mask = ctx->state.caps.sample_mask && mglDrawFramebufferSamples(ctx) > 1
+    GLsizei samples = mglDrawFramebufferSamples(ctx);
+    uint32_t mask = ctx->state.caps.sample_mask && samples > 1
                   ? (uint32_t)ctx->state.var.sample_mask_value : 0xFFFFFFFFu;
+
+    // GL_SAMPLE_COVERAGE: the value's share of the samples, the rest when inverted
+    if (ctx->state.caps.sample_coverage && samples > 1)
+    {
+        int n = (int)(ctx->state.var.sample_coverage_value * (float)samples + 0.5f);
+        uint32_t coverage = n >= 32 ? 0xFFFFFFFFu : (1u << n) - 1u;
+
+        if (ctx->state.var.sample_coverage_invert)
+            coverage = ~coverage;
+
+        mask &= coverage;
+    }
 
     [_currentRenderEncoder setFragmentBytes: &mask length: sizeof mask atIndex: MGL_SAMPLE_MASK_MSL_SLOT];
 }
@@ -2265,8 +2370,11 @@ static bool isRGB32BufferFormat(GLenum f)
         {
             for (int level=0; level<tex->num_levels; level++)
             {
-                // a level the application never defined has nothing to upload
-                if (tex->faces[face].levels[level].complete == false)
+                // a level the application never defined has nothing to upload,
+                // and a cube face given in another format is converted from
+                // the old texture instead
+                if (tex->faces[face].levels[level].complete == false ||
+                    tex->faces[face].levels[level].given_format != 0)
                     continue;
 
                 width = tex->faces[face].levels[level].width;
@@ -3313,6 +3421,12 @@ static bool isRGB32BufferFormat(GLenum f)
             return NULL;
                 break;
         }
+
+#ifdef MGL_OGL_ES
+        // ES cube maps are always seamless, which leaves the wrap modes out
+        if (ctx->es && (target == GL_TEXTURE_CUBE_MAP || target == GL_TEXTURE_CUBE_MAP_ARRAY))
+            mode = MTLSamplerAddressModeClampToEdge;
+#endif
 
         switch(i)
         {
@@ -4808,6 +4922,28 @@ static bool mtlFormatIsStencil(MTLPixelFormat f)
 
 static FBOAttachment *drawSlot(Framebuffer *fbo, int k);
 
+// An RGB format kept in an RGBA Metal one: its alpha has to stay 1
+static bool hidesAlpha(GLMContext ctx, int i)
+{
+    FBOAttachment *a = ctx->state.framebuffer ? drawSlot(ctx->state.framebuffer, i) : NULL;
+    Texture *t = a == NULL ? NULL : a->textarget == GL_RENDERBUFFER ? (a->buf.rbo ? a->buf.rbo->tex : NULL) : a->buf.tex;
+    const MGLFormatDesc *d = t ? mglFormatDesc(t->internalformat) : NULL;
+
+    if (t && t->internalformat == GL_RGB)
+        return true;
+
+    return d && d->base_format == GL_RGB && d->bits[3] == 0;
+}
+
+// Metal takes only all or nothing on RGB9E5
+static MTLColorWriteMask writeMaskFor(MTLPixelFormat f, MTLColorWriteMask m)
+{
+    if (f == MTLPixelFormatRGB9E5Float)
+        return (m & (MTLColorWriteMaskRed | MTLColorWriteMaskGreen | MTLColorWriteMaskBlue)) ? MTLColorWriteMaskAll : MTLColorWriteMaskNone;
+
+    return m;
+}
+
 // Copies one rectangle between two images of the same format, stretching by
 // picking the nearest source texel -- columns into a scratch image first, then
 // rows into the target -- so it works for depth and stencil, which a shader
@@ -4909,10 +5045,83 @@ static FBOAttachment *drawSlot(Framebuffer *fbo, int k);
     return _lastDefaultTarget;
 }
 
--(void)mtlBlitFramebuffer:(GLMContext)glm_ctx srcX0:(size_t)srcX0 srcY0:(size_t)srcY0 srcX1:(size_t)srcX1 srcY1:(size_t)srcY1 dstX0:(size_t)dstX0 dstY0:(size_t)dstY0 dstX1:(size_t)dstX1 dstY1:(size_t)dstY1 mask:(size_t)mask filter:(GLuint)filter
+// The window's own depth or stencil image, made if nothing has used it yet
+- (id<MTLTexture>) defaultDepthStencil: (bool) stencil
+{
+    id<MTLTexture> colour = [self defaultSurface];
+    MTLPixelFormat f = stencil ? ctx->stencil_format.mtl_pixel_format : ctx->depth_format.mtl_pixel_format;
+
+    if (colour == nil || f == MTLPixelFormatInvalid)
+        return nil;
+
+    // the buffer the window last drew into, front or back
+    int which = _BACK;
+
+    for (int i = 0; i < _MAX_DRAW_BUFFERS; i++)
+        if (_drawBuffers[i].drawbuffer == colour)
+            which = i;
+
+    id<MTLTexture> t = stencil ? _drawBuffers[which].stencilbuffer : _drawBuffers[which].depthbuffer;
+
+    if (t == nil)
+    {
+        t = [self newDrawBufferWithCustomSize: f isDepthStencil: true
+                                   customSize: CGSizeMake(colour.width, colour.height)];
+
+        if (stencil)
+            _drawBuffers[which].stencilbuffer = t;
+        else
+            _drawBuffers[which].depthbuffer = t;
+    }
+
+    return t;
+}
+
+// depth or stencil to blit, from a framebuffer object or the window
+- (id<MTLTexture>) blitDepthStencil: (Framebuffer *) fbo stencil: (bool) stencil plane: (NSUInteger *) plane
+{
+    *plane = 0;
+
+    if (fbo == NULL)
+        return [self defaultDepthStencil: stencil];
+
+    return [self blitImage: stencil ? &fbo->stencil : &fbo->depth plane: plane];
+}
+
+// The destination pixels [*c0, *c1) of d0..d0+dw whose centres read a source
+// texel inside 0..size, for a source s0..s0+sw that may run backwards
+static void readableSpan(long s0, long sw, long d0, long dw, long size, long *c0, long *c1)
+{
+    double k = (double)sw / (double)dw;
+
+    *c0 = d0;
+    *c1 = d0 + dw;
+
+    // pixel d reads s0 + (d + 0.5 - d0) * k
+    if (k > 0)
+    {
+        *c0 = MAX(*c0, (long)ceil(d0 - s0 / k - 0.5));
+        *c1 = MIN(*c1, (long)ceil(d0 + (size - s0) / k - 0.5));
+    }
+    else
+    {
+        *c1 = MIN(*c1, (long)floor(d0 - s0 / k - 0.5) + 1);
+        *c0 = MAX(*c0, (long)floor(d0 + (size - s0) / k - 0.5) + 1);
+    }
+}
+
+-(void)mtlBlitFramebuffer:(GLMContext)glm_ctx srcX0:(long)srcX0 srcY0:(long)srcY0 srcX1:(long)srcX1 srcY1:(long)srcY1 dstX0:(long)dstX0 dstY0:(long)dstY0 dstX1:(long)dstX1 dstY1:(long)dstY1 mask:(size_t)mask filter:(GLuint)filter
 {
     Framebuffer *readfbo = ctx->state.readbuffer, *drawfbo = ctx->state.framebuffer;
-    NSUInteger sw = srcX1 - srcX0, sh = srcY1 - srcY0, dw = dstX1 - dstX0, dh = dstY1 - dstY0;
+
+    // the destination is made to run forwards; a source running the other way is mirrored
+    if (dstX1 < dstX0) { long t = dstX0; dstX0 = dstX1; dstX1 = t; t = srcX0; srcX0 = srcX1; srcX1 = t; }
+    if (dstY1 < dstY0) { long t = dstY0; dstY0 = dstY1; dstY1 = t; t = srcY0; srcY0 = srcY1; srcY1 = t; }
+
+    long sw = srcX1 - srcX0, sh = srcY1 - srcY0, dw = dstX1 - dstX0, dh = dstY1 - dstY0;
+
+    if (dw == 0 || dh == 0 || sw == 0 || sh == 0)
+        return;
 
     // a blit obeys the scissor; at one to one it is a smaller copy
     if (ctx->state.caps.scissor_test && sw == dw && sh == dh)
@@ -4928,8 +5137,8 @@ static FBOAttachment *drawSlot(Framebuffer *fbo, int k);
         srcX0 += x0 - (long)dstX0;
         srcY0 += y0 - (long)dstY0;
         dstX0 = x0; dstY0 = y0;
-        sw = dw = (NSUInteger)(x1 - x0);
-        sh = dh = (NSUInteger)(y1 - y0);
+        sw = dw = x1 - x0;
+        sh = dh = y1 - y0;
     }
 
     // glClear only records a mask, so run it before anything reads the result
@@ -4974,6 +5183,26 @@ static FBOAttachment *drawSlot(Framebuffer *fbo, int k);
             }
         }
 
+        // an RGB source is kept in RGBA; its alpha is read as 1
+        bool read_rgb = false;
+
+        if (readtexid && readfbo)
+        {
+            GLenum rf = mglReadColorInternalFormat(ctx);
+            const MGLFormatDesc *rd = rf ? mglFormatDesc(rf) : NULL;
+
+            read_rgb = rf == GL_RGB || (rd && rd->base_format == GL_RGB && rd->bits[3] == 0);
+
+            if (read_rgb)
+                readtexid = [readtexid newTextureViewWithPixelFormat: readtexid.pixelFormat
+                                                          textureType: readtexid.textureType
+                                                               levels: NSMakeRange(0, readtexid.mipmapLevelCount)
+                                                               slices: NSMakeRange(0, readtexid.arrayLength)
+                                                              swizzle: MTLTextureSwizzleChannelsMake(
+                                                                  MTLTextureSwizzleRed, MTLTextureSwizzleGreen,
+                                                                  MTLTextureSwizzleBlue, MTLTextureSwizzleOne)] ?: readtexid;
+        }
+
         // every draw buffer receives the same copy
         for (int k = 0; readtexid && k < (drawfbo ? MAX_COLOR_ATTACHMENTS : 1); k++)
         {
@@ -4998,35 +5227,65 @@ static FBOAttachment *drawSlot(Framebuffer *fbo, int k);
 
             // a straight copy needs one format, one size and two framebuffer
             // objects; anything else is drawn
-            if (readtexid.pixelFormat == drawtexid.pixelFormat && sw == dw && sh == dh &&
-                readtexid.sampleCount == drawtexid.sampleCount)
+            bool inside = srcX0 >= 0 && srcY0 >= 0 && srcX1 <= (long)readtexid.width && srcY1 <= (long)readtexid.height &&
+                          dstX0 >= 0 && dstY0 >= 0 && dstX1 <= (long)drawtexid.width && dstY1 <= (long)drawtexid.height;
+            // only destination pixels inside the image, reading from inside the source, are drawn
+            long cx0, cx1, cy0, cy1;
+
+            readableSpan(srcX0, sw, dstX0, dw, (long)readtexid.width, &cx0, &cx1);
+            readableSpan(srcY0, sh, dstY0, dh, (long)readtexid.height, &cy0, &cy1);
+            cx0 = MAX(cx0, 0L); cy0 = MAX(cy0, 0L);
+            cx1 = MIN(cx1, (long)drawtexid.width); cy1 = MIN(cy1, (long)drawtexid.height);
+
+            // GL 4.6 18.3.1: the scissor test applies to a blit's destination
+            if (ctx->state.caps.scissor_test)
+            {
+                long sx = ctx->state.scissor[0].x, sy = ctx->state.scissor[0].y;
+
+                if (sx > cx0 || sy > cy0 || sx + ctx->state.scissor[0].width < cx1 ||
+                    sy + ctx->state.scissor[0].height < cy1)
+                    inside = false;
+
+                cx0 = MAX(cx0, sx); cy0 = MAX(cy0, sy);
+                cx1 = MIN(cx1, sx + ctx->state.scissor[0].width); cy1 = MIN(cy1, sy + ctx->state.scissor[0].height);
+            }
+            float kx = (float)sw / (float)dw, ky = (float)sh / (float)dh;
+            float rect[4] = { srcX0 + (cx0 - dstX0) * kx, srcY0 + (cy0 - dstY0) * ky,
+                              (cx1 - cx0) * kx, (cy1 - cy0) * ky };
+
+            if (cx1 <= cx0 || cy1 <= cy0)
+                continue;
+
+            // a byte copy would carry an RGB source's stored alpha
+            if (readtexid.pixelFormat == drawtexid.pixelFormat && sw == dw && sh == dh && inside &&
+                readtexid.sampleCount == drawtexid.sampleCount && (!read_rgb || hidesAlpha(ctx, k)))
             {
                 [self nearestCopyFrom: readtexid plane: readplane x: srcX0 y: srcY0 w: sw h: sh
                                    to: drawtexid plane: drawplane x: dstX0 y: dstY0 w: dw h: dh];
             }
-            else if ([self shaderBlitFrom: readtexid
-                                   origin: MTLOriginMake(srcX0, srcY0, 0)
-                                     size: MTLSizeMake(sw, sh, 1)
-                                       to: drawtexid
-                                   origin: MTLOriginMake(dstX0, dstY0, 0)
-                                     size: MTLSizeMake(dw, dh, 1)] == false)
+            else if ([self shaderBlitFrom: readtexid rect: rect to: drawtexid
+                                   origin: MTLOriginMake(cx0, cy0, 0)
+                                     size: MTLSizeMake(cx1 - cx0, cy1 - cy0, 1)
+                                   linear: filter == GL_LINEAR && !(sw == dw && sh == dh)] == false)
             {
                 ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
             }
         }
     }
 
-    // depth and stencil need a framebuffer object on both sides, and copy
-    // a texel at a time -- GL allows only nearest filtering for them
-    if ((mask & (GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT)) && readfbo && drawfbo)
+    // depth and stencil copy a texel at a time -- GL allows only nearest
+    // filtering for them; the window keeps its own two images
+    if (mask & (GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT))
     {
         bool did_depth = false;
+        bool packed_read = readfbo && readfbo->stencil.buf.tex == readfbo->depth.buf.tex;
+        bool packed_draw = drawfbo && drawfbo->stencil.buf.tex == drawfbo->depth.buf.tex;
 
         if (mask & GL_DEPTH_BUFFER_BIT)
         {
             NSUInteger rp = 0, dp = 0;
-            id<MTLTexture> from = [self blitImage: &readfbo->depth plane: &rp];
-            id<MTLTexture> to = [self blitImage: &drawfbo->depth plane: &dp];
+            id<MTLTexture> from = [self blitDepthStencil: readfbo stencil: false plane: &rp];
+            id<MTLTexture> to = [self blitDepthStencil: drawfbo stencil: false plane: &dp];
 
             // a copy cannot cross sample counts, so a multisampled source is
             // resolved first, as the colour path does
@@ -5036,12 +5295,18 @@ static FBOAttachment *drawSlot(Framebuffer *fbo, int k);
             if (from && to && from.sampleCount == 1 && to.sampleCount > 1 && sw == dw && sh == dh)
             {
                 // into a multisampled image, a packed one taking its stencil too
-                bool both = (mask & GL_STENCIL_BUFFER_BIT) && readfbo->stencil.buf.tex == readfbo->depth.buf.tex &&
-                            drawfbo->stencil.buf.tex == drawfbo->depth.buf.tex;
+                bool both = (mask & GL_STENCIL_BUFFER_BIT) && packed_read && packed_draw;
 
                 [self fillMultisample: to from: from sx: srcX0 sy: srcY0 dx: dstX0 dy: dstY0 w: dw h: dh
                                 depth: true stencil: both];
                 did_depth = true;
+            }
+            else if (from && to && packed_read && packed_draw && !(mask & GL_STENCIL_BUFFER_BIT) &&
+                     from.sampleCount == to.sampleCount && sw == dw && sh == dh)
+            {
+                // a copy would take the stencil along, which has to stay
+                [self fillMultisample: to from: from sx: srcX0 sy: srcY0 dx: dstX0 dy: dstY0 w: dw h: dh
+                                depth: true stencil: false];
             }
             else if (from && to && from.pixelFormat == to.pixelFormat)
             {
@@ -5049,27 +5314,38 @@ static FBOAttachment *drawSlot(Framebuffer *fbo, int k);
                                    to: to plane: dp x: dstX0 y: dstY0 w: dw h: dh];
                 did_depth = true;
             }
+            else if (from && to && from.sampleCount == to.sampleCount && rp == 0 && dp == 0 && sw == dw && sh == dh)
+            {
+                // the window's depth beside a packed depth-stencil image: drawn across
+                [self fillMultisample: to from: from sx: srcX0 sy: srcY0 dx: dstX0 dy: dstY0 w: dw h: dh
+                                depth: true stencil: false];
+            }
         }
 
         if (mask & GL_STENCIL_BUFFER_BIT)
         {
             NSUInteger rp = 0, dp = 0;
-            id<MTLTexture> from = [self blitImage: &readfbo->stencil plane: &rp];
-            id<MTLTexture> to = [self blitImage: &drawfbo->stencil plane: &dp];
+            id<MTLTexture> from = [self blitDepthStencil: readfbo stencil: true plane: &rp];
+            id<MTLTexture> to = [self blitDepthStencil: drawfbo stencil: true plane: &dp];
 
             if (from && to && from.sampleCount > 1 && to.sampleCount == 1)
                 from = [self resolveMultisample: from];
 
             // a packed depth-stencil image went across whole with the depth
-            bool packed = did_depth && readfbo->stencil.buf.tex == readfbo->depth.buf.tex &&
-                          drawfbo->stencil.buf.tex == drawfbo->depth.buf.tex;
+            bool packed = did_depth && packed_read && packed_draw;
 
-            if (!packed && from && to && from.sampleCount == 1 && to.sampleCount > 1 && sw == dw && sh == dh)
+            if (!packed && from && to && ((from.sampleCount == 1 && to.sampleCount > 1) ||
+                                          (packed_read && packed_draw && !(mask & GL_DEPTH_BUFFER_BIT) &&
+                                           from.sampleCount == to.sampleCount)) && sw == dw && sh == dh)
                 [self fillMultisample: to from: from sx: srcX0 sy: srcY0 dx: dstX0 dy: dstY0 w: dw h: dh
                                 depth: false stencil: true];
             else if (!packed && from && to && from.pixelFormat == to.pixelFormat)
                 [self nearestCopyFrom: from plane: rp x: srcX0 y: srcY0 w: sw h: sh
                                    to: to plane: dp x: dstX0 y: dstY0 w: dw h: dh];
+            else if (!packed && from && to && from.sampleCount == to.sampleCount && rp == 0 && dp == 0 &&
+                     sw == dw && sh == dh)
+                [self fillMultisample: to from: from sx: srcX0 sy: srcY0 dx: dstX0 dy: dstY0 w: dw h: dh
+                                depth: false stencil: true];
         }
     }
 }
@@ -5524,6 +5800,84 @@ static MTLTextureType viewTextureType(GLenum target)
     return true;
 }
 
+// The levels of the old texture that the new one has at the same size, and
+// that the CPU copy has nothing newer for, copied across on the GPU
+- (void) keepLevels:(Texture *)tex from:(id<MTLTexture>)old
+{
+    id<MTLTexture> now = (__bridge id<MTLTexture>)tex->mtl_data;
+    bool convert = old.pixelFormat != now.pixelFormat;
+
+    if (old.textureType != now.textureType || old.sampleCount != now.sampleCount ||
+        old.arrayLength != now.arrayLength)
+        return;
+
+    // only a cube's faces in another format are drawn across
+    if (convert && now.textureType != MTLTextureTypeCube)
+        return;
+
+    bool cube = now.textureType == MTLTextureTypeCube || now.textureType == MTLTextureTypeCubeArray;
+    NSUInteger slices = (cube ? 6 : 1) * now.arrayLength;
+    id<MTLBlitCommandEncoder> blit = nil;
+
+    for (NSUInteger l = 0; l < old.mipmapLevelCount && l < now.mipmapLevelCount; l++)
+    {
+        MTLSize so = MTLSizeMake(MAX(old.width >> l, 1), MAX(old.height >> l, 1), MAX(old.depth >> l, 1));
+        MTLSize sn = MTLSizeMake(MAX(now.width >> l, 1), MAX(now.height >> l, 1), MAX(now.depth >> l, 1));
+
+        if (so.width != sn.width || so.height != sn.height || so.depth != sn.depth)
+            continue;
+
+        for (NSUInteger s = 0; s < slices; s++)
+        {
+            GLuint face = tex->target == GL_TEXTURE_CUBE_MAP ? (GLuint)s : 0;
+            TextureLevel *lvl = tex->faces[face].levels && l < tex->mipmap_levels ?
+                                &tex->faces[face].levels[l] : NULL;
+
+            if (lvl == NULL || !lvl->complete || lvl->cpu_newer)
+                continue;
+
+            if (convert)
+            {
+                if (lvl->given_format == 0)
+                    continue;
+
+                [blit endEncoding];
+                blit = nil;
+
+                id<MTLTexture> from = [old newTextureViewWithPixelFormat: old.pixelFormat
+                                                             textureType: MTLTextureType2D
+                                                                  levels: NSMakeRange(l, 1)
+                                                                  slices: NSMakeRange(s, 1)];
+                id<MTLTexture> to = [now newTextureViewWithPixelFormat: now.pixelFormat
+                                                           textureType: MTLTextureType2D
+                                                                levels: NSMakeRange(l, 1)
+                                                                slices: NSMakeRange(s, 1)];
+
+                [self shaderBlitFrom: from origin: MTLOriginMake(0, 0, 0) size: so
+                                  to: to origin: MTLOriginMake(0, 0, 0) size: so];
+                continue;
+            }
+
+            if (blit == nil)
+                blit = [self newBlitEncoder];
+
+            [blit copyFromTexture: old sourceSlice: s sourceLevel: l sourceOrigin: MTLOriginMake(0, 0, 0)
+                       sourceSize: so toTexture: now destinationSlice: s destinationLevel: l
+                destinationOrigin: MTLOriginMake(0, 0, 0)];
+        }
+    }
+
+    [blit endEncoding];
+}
+
+- (bool) refreshTexture:(Texture *)tex
+{
+    _keepContents = true;
+    bool ok = [self bindMTLTexture: tex];
+    _keepContents = false;
+    return ok;
+}
+
 - (bool)bindMTLTexture:(Texture *)tex
 {
     // an upload gives the texture contents an invalidated attachment would lose
@@ -5581,12 +5935,17 @@ static MTLTextureType viewTextureType(GLenum target)
     if (tex->sparse && tex->mtl_data)
         storage_changed = false;
 
+    id<MTLTexture> kept = nil;
+
     if (storage_changed && tex->mtl_data)
     {
         // the new texture starts empty, so it is filled from the CPU copy
         tex->dirty_bits |= DIRTY_TEXTURE_DATA;
-        CFBridgingRelease(tex->mtl_data);
+        kept = CFBridgingRelease(tex->mtl_data);
         tex->mtl_data = NULL;
+
+        if (!_keepContents)
+            kept = nil;
     }
 
     if (storage_changed && tex->mtl_sample_view)
@@ -5621,6 +5980,14 @@ static MTLTextureType viewTextureType(GLenum target)
         // made again from scratch, so the integer storage has to be put back
         if (tex->atomic_storage && !atomicStorage((__bridge id<MTLTexture>)tex->mtl_data))
             [self remakeForFormatViews: tex atomic: (MTLPixelFormat)tex->atomic_storage];
+
+        if (kept)
+            [self keepLevels: tex from: kept];
+
+        // every CPU copy has gone into the new texture
+        for (int f = 0; f < _CUBE_MAP_MAX_FACE; f++)
+            for (GLuint l = 0; tex->faces[f].levels && l < tex->mipmap_levels; l++)
+                tex->faces[f].levels[l].cpu_newer = GL_FALSE;
     }
 
     if (tex->params.mtl_data == NULL)
@@ -6248,9 +6615,10 @@ static id<MTLFunction> stageFunction(id<MTLLibrary> library, const char *entry)
 
         [_currentRenderEncoder setDepthStencilState: dsState];
 
+        // GL clamps the reference to what the 8 stencil bits hold
         if (ctx->state.caps.stencil_test)
-            [_currentRenderEncoder setStencilFrontReferenceValue: ctx->state.var.stencil_ref
-                                               backReferenceValue: ctx->state.var.stencil_back_ref];
+            [_currentRenderEncoder setStencilFrontReferenceValue: (uint32_t)MIN(MAX((GLint)ctx->state.var.stencil_ref, 0), 255)
+                                               backReferenceValue: (uint32_t)MIN(MAX((GLint)ctx->state.var.stencil_back_ref, 0), 255)];
     }
 
     {
@@ -6311,10 +6679,10 @@ static id<MTLFunction> stageFunction(id<MTLLibrary> library, const char *entry)
 
                 if (x < 0) { w += x; x = 0; }
                 if (fy < 0) { h += fy; fy = 0; }
-                if (tw > 0 && (NSUInteger)x > tw) x = (GLint)tw;
-                if (th > 0 && (NSUInteger)fy > th) fy = (GLint)th;
-                if (tw > 0 && (NSUInteger)(x + w) > tw) w = (GLint)tw - x;
-                if (th > 0 && (NSUInteger)(fy + h) > th) h = (GLint)th - fy;
+                if (tw > 0 && x > (GLint)tw) x = (GLint)tw;
+                if (th > 0 && fy > (GLint)th) fy = (GLint)th;
+                if (tw > 0 && x + w > (GLint)tw) w = (GLint)tw - x;
+                if (th > 0 && fy + h > (GLint)th) h = (GLint)th - fy;
 
                 // a zero-sized box lets nothing through, which is what GL asks
                 rects[i] = (MTLScissorRect){ (NSUInteger)x, (NSUInteger)fy,
@@ -6328,21 +6696,18 @@ static id<MTLFunction> stageFunction(id<MTLLibrary> library, const char *entry)
             [_currentRenderEncoder setScissorRects:rects count:MAX_VIEWPORTS];
     }
 
-    if (ctx->state.caps.cull_face)
     {
-        MTLCullMode cull_mode;
+        MTLCullMode cull_mode = MTLCullModeNone;
+        MTLWinding winding;
 
-        switch(ctx->state.var.cull_face_mode)
-        {
-            case GL_BACK: cull_mode = MTLCullModeBack; break;
-            case GL_FRONT: cull_mode = MTLCullModeFront; break;
-            default:
-                cull_mode = MTLCullModeNone;
-        }
+        if (ctx->state.caps.cull_face && ctx->state.var.cull_face_mode == GL_BACK)
+            cull_mode = MTLCullModeBack;
+        else if (ctx->state.caps.cull_face && ctx->state.var.cull_face_mode == GL_FRONT)
+            cull_mode = MTLCullModeFront;
 
         [_currentRenderEncoder setCullMode:cull_mode];
 
-        MTLWinding winding;
+        // set with culling off too, for gl_FrontFacing
 
         winding = ctx->state.var.front_face - GL_CW;
 
@@ -6371,6 +6736,11 @@ static id<MTLFunction> stageFunction(id<MTLLibrary> library, const char *entry)
         else
             [_currentRenderEncoder setDepthBias: 0.0f slopeScale: 0.0f clamp: 0.0f];
     }
+
+    [_currentRenderEncoder setBlendColorRed: ctx->state.var.blend_color[0]
+                                      green: ctx->state.var.blend_color[1]
+                                       blue: ctx->state.var.blend_color[2]
+                                      alpha: ctx->state.var.blend_color[3]];
 
     [self bindBindlessToRenderEncoder];
 }
@@ -6550,7 +6920,7 @@ static MTLPixelFormat drawFormat(GLMContext ctx, MTLPixelFormat f)
                 _renderPassDescriptor.renderTargetArrayLength =
                     fbo->default_layers > 0 ? (NSUInteger)fbo->default_layers : 0;
                 _renderPassDescriptor.defaultRasterSampleCount =
-                    fbo->default_samples > 1 ? (NSUInteger)fbo->default_samples : 1;
+                    mglFramebufferSamples(fbo) > 1 ? (NSUInteger)mglFramebufferSamples(fbo) : 1;
             }
         }
     }
@@ -6735,6 +7105,14 @@ static MTLPixelFormat drawFormat(GLMContext ctx, MTLPixelFormat f)
                 }
 
                 _renderPassDescriptor.colorAttachments[i].storeAction = MTLStoreActionStore;
+
+                if (hidesAlpha(ctx, i))
+                {
+                    MTLClearColor cc = _renderPassDescriptor.colorAttachments[i].clearColor;
+
+                    _renderPassDescriptor.colorAttachments[i].clearColor =
+                        MTLClearColorMake(cc.red, cc.green, cc.blue, 1.0);
+                }
             }
         }
 
@@ -6758,13 +7136,13 @@ static MTLPixelFormat drawFormat(GLMContext ctx, MTLPixelFormat f)
 
         if (ctx->state.clear_bitmask & GL_STENCIL_BUFFER_BIT)
         {
-            _renderPassDescriptor.stencilAttachment.clearStencil = clear_stencil;
+            _renderPassDescriptor.stencilAttachment.clearStencil = clear_stencil & 0xFF;
 
             _renderPassDescriptor.stencilAttachment.loadAction = MTLLoadActionClear;
         }
         else if (clear_fbo && (clear_fbo->stencil.clear_bitmask & GL_STENCIL_BUFFER_BIT))
         {
-            _renderPassDescriptor.stencilAttachment.clearStencil = (GLint)clear_fbo->stencil.clear_color[0];
+            _renderPassDescriptor.stencilAttachment.clearStencil = (GLint)clear_fbo->stencil.clear_color[0] & 0xFF;
 
             _renderPassDescriptor.stencilAttachment.loadAction = MTLLoadActionClear;
             clear_fbo->stencil.clear_bitmask &= ~GL_STENCIL_BUFFER_BIT;
@@ -6821,6 +7199,9 @@ static MTLPixelFormat drawFormat(GLMContext ctx, MTLPixelFormat f)
                     continue;
 
                 _scissorClearColorMask |= 1u << i;
+
+                if (hidesAlpha(ctx, i))
+                    _scissorClearColors[i][3] = 1.0f;
             }
 
             _scissorClearDepth = (ctx->state.clear_bitmask & GL_DEPTH_BUFFER_BIT) || !clear_fbo
@@ -7060,7 +7441,7 @@ typedef struct { float color[MAX_COLOR_ATTACHMENTS][4]; float depth; float pad[3
     if (tw == 0 || th == 0)
         return false;
 
-    return !(x <= 0 && y <= 0 && (NSUInteger)(x + w) >= tw && (NSUInteger)(y + h) >= th);
+    return !(x <= 0 && y <= 0 && (long)x + w >= (long)tw && (long)y + h >= (long)th);
 }
 
 // True when a write mask keeps glClear from writing everything it names
@@ -7182,7 +7563,7 @@ static char clearColorKind(MTLPixelFormat f)
             continue;
 
         desc.colorAttachments[i].pixelFormat = t.pixelFormat;
-        desc.colorAttachments[i].writeMask = masks[i];
+        desc.colorAttachments[i].writeMask = writeMaskFor(t.pixelFormat, masks[i]);
     }
 
     if (dt)
@@ -7267,7 +7648,7 @@ static char clearColorKind(MTLPixelFormat f)
 
     [_currentRenderEncoder setRenderPipelineState: ps];
     [_currentRenderEncoder setDepthStencilState: [_device newDepthStencilStateWithDescriptor: dsd]];
-    [_currentRenderEncoder setStencilReferenceValue: _scissorClearStencil];
+    [_currentRenderEncoder setStencilReferenceValue: _scissorClearStencil & 0xFF];
     [_currentRenderEncoder setCullMode: MTLCullModeNone];
     {
         // as many viewports as there are scissor boxes, all the whole target
@@ -7556,12 +7937,46 @@ static char clearColorKind(MTLPixelFormat f)
 // Copy one texture into another by drawing it. MTLBlitCommandEncoder only
 // copies between matching pixel formats and refuses a framebuffer-only
 // drawable, so anything that has to change format comes through here.
+// 1 for a signed integer format, 2 for an unsigned one, 0 for the rest
+static int blitIntegerKind(MTLPixelFormat f)
+{
+    switch (f)
+    {
+        case MTLPixelFormatR8Sint: case MTLPixelFormatRG8Sint: case MTLPixelFormatRGBA8Sint:
+        case MTLPixelFormatR16Sint: case MTLPixelFormatRG16Sint: case MTLPixelFormatRGBA16Sint:
+        case MTLPixelFormatR32Sint: case MTLPixelFormatRG32Sint: case MTLPixelFormatRGBA32Sint:
+            return 1;
+
+        case MTLPixelFormatR8Uint: case MTLPixelFormatRG8Uint: case MTLPixelFormatRGBA8Uint:
+        case MTLPixelFormatR16Uint: case MTLPixelFormatRG16Uint: case MTLPixelFormatRGBA16Uint:
+        case MTLPixelFormatR32Uint: case MTLPixelFormatRG32Uint: case MTLPixelFormatRGBA32Uint:
+        case MTLPixelFormatRGB10A2Uint:
+            return 2;
+
+        default:
+            return 0;
+    }
+}
+
 - (bool) shaderBlitFrom: (id<MTLTexture>) src
                  origin: (MTLOrigin) srcOrigin
                    size: (MTLSize) srcSize
                      to: (id<MTLTexture>) dst
                  origin: (MTLOrigin) dstOrigin
                    size: (MTLSize) dstSize
+{
+    float rect[4] = { (float)srcOrigin.x, (float)srcOrigin.y, (float)srcSize.width, (float)srcSize.height };
+
+    return [self shaderBlitFrom: src rect: rect to: dst origin: dstOrigin size: dstSize linear: false];
+}
+
+// rect is x, y, width, height in source texels; a negative size reads it mirrored
+- (bool) shaderBlitFrom: (id<MTLTexture>) src
+                   rect: (const float *) rect
+                     to: (id<MTLTexture>) dst
+                 origin: (MTLOrigin) dstOrigin
+                   size: (MTLSize) dstSize
+                 linear: (bool) linear
 {
     if (src == nil || dst == nil)
         return false;
@@ -7584,7 +7999,8 @@ static char clearColorKind(MTLPixelFormat f)
         _blitPipelines = [NSMutableDictionary dictionary];
     }
 
-    NSNumber *key = @((unsigned long)dst.pixelFormat);
+    bool nearest = !linear && !blitIntegerKind(dst.pixelFormat);
+    NSNumber *key = @((unsigned long)dst.pixelFormat * 2 + (nearest ? 1 : 0));
     id<MTLRenderPipelineState> pipeline = _blitPipelines[key];
 
     if (pipeline == nil)
@@ -7592,9 +8008,14 @@ static char clearColorKind(MTLPixelFormat f)
         MTLRenderPipelineDescriptor *desc = [[MTLRenderPipelineDescriptor alloc] init];
         NSError *err = nil;
 
+        int kind = blitIntegerKind(dst.pixelFormat);
+
         desc.label = @"MGL blit";
-        desc.vertexFunction = [_blitLibrary newFunctionWithName: @"mglBlitVertex"];
-        desc.fragmentFunction = [_blitLibrary newFunctionWithName: @"mglBlitFragment"];
+        desc.vertexFunction = [_blitLibrary newFunctionWithName: kind ? @"mglBlitVertexInt" : @"mglBlitVertex"];
+        desc.fragmentFunction = [_blitLibrary newFunctionWithName: kind == 1 ? @"mglBlitFragmentInt" :
+                                                                   kind == 2 ? @"mglBlitFragmentUint" :
+                                                                   nearest ? @"mglBlitFragmentNearest" :
+                                                                               @"mglBlitFragment"];
         desc.colorAttachments[0].pixelFormat = dst.pixelFormat;
         desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
 
@@ -7629,7 +8050,7 @@ static char clearColorKind(MTLPixelFormat f)
     if (enc == nil)
         return false;
 
-    float args[4] = { (float)srcOrigin.x, (float)srcOrigin.y, (float)srcSize.width, (float)srcSize.height };
+    float args[4] = { rect[0], rect[1], rect[2], rect[3] };
 
     [enc setRenderPipelineState: pipeline];
     if (_blitFlipY)
@@ -7639,9 +8060,28 @@ static char clearColorKind(MTLPixelFormat f)
         [enc setViewport: (MTLViewport){ (double)dstOrigin.x, (double)dstOrigin.y,
                                          (double)dstSize.width, (double)dstSize.height, 0.0, 1.0 }];
     [enc setVertexBytes: args length: sizeof(args) atIndex: 0];
-    [enc setVertexTexture: src atIndex: 0];
+
+    if (blitIntegerKind(dst.pixelFormat))
+    {
+        float texel[2] = { (float)src.width, (float)src.height };
+
+        [enc setVertexBytes: texel length: sizeof(texel) atIndex: 1];
+    }
+    else
+    {
+        [enc setVertexTexture: src atIndex: 0];
+        [enc setFragmentSamplerState: linear ? [self linearBlitSampler] : [self defaultSamplerState] atIndex: 0];
+    }
+
+    if (nearest)
+    {
+        float fargs[9] = { rect[0], rect[1], rect[2], rect[3], (float)dstOrigin.x, (float)dstOrigin.y,
+                           (float)dstSize.width, (float)dstSize.height, _blitFlipY ? 1.0f : 0.0f };
+
+        [enc setFragmentBytes: fargs length: sizeof(fargs) atIndex: 0];
+    }
+
     [enc setFragmentTexture: src atIndex: 0];
-    [enc setFragmentSamplerState: [self defaultSamplerState] atIndex: 0];
     [enc drawPrimitives: MTLPrimitiveTypeTriangle vertexStart: 0 vertexCount: 3];
     [enc endEncoding];
 
@@ -7746,6 +8186,23 @@ static char clearColorKind(MTLPixelFormat f)
 }
 
 // A stand-in for a sampler the app declared but never bound.
+- (id<MTLSamplerState>) linearBlitSampler
+{
+    if (_linearBlitSampler == nil)
+    {
+        MTLSamplerDescriptor *desc = [[MTLSamplerDescriptor alloc] init];
+
+        desc.minFilter = MTLSamplerMinMagFilterLinear;
+        desc.magFilter = MTLSamplerMinMagFilterLinear;
+        desc.sAddressMode = MTLSamplerAddressModeClampToEdge;
+        desc.tAddressMode = MTLSamplerAddressModeClampToEdge;
+
+        _linearBlitSampler = [_device newSamplerStateWithDescriptor: desc];
+    }
+
+    return _linearBlitSampler;
+}
+
 - (id<MTLSamplerState>) defaultSamplerState
 {
     if (_defaultSampler == nil)
@@ -8060,6 +8517,17 @@ static bool restartIndexFor(GLMContext ctx, size_t elem, uint32_t *out)
             for (GLsizei k = 0; k < (GLsizei)per; k++)
                 order[n++] = k;
             break;
+    }
+
+    // a rotated triangle is (last, first, middle) and a rotated line
+    // (second, first); recording goes in the order GL gave them
+    if (ctx->state.draw_rotated && (mode == GL_TRIANGLES || mode == GL_LINES))
+    {
+        GLuint p = mode == GL_TRIANGLES ? 3 : 2;
+
+        for (GLuint k = 0; k + p <= n; k += p)
+            for (GLuint j = 0; j < p; j++)
+                order[k + j] = (GLsizei)(k + (p == 3 ? (j + 1) % 3 : 1 - j));
     }
 
     // only as many as the buffers have room for
@@ -10546,9 +11014,11 @@ static MTLWinding mtlWindingFor(const Program *p)
 
             if (is_double)
                 format = VAO_ATTRIB_STATE(i).size >= 2 ? MTLVertexFormatUInt4 : MTLVertexFormatUInt2;
-            // the slot is fed a float4 copy
+            // the slot is fed a float4 copy, or an int4 one for an integer attribute
             else if (attribNeedsConversion(ctx, i))
-                format = MTLVertexFormatFloat4;
+                format = !VAO_ATTRIB_STATE(i).is_integer ? MTLVertexFormatFloat4 :
+                         (VAO_ATTRIB_STATE(i).type == GL_BYTE || VAO_ATTRIB_STATE(i).type == GL_SHORT ||
+                          VAO_ATTRIB_STATE(i).type == GL_INT) ? MTLVertexFormatInt4 : MTLVertexFormatUInt4;
             else
                 format = glTypeSizeToMtlType(VAO_ATTRIB_STATE(i).type,
                                              VAO_ATTRIB_STATE(i).size,
@@ -10661,6 +11131,11 @@ static MTLWinding mtlWindingFor(const Program *p)
             vl->layout[MGL_CONSTANT_ATTRIB_BUFFER_INDEX].step = (uint16_t)(MTLVertexStepFunctionConstant);
         }
     }
+
+    // an aliased input reads the same array as the attribute it was bound to
+    for (int i = 0; ctx->state.program && i < 31; i++)
+        if (ctx->state.program->attrib_alias[i])
+            vl->attr[i] = vl->attr[ctx->state.program->attrib_alias[i] - 1];
 
     // clear all dirty bits as they have been translated into a vertex descriptor
     ctx->state.vao->dirty_bits = 0;
@@ -10819,6 +11294,13 @@ static MTLWinding mtlWindingFor(const Program *p)
             pipelineStateDescriptor.colorAttachments[i].alphaBlendOperation = _alpha_blend_operation[i];
 
             pipelineStateDescriptor.colorAttachments[i].writeMask = _color_mask[i];
+
+            if (hidesAlpha(ctx, i))
+                pipelineStateDescriptor.colorAttachments[i].writeMask &= ~MTLColorWriteMaskAlpha;
+
+            pipelineStateDescriptor.colorAttachments[i].writeMask =
+                writeMaskFor(pipelineStateDescriptor.colorAttachments[i].pixelFormat,
+                             pipelineStateDescriptor.colorAttachments[i].writeMask);
         }
     }
 }
@@ -11882,6 +12364,7 @@ static bool unitTakesAtomics(GLMContext ctx, int unit)
         GLsizei n = mglDrawFramebufferSamples(ctx);
 
         mglWriteNumSamples(ctx, ctx->state.program, n > 1 ? n : 1);
+        mglWriteDepthRange(ctx, ctx->state.program);
 
         mglWriteIndexedDraw(ctx, ctx->state.program, ctx->state.draw_indexed ? 1 : 0);
 
@@ -14710,6 +15193,13 @@ bool mtlClearTexRegion(GLMContext glm_ctx, Texture *tex, GLuint face, GLuint lev
     }
 }
 
+bool mtlRefreshTexture(GLMContext glm_ctx, Texture *tex)
+{
+    @autoreleasepool {
+        return [(__bridge id) glm_ctx->mtl_funcs.mtlObj refreshTexture: tex];
+    }
+}
+
 bool mtlUpdateTexRegion(GLMContext glm_ctx, Texture *tex, GLuint face, GLuint level,
                         size_t x, size_t y, size_t z, size_t w, size_t h, size_t d)
 {
@@ -16204,6 +16694,7 @@ void mtlMultiDrawElementsIndirect(GLMContext glm_ctx, GLenum mode, GLenum type, 
     glm_ctx->mtl_funcs.mtlGenerateMipmaps = mtlGenerateMipmaps;
     glm_ctx->mtl_funcs.mtlTexSubImage = mtlTexSubImage;
     glm_ctx->mtl_funcs.mtlUpdateTexRegion = mtlUpdateTexRegion;
+    glm_ctx->mtl_funcs.mtlRefreshTexture = mtlRefreshTexture;
     glm_ctx->mtl_funcs.mtlClearTexRegion = mtlClearTexRegion;
     glm_ctx->mtl_funcs.mtlInvalidateAttachments = mtlInvalidateAttachments;
 
@@ -16290,7 +16781,8 @@ void* CppCreateMGLRendererFromContextAndBindToWindow (void *glm_ctx, void *windo
     return  (__bridge void *)(renderer);
 }
 
-void* CppCreateMGLRendererHeadless (void *glm_ctx)
+// a headless default framebuffer of width by height
+void* CppCreateMGLRendererHeadlessSize (void *glm_ctx, int width, int height)
 {
     assert (glm_ctx);
     MGLRenderer *renderer = [[MGLRenderer alloc] init];
@@ -16298,12 +16790,17 @@ void* CppCreateMGLRendererHeadless (void *glm_ctx)
 
     // The default framebuffer has to be as big as the viewport MGL reports, or
     // a caller that trusts GL_VIEWPORT reads back memory nothing drew into.
-    NSView *view = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 1024, 768)];
+    NSView *view = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, width, height)];
     assert (view);
     [view setWantsLayer:YES];
 
     [renderer createMGLRendererAndBindToContext: glm_ctx view: view];
     return  (__bridge void *)(renderer);
+}
+
+void* CppCreateMGLRendererHeadless (void *glm_ctx)
+{
+    return CppCreateMGLRendererHeadlessSize(glm_ctx, 1024, 768);
 }
 
 // A view in no window is headless. Nothing is ever presented there, and

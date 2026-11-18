@@ -193,8 +193,16 @@ GPU_TEST(state_indexed, graphics_reset_status_is_no_error)
 GPU_TEST(state_indexed, get_multisamplefv_returns_sample_position)
 {
     GLfloat pos[2] = { -1, -1 };
+    GLuint rbo, fbo;
 
-    glGetMultisamplefv(GL_SAMPLE_POSITION, 0, pos);
+    glGenRenderbuffers(1, &rbo);
+    glBindRenderbuffer(GL_RENDERBUFFER, rbo);
+    glRenderbufferStorageMultisample(GL_RENDERBUFFER, 4, GL_RGBA8, 8, 8);
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, rbo);
+
+    glGetMultisamplefv(GL_SAMPLE_POSITION, 3, pos);
     CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
 
     // sample position must be in [0,1]
@@ -204,6 +212,14 @@ GPU_TEST(state_indexed, get_multisamplefv_returns_sample_position)
     // invalid pname
     glGetMultisamplefv(0x9999, 0, pos);
     CHECK_EQ_UINT(mgl_drain_errors(), GL_INVALID_ENUM);
+
+    // past GL_SAMPLES
+    glGetMultisamplefv(GL_SAMPLE_POSITION, 4, pos);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_INVALID_VALUE);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &fbo);
+    glDeleteRenderbuffers(1, &rbo);
 }
 
 /* ---------- pixel store float ---------- */

@@ -782,3 +782,241 @@ GPU_TEST(draw, clear_respects_write_masks)
 
     mgl_target_destroy(&t);
 }
+
+GPU_TEST(draw, blend_uses_the_blend_color)
+{
+    static const char *VS =
+        "#version 330 core\n"
+        "layout(location = 0) in vec2 pos;\n"
+        "void main() { gl_Position = vec4(pos, 0.0, 1.0); }\n";
+    static const char *FS =
+        "#version 330 core\n"
+        "out vec4 color;\n"
+        "void main() { color = vec4(1.0); }\n";
+    MGLTestTarget t;
+    char log[512] = "";
+    GLuint vbo, vao, prog;
+    unsigned char *px, p[4];
+
+    if (!mgl_target_create(&t, 8, 8, GL_RGBA8, 0))
+        SKIP("no target");
+
+    prog = mgl_build_program(VS, FS, log, sizeof log);
+    CHECK_MSG(prog != 0, "%s", log);
+    vao = mgl_fullscreen_quad(&vbo);
+
+    mgl_target_bind(&t);
+    glViewport(0, 0, 8, 8);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glUseProgram(prog);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_CONSTANT_COLOR, GL_ZERO);
+    glBlendColor(0.5f, 0.25f, 0.0f, 1.0f);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glDisable(GL_BLEND);
+
+    px = mgl_read_rgba8(&t);
+    mgl_pixel_at(px, &t, 4, 4, p);
+    CHECK_MSG(abs(p[0] - 128) <= 2 && abs(p[1] - 64) <= 2 && p[2] == 0, "drew %d %d %d", p[0], p[1], p[2]);
+    free(px);
+
+    glBlendColor(0, 0, 0, 0);
+    glUseProgram(0);
+    glDeleteProgram(prog);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo);
+    mgl_target_destroy(&t);
+}
+
+GPU_TEST(draw, a_scissor_box_off_the_target_draws_nothing)
+{
+    static const char *VS =
+        "#version 330 core\n"
+        "layout(location = 0) in vec2 pos;\n"
+        "void main() { gl_Position = vec4(pos, 0.0, 1.0); }\n";
+    static const char *FS =
+        "#version 330 core\n"
+        "out vec4 color;\n"
+        "void main() { color = vec4(1.0); }\n";
+    MGLTestTarget t;
+    char log[512] = "";
+    GLuint vbo, vao, prog;
+    unsigned char *px, p[4];
+
+    if (!mgl_target_create(&t, 8, 8, GL_RGBA8, 0))
+        SKIP("no target");
+
+    prog = mgl_build_program(VS, FS, log, sizeof log);
+    CHECK_MSG(prog != 0, "%s", log);
+    vao = mgl_fullscreen_quad(&vbo);
+
+    mgl_target_bind(&t);
+    glViewport(0, 0, 8, 8);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glUseProgram(prog);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(-20, -20, 10, 10);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glDisable(GL_SCISSOR_TEST);
+
+    px = mgl_read_rgba8(&t);
+    mgl_pixel_at(px, &t, 4, 4, p);
+    CHECK_MSG(p[0] == 0, "drew %d %d %d", p[0], p[1], p[2]);
+    free(px);
+
+    glUseProgram(0);
+    glDeleteProgram(prog);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo);
+    mgl_target_destroy(&t);
+}
+
+static GLuint drawProgram(const char *fs_body)
+{
+    static const char *VS =
+        "#version 330 core\n"
+        "layout(location = 0) in vec2 pos;\n"
+        "void main() { gl_Position = vec4(pos, 0.0, 1.0); gl_PointSize = 4.0; }\n";
+    char fs[512], log[512] = "";
+
+    snprintf(fs, sizeof fs, "#version 330 core\nout vec4 color;\nvoid main() { %s }\n", fs_body);
+    return mgl_build_program(VS, fs, log, sizeof log);
+}
+
+static void centre(MGLTestTarget *t, unsigned char p[4])
+{
+    unsigned char *px = mgl_read_rgba8(t);
+
+    mgl_pixel_at(px, t, 4, 4, p);
+    free(px);
+}
+
+GPU_TEST(draw, discard_cull_and_depth_range_rules)
+{
+    MGLTestTarget t;
+    GLuint vbo, vao, prog, ranged;
+    unsigned char p[4];
+    GLint v = 0;
+
+    if (!mgl_target_create(&t, 8, 8, GL_RGBA8, 0))
+        SKIP("no target");
+
+    prog = drawProgram("color = vec4(1.0);");
+    ranged = drawProgram("color = vec4(gl_DepthRange.far, gl_DepthRange.near, gl_DepthRange.diff, 1.0);");
+    CHECK(prog != 0 && ranged != 0);
+    vao = mgl_fullscreen_quad(&vbo);
+
+    mgl_target_bind(&t);
+    glViewport(0, 0, 8, 8);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    // a clear does nothing while the raster is off
+    glEnable(GL_RASTERIZER_DISCARD);
+    glClearColor(1, 1, 1, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDisable(GL_RASTERIZER_DISCARD);
+    centre(&t, p);
+    CHECK_MSG(p[0] == 0, "discarded clear left %d", p[0]);
+
+    // both faces culled: no triangles
+    glUseProgram(prog);
+    glEnable(GL_CULL_FACE);
+    glCullFace(GL_FRONT_AND_BACK);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    centre(&t, p);
+    CHECK_MSG(p[0] == 0, "culled triangles drew %d", p[0]);
+    glDisable(GL_CULL_FACE);
+    glCullFace(GL_BACK);
+
+    // gl_DepthRange follows glDepthRange
+    glUseProgram(ranged);
+    glDepthRange(0.25, 0.75);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    centre(&t, p);
+    CHECK_MSG(abs(p[0] - 191) <= 2 && abs(p[1] - 64) <= 2 && abs(p[2] - 128) <= 2, "depth range read %d %d %d",
+              p[0], p[1], p[2]);
+    glDepthRange(0.0, 1.0);
+
+    // GL's provoking vertex starts as the last one
+    glGetIntegerv(GL_PROVOKING_VERTEX, &v);
+    CHECK_EQ_INT(v, GL_LAST_VERTEX_CONVENTION);
+
+    glUseProgram(0);
+    glDeleteProgram(prog);
+    glDeleteProgram(ranged);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo);
+    mgl_target_destroy(&t);
+}
+
+GPU_TEST(draw, fixed_point_attributes_pack_tightly)
+{
+    static const GLint quad[12] = { -65536, -65536,  65536, -65536,  -65536, 65536,
+                                       65536, -65536,  65536, 65536,  -65536, 65536 };
+    MGLTestTarget t;
+    GLuint vbo, vao, prog;
+    unsigned char p[4];
+
+    if (!mgl_target_create(&t, 8, 8, GL_RGBA8, 0))
+        SKIP("no target");
+
+    prog = drawProgram("color = vec4(1.0);");
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    glGenBuffers(1, &vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof quad, quad, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 2, GL_FIXED, GL_FALSE, 0, 0);
+    glEnableVertexAttribArray(0);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+
+    mgl_target_bind(&t);
+    glViewport(0, 0, 8, 8);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glUseProgram(prog);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    centre(&t, p);
+    CHECK_MSG(p[0] == 255, "fixed quad drew %d", p[0]);
+
+    glUseProgram(0);
+    glBindVertexArray(0);
+    glDeleteProgram(prog);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo);
+    mgl_target_destroy(&t);
+}
+
+GPU_TEST(draw, front_facing_follows_front_face_without_culling)
+{
+    MGLTestTarget t;
+    GLuint vbo, vao, prog;
+    unsigned char a[4], b[4];
+
+    if (!mgl_target_create(&t, 8, 8, GL_RGBA8, 0))
+        SKIP("no target");
+
+    prog = drawProgram("color = gl_FrontFacing ? vec4(0, 1, 0, 1) : vec4(0, 0, 1, 1);");
+    vao = mgl_fullscreen_quad(&vbo);
+    mgl_target_bind(&t);
+    glViewport(0, 0, 8, 8);
+    glUseProgram(prog);
+
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    centre(&t, a);
+    glFrontFace(GL_CW);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    centre(&t, b);
+    glFrontFace(GL_CCW);
+
+    CHECK_MSG(a[1] != b[1] && a[2] != b[2], "the same face both times: %d %d / %d %d", a[1], a[2], b[1], b[2]);
+
+    glUseProgram(0);
+    glDeleteProgram(prog);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo);
+    mgl_target_destroy(&t);
+}

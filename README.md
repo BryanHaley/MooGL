@@ -104,7 +104,7 @@ MooGL-SDK/
               libffx_fsr2_api.dylib (FSR 2 on MetalFX)
               cmake/MooGL/  cmake/SDL2/  cmake/SDL3/  cmake/SFML/  cmake/raylib/  cmake/glfw3/
   include/    GL/glcorearb.h  GL/gl.h  GL/glext.h  GL/glu.h  GL/freeglut.h  GLUT/glut.h  AGL/agl.h
-              KHR/khrplatform.h
+              GLES2/  GLES3/  KHR/khrplatform.h
               GLFW/  SDL2/  SDL3/  SFML/  raylib.h  raymath.h  rlgl.h  rcamera.h  imgui/  MGLContext.h  ffx-fsr2/
   sfml2/      SFML 2.6, with its own include/, lib/ and CMake package
   examples/   triangle/ (GLFW)  sdl2_triangle/ sdl3_triangle/ (SDL)  glut_teapot/ (GLUT)
@@ -216,7 +216,11 @@ A few things differ from Apple's driver:
 - `SDL_Renderer` uses Metal by default, as on any Mac. Its `opengl` backend works too, through a
   compatibility context: set `SDL_HINT_RENDER_DRIVER` to `"opengl"`.
 
-OpenGL ES contexts aren't offered yet; they're on the roadmap.
+- OpenGL ES 3.1 contexts come from the same library, in a build made with `make OGL_ES=1`; the
+  SDK is built that way. Ask GLFW for `GLFW_OPENGL_ES_API` or SDL for
+  `SDL_GL_CONTEXT_PROFILE_ES`: any request from ES 2.0 to 3.1 gets 3.1, with the ES strings,
+  formats, errors and GLSL ES 1.00, 3.00 and 3.10. SDL's `opengles2` renderer works on one.
+  ES 3.2 isn't offered.
 
 ### 2. Call GL functions
 
@@ -609,8 +613,10 @@ git clone --recursive https://github.com/BryanHaley/MGL.git
 cd MGL
 tools/build_deps.sh      # SPIRV-Cross, SPIRV-Tools, glslang and GLFW, built once
 make -j                  # build/libmoogl.dylib, GLFW, SDL, SFML, raylib and the FSR 2 libraries
+make -j OGL_ES=1         # the same, with OpenGL ES contexts
 make test                # MooGL's own suite (needs a GPU and a logged-in session)
 make window-test         # GLFW, SDL, SFML, raylib and GLUT in real windows
+make OGL_ES=1 gles-demo  # the OpenGLESDemo samples on ES contexts
 tools/make_sdk.sh        # the SDK, as dist/MooGL-SDK-<version>-macos-arm64.tar.gz
 ```
 

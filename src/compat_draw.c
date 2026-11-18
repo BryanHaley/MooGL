@@ -520,11 +520,109 @@ static void issue(GLMContext ctx, GLenum mode, GLint first, GLsizei count, GLenu
     }
 }
 
+// Whether flat inputs need GL's last-vertex rule, which Metal does not have
+static bool wantsLastProvoking(GLMContext ctx, GLenum mode)
+{
+    Program *p = ctx->state.program;
+    bool flat = false;
+
+    // with a pipeline bound, the fragment stage's own program
+    if (p == NULL && ctx->state.program_pipeline)
+    {
+        ProgramPipeline *pp = ctx->state.program_pipeline;
+
+        if (pp->stage_programs[_GEOMETRY_SHADER] || pp->stage_programs[_TESS_EVALUATION_SHADER])
+            return false;
+
+        p = pp->stage_programs[_FRAGMENT_SHADER];
+    }
+
+    if (STATE_VAR(provoking_vertex) != GL_LAST_VERTEX_CONVENTION || p == NULL || mglProgramHasGeometry(p) ||
+        p->tess.active)
+        return false;
+
+
+    for (GLuint i = 0; i < p->spirv_resources_list[_FRAGMENT_SHADER][SPVC_RESOURCE_TYPE_STAGE_INPUT].count; i++)
+        flat |= p->spirv_resources_list[_FRAGMENT_SHADER][SPVC_RESOURCE_TYPE_STAGE_INPUT].list[i].flat;
+
+    if (!flat)
+        return false;
+
+    return mode == GL_TRIANGLES || mode == GL_TRIANGLE_STRIP || mode == GL_TRIANGLE_FAN ||
+           mode == GL_LINES || mode == GL_LINE_STRIP || mode == GL_LINE_LOOP;
+}
+
+// The vertices v as a list of triangles or lines, each starting with the
+// vertex GL makes provoking: Metal's flat inputs come from a primitive's first.
+// Points just lose their restarts, which Metal would draw.
+static GLuint *lastProvoking(GLenum mode, const GLuint *v, GLsizei n, bool restart, GLuint restart_value,
+                             GLsizei *out_n, GLenum *out_mode)
+{
+    GLuint *ix = (GLuint *)malloc(((size_t)n * 3 + 2) * sizeof(GLuint));
+    GLsizei k = 0;
+
+    if (ix == NULL)
+        return NULL;
+
+    for (GLsizei s = 0; s < n;)
+    {
+        GLsizei e = s;
+
+        while (e < n && !(restart && v[e] == restart_value))
+            e++;
+
+        const GLuint *r = v + s;
+        GLsizei m = e - s;
+
+        switch (mode)
+        {
+            case GL_POINTS:
+                for (GLsizei i = 0; i < m; i++)
+                    ix[k++] = r[i];
+                break;
+            case GL_TRIANGLES:
+                for (GLsizei i = 0; i + 2 < m; i += 3)
+                { ix[k++] = r[i + 2]; ix[k++] = r[i]; ix[k++] = r[i + 1]; }
+                break;
+            case GL_TRIANGLE_STRIP:
+                for (GLsizei i = 0; i + 2 < m; i++)
+                {
+                    ix[k++] = r[i + 2];
+                    ix[k++] = r[i + (i & 1)];
+                    ix[k++] = r[i + 1 - (i & 1)];
+                }
+                break;
+            case GL_TRIANGLE_FAN:
+                for (GLsizei i = 1; i + 1 < m; i++)
+                { ix[k++] = r[i + 1]; ix[k++] = r[0]; ix[k++] = r[i]; }
+                break;
+            case GL_LINES:
+                for (GLsizei i = 0; i + 1 < m; i += 2)
+                { ix[k++] = r[i + 1]; ix[k++] = r[i]; }
+                break;
+            default:    // strip and loop
+                for (GLsizei i = 0; i + 1 < m; i++)
+                { ix[k++] = r[i + 1]; ix[k++] = r[i]; }
+                if (mode == GL_LINE_LOOP && m > 1)
+                { ix[k++] = r[0]; ix[k++] = r[m - 1]; }
+                break;
+        }
+
+        s = e + 1;
+    }
+
+    *out_n = k;
+    *out_mode = mode == GL_POINTS ? GL_POINTS :
+                mode == GL_TRIANGLES || mode == GL_TRIANGLE_STRIP || mode == GL_TRIANGLE_FAN ? GL_TRIANGLES : GL_LINES;
+    return ix;
+}
+
 // One pass of a draw: quads expanded, client arrays staged, the program in place.
 static void drawOnce(GLMContext ctx, GLenum mode, GLint first, GLsizei count, GLenum type, const void *indices,
                      GLsizei instances, GLint basevertex, GLuint baseinstance)
 {
     GLuint *expanded = NULL;
+    bool rotated = false;
     GLsizei n = 0;
     GLuint lo = 0, hi = 0;
     StagedSet staged = { .n = 0 };
@@ -573,6 +671,44 @@ static void drawOnce(GLMContext ctx, GLenum mode, GLint first, GLsizei count, GL
             STATE(vao)->element_array.buffer = NULL;
         }
     }
+    else if (wantsLastProvoking(ctx, mode) ||
+             (mode == GL_POINTS && type &&
+              (ctx->state.caps.primitive_restart_fixed_index || ctx->state.caps.primitive_restart)))
+    {
+        GLuint *v = (GLuint *)malloc((size_t)(count > 0 ? count : 1) * sizeof(GLuint));
+        GLuint mask = type == GL_UNSIGNED_BYTE ? 0xFFu : type == GL_UNSIGNED_SHORT ? 0xFFFFu : 0xFFFFFFFFu;
+        bool restart = type && (ctx->state.caps.primitive_restart_fixed_index || ctx->state.caps.primitive_restart);
+        GLuint restart_value = ctx->state.caps.primitive_restart_fixed_index ? mask :
+                               (ctx->state.var.primitive_restart_index & mask);
+        const void *src = type ? indexData(ctx, type, indices, count) : NULL;
+
+        if (v == NULL || (type && src == NULL))
+        {
+            free(v);
+            return;
+        }
+
+        for (GLsizei i = 0; i < count; i++)
+            v[i] = type ? indexAt(src, type, i) : (GLuint)(first + i);
+
+        expanded = lastProvoking(mode, v, count, restart, restart_value, &n, &mode);
+        free(v);
+        rotated = true;
+
+        if (expanded == NULL)
+            return;
+
+        type = GL_UNSIGNED_INT;
+        indices = expanded;
+        count = n;
+        first = 0;
+
+        if (STATE(vao))
+        {
+            element_buffer = STATE(vao)->element_array.buffer;
+            STATE(vao)->element_array.buffer = NULL;
+        }
+    }
 
     if (client)
     {
@@ -583,9 +719,19 @@ static void drawOnce(GLMContext ctx, GLenum mode, GLint first, GLsizei count, GL
             if (src == NULL)
                 goto done;
 
+            GLuint mask = type == GL_UNSIGNED_BYTE ? 0xFFu : type == GL_UNSIGNED_SHORT ? 0xFFFFu : 0xFFFFFFFFu;
+            bool restart = ctx->state.caps.primitive_restart_fixed_index || ctx->state.caps.primitive_restart;
+            GLuint restart_index = ctx->state.caps.primitive_restart_fixed_index ? mask :
+                                   (ctx->state.var.primitive_restart_index & mask);
+
             for (GLsizei i = 0; i < count; i++)
             {
-                GLuint v = indexAt(src, type, i) + (GLuint)basevertex;
+                GLuint raw = indexAt(src, type, i), v = raw + (GLuint)basevertex;
+
+                // the restart index names no vertex
+                if (restart && raw == restart_index)
+                    continue;
+
                 hi = v > hi ? v : hi;
             }
         }
@@ -641,7 +787,21 @@ static void drawOnce(GLMContext ctx, GLenum mode, GLint first, GLsizei count, GL
     if (!enterProgram(ctx, mode, &ps))
         goto done;
 
-    issue(ctx, mode, first, count, type, indices, instances, basevertex, baseinstance);
+    {
+        // rewritten indices hold no restarts, and any of them may equal the restart index
+        GLboolean restart = ctx->state.caps.primitive_restart;
+        GLboolean restart_fixed = ctx->state.caps.primitive_restart_fixed_index;
+
+        if (expanded)
+            ctx->state.caps.primitive_restart = ctx->state.caps.primitive_restart_fixed_index = GL_FALSE;
+
+        ctx->state.draw_rotated = rotated && mode != GL_POINTS;
+        issue(ctx, mode, first, count, type, indices, instances, basevertex, baseinstance);
+        ctx->state.draw_rotated = GL_FALSE;
+
+        ctx->state.caps.primitive_restart = restart;
+        ctx->state.caps.primitive_restart_fixed_index = restart_fixed;
+    }
 
     leaveProgram(ctx, &ps);
 

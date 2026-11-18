@@ -264,6 +264,9 @@ GPU_TEST(khr_debug, insert_then_read_back_in_order)
 
     glDebugMessageCallback(NULL, NULL);
 
+    // low severity messages start out disabled
+    glDebugMessageControl(GL_DONT_CARE, GL_DONT_CARE, GL_DEBUG_SEVERITY_LOW, 0, NULL, GL_TRUE);
+
     glDebugMessageInsert(GL_DEBUG_SOURCE_APPLICATION, GL_DEBUG_TYPE_MARKER, 11,
                          GL_DEBUG_SEVERITY_LOW, -1, "first");
     glDebugMessageInsert(GL_DEBUG_SOURCE_APPLICATION, GL_DEBUG_TYPE_MARKER, 22,
@@ -282,6 +285,8 @@ GPU_TEST(khr_debug, insert_then_read_back_in_order)
 
     // the log is drained
     CHECK_EQ_UINT(glGetDebugMessageLog(4, sizeof log, src, typ, ids, sev, lens, log), 0u);
+
+    glDebugMessageControl(GL_DONT_CARE, GL_DONT_CARE, GL_DEBUG_SEVERITY_LOW, 0, NULL, GL_FALSE);
 }
 
 static int g_cb_seen;
@@ -1221,4 +1226,36 @@ GPU_TEST(clear_buffer, indirect_count_draws_validate)
 
     glBindBuffer(GL_DRAW_INDIRECT_BUFFER, 0);
     glDeleteBuffers(1, &b);
+}
+
+// glDebugMessageControl settings apply in order, and a debug group's own
+// settings end when it is popped
+GPU_TEST(khr_debug, message_control_filters_and_groups_restore_it)
+{
+    GLuint ids[4] = { 0 };
+
+    glEnable(GL_DEBUG_OUTPUT);
+    glDebugMessageCallback(NULL, NULL);
+    while (glGetDebugMessageLog(1, 0, NULL, NULL, NULL, NULL, NULL, NULL)) {}
+
+    const GLuint off = 7;
+    glDebugMessageControl(GL_DEBUG_SOURCE_APPLICATION, GL_DEBUG_TYPE_MARKER, GL_DONT_CARE, 1, &off, GL_FALSE);
+    glDebugMessageInsert(GL_DEBUG_SOURCE_APPLICATION, GL_DEBUG_TYPE_MARKER, 7, GL_DEBUG_SEVERITY_HIGH, -1, "off");
+    glDebugMessageInsert(GL_DEBUG_SOURCE_APPLICATION, GL_DEBUG_TYPE_MARKER, 8, GL_DEBUG_SEVERITY_HIGH, -1, "on");
+    CHECK_EQ_UINT(glGetDebugMessageLog(4, 0, NULL, NULL, ids, NULL, NULL, NULL), 1u);
+    CHECK_EQ_UINT(ids[0], 8u);
+
+    glPushDebugGroup(GL_DEBUG_SOURCE_APPLICATION, 1, -1, "g");
+    glDebugMessageControl(GL_DONT_CARE, GL_DONT_CARE, GL_DONT_CARE, 0, NULL, GL_FALSE);
+    glDebugMessageInsert(GL_DEBUG_SOURCE_APPLICATION, GL_DEBUG_TYPE_MARKER, 8, GL_DEBUG_SEVERITY_HIGH, -1, "on");
+    glPopDebugGroup();
+    glDebugMessageInsert(GL_DEBUG_SOURCE_APPLICATION, GL_DEBUG_TYPE_MARKER, 8, GL_DEBUG_SEVERITY_HIGH, -1, "on");
+
+    // the push message, then nothing inside the group, then the pop and the last insert
+    CHECK_EQ_UINT(glGetDebugMessageLog(4, 0, NULL, NULL, ids, NULL, NULL, NULL), 3u);
+    CHECK_EQ_UINT(ids[2], 8u);
+
+    glDebugMessageControl(GL_DONT_CARE, GL_DONT_CARE, GL_DONT_CARE, 0, NULL, GL_TRUE);
+    glDebugMessageControl(GL_DONT_CARE, GL_DONT_CARE, GL_DEBUG_SEVERITY_LOW, 0, NULL, GL_FALSE);
+    glDisable(GL_DEBUG_OUTPUT);
 }

@@ -22,6 +22,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 extern "C" bool mglInlineSpirv(const unsigned int *words, size_t count,
@@ -745,4 +746,154 @@ extern "C" bool mglZeroBaseInstance(const unsigned int *words, size_t count,
     *out_words = res;
     *out_count = total;
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// GLSL ES 1.00 lets two attributes share a location. Metal does not, and has
+// only 31 attribute slots, so inputs of the same type bound to the same
+// location are folded into the first: its loads read the other one.
+// ---------------------------------------------------------------------------
+
+extern "C" int mglMergeAliasedInputs(const unsigned int *words, size_t count, const char *const *bind_names,
+                                     const unsigned int *bind_locs, int nbinds, unsigned int **out_words,
+                                     size_t *out_count, char **removed, char **kept, int max_pairs);
+
+extern "C" int mglMergeAliasedInputs(const unsigned int *words, size_t count, const char *const *bind_names,
+                                     const unsigned int *bind_locs, int nbinds, unsigned int **out_words,
+                                     size_t *out_count, char **removed, char **kept, int max_pairs)
+{
+    const uint32_t OpName = 5, OpEntryPoint = 15, OpFunction = 54, OpVariable = 59, OpLoad = 61,
+                   OpAccessChain = 65, OpInBoundsAccessChain = 66, OpDecorate = 71,
+                   DecBuiltIn = 11, SCInput = 1;
+    std::map<uint32_t, std::string> names;
+    std::map<uint32_t, uint32_t> input_type, merged;
+    std::set<uint32_t> placed;
+    std::vector<uint32_t> order;
+    int entry_points = 0, pairs = 0;
+    size_t functions = count;
+
+    if (words == nullptr || count < 5 || words[0] != 0x07230203 || nbinds <= 0)
+        return 0;
+
+    for (size_t i = 5; i < count; i += words[i] >> 16)
+    {
+        uint32_t wc = words[i] >> 16, op = words[i] & 0xffff;
+
+        if (wc == 0 || i + wc > count)
+            return 0;
+
+        if (op == OpEntryPoint)
+            entry_points++;
+        else if (op == OpName && wc >= 3)
+            names[words[i + 1]] = std::string((const char *)&words[i + 2], strnlen((const char *)&words[i + 2], (wc - 2) * 4));
+        else if (op == OpVariable && wc >= 4 && words[i + 3] == SCInput)
+        {
+            input_type[words[i + 2]] = words[i + 1];
+            order.push_back(words[i + 2]);
+        }
+        else if (op == OpDecorate && wc >= 3 && words[i + 2] == DecBuiltIn)
+            placed.insert(words[i + 1]);
+        else if (op == OpFunction && functions == count)
+            functions = i;
+    }
+
+    if (entry_points != 1)
+        return 0;
+
+    // the first input bound to a location and type keeps it
+    std::map<std::pair<uint32_t, uint32_t>, uint32_t> first;
+
+    for (uint32_t id : order)
+    {
+        int bind = -1;
+
+        if (placed.count(id) || !names.count(id))
+            continue;
+
+        for (int b = 0; b < nbinds; b++)
+            if (names[id] == bind_names[b])
+                bind = b;
+
+        if (bind < 0)
+            continue;
+
+        auto key = std::make_pair(bind_locs[bind], input_type[id]);
+        auto hit = first.find(key);
+
+        if (hit == first.end())
+            first[key] = id;
+        else
+            merged[id] = hit->second;
+    }
+
+    // only fold an input that the code just loads from
+    for (size_t i = functions; i < count && !merged.empty(); i += words[i] >> 16)
+    {
+        uint32_t wc = words[i] >> 16, op = words[i] & 0xffff;
+        bool reads = op == OpLoad || op == OpAccessChain || op == OpInBoundsAccessChain;
+
+        for (uint32_t k = 1; k < wc; k++)
+            if (!(reads && k == 3) && merged.count(words[i + k]))
+                merged.erase(words[i + k]);
+    }
+
+    if (merged.empty())
+        return 0;
+
+    std::vector<uint32_t> res(words, words + 5);
+
+    for (size_t i = 5; i < count; i += words[i] >> 16)
+    {
+        uint32_t wc = words[i] >> 16, op = words[i] & 0xffff;
+        size_t at = res.size();
+
+        if ((op == OpName || op == OpDecorate) && merged.count(words[i + 1]))
+            continue;
+        if (op == OpVariable && merged.count(words[i + 2]))
+            continue;
+
+        if (op == OpEntryPoint)
+        {
+            uint32_t name_words = (uint32_t)strnlen((const char *)&words[i + 3], (wc - 3) * 4) / 4 + 1;
+
+            res.insert(res.end(), words + i, words + i + 3 + name_words);
+            for (uint32_t k = 3 + name_words; k < wc; k++)
+                if (!merged.count(words[i + k]))
+                    res.push_back(words[i + k]);
+            res[at] = ((uint32_t)(res.size() - at) << 16) | op;
+            continue;
+        }
+
+        res.insert(res.end(), words + i, words + i + wc);
+        if ((op == OpLoad || op == OpAccessChain || op == OpInBoundsAccessChain) && merged.count(words[i + 3]))
+            res[at + 3] = merged[words[i + 3]];
+    }
+
+    for (auto &m : merged)
+    {
+        if (pairs < max_pairs)
+        {
+            removed[pairs] = strdup(names[m.first].c_str());
+            kept[pairs] = strdup(names[m.second].c_str());
+            pairs++;
+        }
+    }
+
+    // a pair that did not fit would vanish from reflection, so give up
+    if ((size_t)pairs < merged.size())
+    {
+        for (int p = 0; p < pairs; p++)
+        {
+            free(removed[p]);
+            free(kept[p]);
+        }
+        return 0;
+    }
+
+    *out_words = (unsigned int *)malloc(res.size() * sizeof(uint32_t));
+    if (*out_words == nullptr)
+        return 0;
+    memcpy(*out_words, res.data(), res.size() * sizeof(uint32_t));
+    *out_count = res.size();
+    return pairs;
 }

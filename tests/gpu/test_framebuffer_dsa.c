@@ -16,7 +16,7 @@
 
 GPU_TEST(framebuffer_dsa, texture_attachment_variants)
 {
-    GLuint fbo = 0, tex = 0;
+    GLuint fbo = 0, tex = 0, layered = 0;
     GLint type = 0, name = 0;
 
     glGenFramebuffers(1, &fbo);
@@ -50,8 +50,14 @@ GPU_TEST(framebuffer_dsa, texture_attachment_variants)
     glFramebufferTexture3D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_3D, tex, 0, 0);
     CHECK_EQ_UINT(mgl_drain_errors(), GL_INVALID_OPERATION);
 
-    /* glFramebufferTextureLayer — attaches a single layer */
+    /* glFramebufferTextureLayer — a 2D texture has no layers, an array does */
     glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, tex, 0, 0);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_INVALID_OPERATION);
+
+    glGenTextures(1, &layered);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, layered);
+    glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_RGBA8, FW, FH, 2);
+    glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, layered, 0, 0);
     CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
 
     glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
@@ -66,20 +72,21 @@ GPU_TEST(framebuffer_dsa, texture_attachment_variants)
     glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, 0, 0);
     CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
 
-    glNamedFramebufferTextureLayer(fbo, GL_COLOR_ATTACHMENT0, tex, 0, 0);
+    glNamedFramebufferTextureLayer(fbo, GL_COLOR_ATTACHMENT0, layered, 0, 1);
     CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
 
     glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                                           GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
-    CHECK_EQ_INT(name, (GLint)tex);
+    CHECK_EQ_INT(name, (GLint)layered);
 
     /* invalid framebuffer name for the DSA variant */
-    glNamedFramebufferTextureLayer(9999, GL_COLOR_ATTACHMENT0, tex, 0, 0);
+    glNamedFramebufferTextureLayer(9999, GL_COLOR_ATTACHMENT0, layered, 0, 0);
     CHECK_EQ_UINT(mgl_drain_errors(), GL_INVALID_OPERATION);
 
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glDeleteFramebuffers(1, &fbo);
     glDeleteTextures(1, &tex);
+    glDeleteTextures(1, &layered);
 }
 
 /* ---------- glDrawBuffers ---------- */

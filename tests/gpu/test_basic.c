@@ -432,3 +432,15 @@ GPU_TEST(basic, a_no_error_context_records_no_errors)
     glBindBuffer(0x1234, 0);
     CHECK_EQ_UINT(glGetError(), GL_INVALID_ENUM);
 }
+
+// A test that leaves another texture unit active made the next one bind its
+// textures to that unit, while its shader read unit 0.
+GPU_TEST(basic, harness_reset_makes_unit_zero_active)
+{
+    GLint unit = 0;
+
+    glActiveTexture(GL_TEXTURE3);
+    mgl_harness_reset();
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &unit);
+    CHECK_EQ_INT(unit, GL_TEXTURE0);
+}

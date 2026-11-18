@@ -874,7 +874,7 @@ static void print_entry_point_prologue(FILE *fp_out)
 {
     fprintf(fp_out, "#include \"glcorearb.h\"\n\n");
     fprintf(fp_out, "#include \"glm_context.h\"\n\n");
-    fprintf(fp_out, "extern GLMContext _ctx;\n");
+    fprintf(fp_out, "extern __thread GLMContext _ctx;\n");
     fprintf(fp_out, "extern void mgl_lazy_init(void);\n\n");
     fprintf(fp_out, "#define GET_CONTEXT()   (mgl_lazy_init(), _ctx)\n\n");
 }
@@ -900,27 +900,6 @@ void print_mgl_core_source(ezxml_t registry)
     fclose(fp_out);
 }
 
-void print_mgl_es_source(ezxml_t registry)
-{
-    FILE *fp_out;
-    const char *filename = out_path(g_src_dir, "gl_es.c");
-
-    fp_out = fopen(filename, "w");
-    assert(fp_out);
-
-    // print mgl_core.h header
-    print_about(fp_out, filename);
-
-    print_entry_point_prologue(fp_out);
-
-    reset_seen();
-
-    // print the required commands
-    print_required_commands(registry, kGLFuncs, fp_out, 1);
-
-    fclose(fp_out);
-}
-
 void print_mgl_dispatch(ezxml_t registry)
 {
     FILE *fp_out;
@@ -939,24 +918,14 @@ void print_mgl_dispatch(ezxml_t registry)
     fprintf(fp_out, "typedef struct GLMContextRec_t *GLMContext;\n\n");
     fprintf(fp_out, "void init_dispatch(GLMContext ctx);\n\n");
 
-    for (int version=0; version<2; version++)
-    {
-        if (version == 0)
-        {
-            fprintf(fp_out, "struct GLMDispatchTable {\n");
-        }
-        else
-        {
-            fprintf(fp_out, "\nstruct GLM_ES_DispatchTable {\n");
-        }
-        
-        reset_seen();
+    fprintf(fp_out, "struct GLMDispatchTable {\n");
 
-        // print the required commands
-        print_required_commands(registry, kMGLDispatch, fp_out, version);
-        
-        fprintf(fp_out, "};\n");
-    }
+    reset_seen();
+
+    // print the required commands
+    print_required_commands(registry, kMGLDispatch, fp_out, 0);
+
+    fprintf(fp_out, "};\n");
 
     fprintf(fp_out, "\n\n#endif // #ifndef glm_dispatch_h\n");
 
@@ -981,25 +950,16 @@ void print_mgl_init_dispatch(ezxml_t registry)
        generated rather than added by hand afterwards. */
     fprintf(fp_out, "void mglWrapPipelineDraws(GLMContext ctx);\n\n");
 
-    for (int version=0; version<2; version++)
-    {
-        /* core and ES are two builds of the same driver, not two functions in
-           one binary, so each defines init_dispatch behind its own guard */
-        fprintf(fp_out, "#ifdef %s\n", version == 0 ? "MGL_GL_CORE" : "MGL_GL_ES");
+    fprintf(fp_out, "void init_dispatch(GLMContext ctx)\n");
+    fprintf(fp_out, "{\n");
 
-        fprintf(fp_out, "void init_dispatch(GLMContext ctx)\n");
+    reset_seen();
 
-        fprintf(fp_out, "{\n");
-        
-        reset_seen();
+    // print the required commands
+    print_required_commands(registry, kMGLDispatchInit, fp_out, 0);
 
-        // print the required commands
-        print_required_commands(registry, kMGLDispatchInit, fp_out, version);
-
-        fprintf(fp_out, "\n    mglWrapPipelineDraws(ctx);\n");
-        fprintf(fp_out, "}\n");
-        fprintf(fp_out, "#endif\n\n");
-    }
+    fprintf(fp_out, "\n    mglWrapPipelineDraws(ctx);\n");
+    fprintf(fp_out, "}\n");
     
     fclose(fp_out);
 }
@@ -1030,12 +990,6 @@ void print_mgl_header(ezxml_t registry)
     // print the required commands
     print_required_commands(registry, kMGLHeaders, fp_out, 0);
 
-    /* ES adds a handful of entry points core does not have. The tally is not
-       reset, so only those extras come out here. */
-    fprintf(fp_out, "\n#ifdef MGL_GL_ES\n");
-    print_required_commands(registry, kMGLHeaders, fp_out, 1);
-    fprintf(fp_out, "#endif\n");
-
     fprintf(fp_out, "\n#endif /* mgl_h */\n");
 
     fclose(fp_out);
@@ -1058,10 +1012,6 @@ void print_mgl_functions(ezxml_t registry)
 
     // print the required commands
     print_required_commands(registry, kMGLFuncs, fp_out, 0);
-
-    fprintf(fp_out, "\n#ifdef MGL_GL_ES\n");
-    print_required_commands(registry, kMGLFuncs, fp_out, 1);
-    fprintf(fp_out, "#endif\n");
 
     fclose(fp_out);
 }
@@ -1100,9 +1050,6 @@ int main(int argc, char **argv)
 
     // mgl gl exported functions
     print_mgl_core_source(registry);
-
-    // mgl es exported functions
-    print_mgl_es_source(registry);
 
     // mgl dispatch table
     print_mgl_dispatch(registry);

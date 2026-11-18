@@ -36,6 +36,9 @@
 #include <glslang/MachineIndependent/localintermediate.h>
 #include <glslang/Public/ShaderLang.h>
 
+extern "C" int mglOpaqueStructGLNameAt(const char *flat, const int *idx, char *out, size_t size);
+extern "C" int mglOpaqueStructTakeSizes(char *flat, int *dims, int max);
+
 // glslang's C interface keeps the C++ shader as the first thing in its handle
 struct CShaderHandle {
     glslang::TShader *shader;
@@ -45,7 +48,9 @@ namespace {
 
 const int kReflectOptions = EShReflectionStrictArraySuffix | EShReflectionBasicArraySuffix |
                             EShReflectionIntermediateIO | EShReflectionSeparateBuffers |
-                            EShReflectionAllBlockVariables | EShReflectionUnwrapIOBlocks;
+                            EShReflectionAllBlockVariables | EShReflectionUnwrapIOBlocks |
+                            // a shared or std140 block is active even when the shader never reads it
+                            EShReflectionSharedStd140SSBO | EShReflectionSharedStd140UBO;
 
 // names MGL made up for itself
 bool internalName(const std::string &name)
@@ -178,6 +183,58 @@ void addBlocks(Kind &kind, glslang::TProgram &prog, bool storage, int stage, std
     }
 }
 
+// A sampler that a struct uniform held, under its GL name: "s.a", or one
+// "s[k].a" per element of an array of structs.
+void addStructSampler(Kind &kind, const glslang::TObjectReflection &o)
+{
+    char flat[256], name[256];
+    int dims[8], nd, levels, outer = 1, inner = 1;
+
+    std::snprintf(flat, sizeof(flat), "%s", o.name.substr(0, o.name.find('[')).c_str());
+    nd = mglOpaqueStructTakeSizes(flat, dims, 8);
+
+    // without a size marker, the sizes are the type's, outermost first
+    if (nd == 0 && o.getType() && o.getType()->isArray())
+    {
+        const glslang::TArraySizes *a = o.getType()->getArraySizes();
+
+        for (int d = 0; d < a->getNumDims() && nd < 8; d++)
+            dims[nd++] = a->getDimSize(d) > 0 ? a->getDimSize(d) : 1;
+    }
+
+    levels = mglOpaqueStructGLNameAt(flat, nullptr, name, sizeof(name));
+
+    if (levels < 0 || levels > nd)
+        return;
+
+    for (int d = 0; d < nd; d++)
+        (d < levels ? outer : inner) *= dims[d];
+
+    for (int k = 0; k < outer; k++)
+    {
+        int idx[8], rest = k;
+        bool added;
+
+        for (int d = levels - 1; d >= 0; d--)
+        {
+            idx[d] = rest % dims[d];
+            rest /= dims[d];
+        }
+
+        mglOpaqueStructGLNameAt(flat, idx, name, sizeof(name));
+
+        MglResource &r = kind.res[kind.find(nd > levels ? std::string(name) + "[0]" : std::string(name), &added)];
+
+        if (added)
+        {
+            r.type = (GLenum)o.glDefineType;
+            r.array_size = inner;
+        }
+
+        r.stages |= (GLuint)o.stages;
+    }
+}
+
 void addVariables(Kind &kind, glslang::TProgram &prog, bool storage, int stage,
                   const std::vector<int> &local)
 {
@@ -187,6 +244,12 @@ void addVariables(Kind &kind, glslang::TProgram &prog, bool storage, int stage,
     {
         const glslang::TObjectReflection &o = storage ? prog.getBufferVariable(i) : prog.getUniform(i);
         const glslang::TType *type = o.getType();
+
+        if (!storage && type && o.name.compare(0, 5, "mglS_") == 0)
+        {
+            addStructSampler(kind, o);
+            continue;
+        }
 
         if (internalName(o.name) || type == nullptr)
             continue;
@@ -217,8 +280,23 @@ void addVariables(Kind &kind, glslang::TProgram &prog, bool storage, int stage,
 
                 if (storage)
                 {
-                    r.top_level_size = o.topLevelArraySize > 0 ? o.topLevelArraySize : 1;
-                    r.top_level_stride = o.topLevelArrayStride;
+                    // GL counts the top level only for an array of structures or
+                    // of arrays, "s[0].a" or "v[0][0]": 1 and stride 0 for the rest,
+                    // and size 0 when that array is unsized
+                    std::string rel = o.name;
+                    // an instance array's block is "Block[0]", its members "Block.x"
+                    std::string prefix = b.name.substr(0, b.name.find('[')) + ".";
+
+                    if (rel.compare(0, prefix.size(), prefix) == 0)
+                        rel = rel.substr(prefix.size());
+
+                    size_t dot = rel.find('.');
+                    std::string top = rel.substr(0, dot);
+                    bool aggregate = top.find('[') != std::string::npos &&
+                                     (top.find("][") != std::string::npos || dot != std::string::npos);
+
+                    r.top_level_size = !aggregate ? 1 : o.topLevelArraySize >= 0 ? o.topLevelArraySize : 1;
+                    r.top_level_stride = aggregate ? o.topLevelArrayStride : 0;
 
                     // a runtime-sized array has no size of its own; in an
                     // array of arrays only the outermost can be, and what is
@@ -226,6 +304,7 @@ void addVariables(Kind &kind, glslang::TProgram &prog, bool storage, int stage,
                     // glslang also calls the innermost of a sized array of
                     // arrays implicitly sized, while giving its real size
                     if (type->isArray() && type->getArraySizes()->getNumDims() == 1 &&
+                        o.name.find("][") == std::string::npos &&
                         (type->isUnsizedArray() || (type->isImplicitlySizedArray() && o.size <= 1)))
                         r.array_size = 0;
                 }
@@ -351,10 +430,24 @@ void listMembers(MglResourceTable *out, int block_kind, int var_kind)
         MglResource &block = out->list[block_kind][b];
         std::vector<GLint> members;
 
+        // the elements of a block array, "Block[0]" and "Block[1]", hold the same variables
+        std::string base = block.name ? block.name : "";
+
+        base = base.substr(0, base.find('['));
+
         for (GLint v = 0; v < out->count[var_kind]; v++)
         {
             MglResource &var = out->list[var_kind][v];
             bool mine = block_kind == MGL_RES_ATOMIC_BUFFER ? var.atomic_buffer == b : var.block_index == b;
+
+            if (!mine && block_kind != MGL_RES_ATOMIC_BUFFER && var.block_index >= 0 &&
+                var.block_index < out->count[block_kind])
+            {
+                const char *owner = out->list[block_kind][var.block_index].name;
+                std::string other = owner ? owner : "";
+
+                mine = other.find('[') != std::string::npos && base == other.substr(0, other.find('['));
+            }
 
             if (mine)
                 members.push_back(v);

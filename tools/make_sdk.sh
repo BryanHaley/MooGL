@@ -44,7 +44,8 @@ fsr2="submodules/FidelityFX-FSR2-OpenGL/src/ffx-fsr2-api"
 [ "$deps" = 1 ] && tools/build_deps.sh
 
 # its own build folder, so the deployment target cannot mix with a dev build
-make -j"$(sysctl -n hw.ncpu)" build_dir=build/sdk MOOGL_VERSION="$version" lib
+# the SDK has OpenGL ES contexts, which a plain make leaves out
+make -j"$(sysctl -n hw.ncpu)" build_dir=build/sdk MOOGL_VERSION="$version" OGL_ES=1 lib
 
 # stock SDL2 builds too, but makes Apple's OpenGL contexts
 otool -L "$build/libSDL2-2.0.0.dylib" | grep -q libmoogl ||
@@ -58,9 +59,7 @@ raylib="$build/raylib/install"
 
 
 # the Makefile points the repo-root dylib links at whatever it built last
-for lib in libmoogl.dylib libmoogles.dylib; do
-    [ -f "build/$lib" ] && ln -fs "build/$lib" .
-done
+[ -f build/libmoogl.dylib ] && ln -fs build/libmoogl.dylib .
 
 rm -rf "$out"
 mkdir -p "$out/lib/cmake/MooGL" "$out/include/GL" "$out/include/KHR" "$out/include/GLFW" \
@@ -95,6 +94,8 @@ cp submodules/freeglut/include/GL/*.h "$out/include/GL/"
 cp tools/sdk/GLUT/glut.h "$out/include/GLUT/"
 cp submodules/glu/include/GL/glu.h tools/sdk/GL/gl.h tools/sdk/GL/glext.h "$out/include/GL/"
 cp include/AGL/agl.h "$out/include/AGL/"
+# Khronos's OpenGL ES headers, for code on ES contexts
+cp -R tools/sdk/GLES2 tools/sdk/GLES3 "$out/include/"
 cp -R "$build/sdl2/install/lib/cmake/SDL2" "$out/lib/cmake/"
 cp -R "$build/sdl3/install/include/SDL3" "$out/include/"
 cp -R "$build/sdl3/install/lib/cmake/SDL3" "$out/lib/cmake/"
@@ -167,7 +168,8 @@ OpenGL 4.6 core on Metal, for Apple silicon Macs on macOS $MACOSX_DEPLOYMENT_TAR
 - \`lib/\`: libmoogl (OpenGL), and libglfw, libSDL2, libSDL3, SFML 3, raylib and libglut (freeglut), built to make
   MooGL contexts; libGLU, libimgui (Dear ImGui with docking, drawing with MooGL) and the FSR 2 libraries on MetalFX
 - \`include/\`: GL/glcorearb.h, GLFW, SDL2, SDL3, SFML, raylib, GLUT (\`GL/freeglut.h\`, \`GLUT/glut.h\`), \`GL/gl.h\`,
-  \`GL/glext.h\`, \`GL/glu.h\`, AGL/agl.h, Dear ImGui, MGLContext.h, and AMD's FSR 2 headers
+  \`GL/glext.h\`, \`GL/glu.h\`, GLES2 and GLES3, AGL/agl.h, Dear ImGui, MGLContext.h, and AMD's FSR 2
+  headers
 - \`lib/cmake\`: \`find_package(MooGL)\` with MooGL::GL, MooGL::glfw, MooGL::glut, MooGL::GLU, MooGL::imgui and MooGL::FSR2,
   and the packages of SDL2, SDL3, SFML, raylib and glfw3 (MooGL's GLFW)
 - \`sfml2/\`: SFML 2.6, with its own \`include/\`, \`lib/\` and CMake package

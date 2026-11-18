@@ -29,6 +29,7 @@
 #include "mgl_reflect.h"
 #include "glm_context.h"
 #include "mgl_log.h"
+#include "mgl_es.h"
 
 const glslang_resource_t* glslang_default_resource(void);
 
@@ -377,7 +378,7 @@ void mglDeleteShader(GLMContext ctx, GLuint shader)
 
     ptr = findShader(ctx, shader);
 
-    ERROR_CHECK_RETURN(ptr, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(ptr, mglShaderNameError(ctx, shader));
 
     ptr->delete_status = GL_TRUE;
 
@@ -402,12 +403,10 @@ void mglShaderSource(GLMContext ctx, GLuint shader, GLsizei count, const GLchar 
     GLchar *src;
     Shader *ptr;
 
-    ERROR_CHECK_RETURN(isShader(ctx, shader), GL_INVALID_VALUE);
-    ERROR_CHECK_RETURN(count >= 0, GL_INVALID_VALUE);
-
     ptr = findShader(ctx, shader);
 
-    ERROR_CHECK_RETURN(ptr, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(ptr, mglShaderNameError(ctx, shader));
+    ERROR_CHECK_RETURN(count >= 0, GL_INVALID_VALUE);
     ERROR_CHECK_RETURN(count == 0 || string, GL_INVALID_VALUE);
 
     // GL 4.6 7.1: a part with no length, or a negative one, ends at its null;
@@ -436,7 +435,11 @@ void mglShaderSource(GLMContext ctx, GLuint shader, GLsizei count, const GLchar 
 #ifdef MGL_COMPAT_CONTEXTS
     // the old built-ins only mean something in a compatibility context; the
     // linker reads layouts from the source, so the source is what changes
+#ifdef MGL_OGL_ES
+    if (ctx->compat && ctx->es == NULL)
+#else
     if (ctx->compat)
+#endif
     {
         char *modern = mglCompatRewriteGLSL(src, ptr->type);
 
@@ -626,10 +629,15 @@ static const char *atomicLayoutProblem(const char *src, GLint max_size)
 static const char *glslRuleProblem(const char *src)
 {
     int version = 0;
+    char profile[8] = "";
     const char *v = strstr(src, "#version");
 
     if (v)
-        sscanf(v, "#version %d", &version);
+        sscanf(v, "#version %d %7s", &version, profile);
+
+    // GLSL ES has imageSize from 3.10, which glslang checks itself
+    if (!strcmp(profile, "es"))
+        version = 0;
 
     for (const char *p = src; *p; p++)
     {
@@ -760,22 +768,18 @@ static void rewriteBlockLayouts(char *src)
         }
 
         char *open = q;
-        char *words[8];
-        int nwords = 0;
         int depth = 0;
 
         for (; *q; q++)
         {
             if (*q == '(') { depth++; continue; }
             if (*q == ')') { if (--depth == 0) { q++; break; } continue; }
-
-            if (depth > 0 && nwords < 8 && (isWord(q, src, "shared") || isWord(q, src, "packed")))
-                words[nwords++] = q;
         }
 
-        if (nwords && !blockPlacesMembers(open, q))
-            for (int i = 0; i < nwords; i++)
-                memcpy(words[i], "std140", 6);
+        if (!blockPlacesMembers(open, q))
+            for (char *w = open; w < q; w++)
+                if (isWord(w, src, "shared") || isWord(w, src, "packed"))
+                    memcpy(w, "std140", 6);
 
         p = q;
     }
@@ -1088,6 +1092,171 @@ static char *rewriteCullExtension(const char *src)
     return out;
 }
 
+// glslang's relaxed rules pass an atomic counter to a function by value, so
+// the function counts on a copy. A void function whose parameters are all
+// atomic counters becomes a macro, which works on the counters themselves.
+// Returns a new string when something changed, NULL when nothing did.
+static char *macroAtomicFunctions(const char *src)
+{
+    char *out = NULL;
+    size_t len = 0, cap = 0;
+    const char *copied = src;
+
+    if (strstr(src, "atomic_uint") == NULL)
+        return NULL;
+
+    for (const char *p = src; *p; p++)
+    {
+        if (!isWord(p, src, "void"))
+            continue;
+
+        // void NAME ( PARAMS ) { BODY }
+        const char *q = p + 4, *name, *open, *close, *body, *end;
+        char params[512] = "";
+        bool atomic_only = true;
+        int depth = 0;
+
+        while (isspace((unsigned char)*q)) q++;
+        name = q;
+        while (isalnum((unsigned char)*q) || *q == '_') q++;
+        if (q == name) continue;
+
+        open = q;
+        while (isspace((unsigned char)*open)) open++;
+        if (*open != '(') continue;
+
+        close = strchr(open, ')');
+        if (close == NULL) continue;
+
+        // every parameter an atomic counter, and kept by its name
+        for (const char *a = open + 1; a < close && atomic_only;)
+        {
+            const char *comma = memchr(a, ',', (size_t)(close - a)), *e = comma ? comma : close, *n = e;
+            bool has = false;
+
+            // the name is the last word before any [size]
+            while (n > a && (n[-1] == ']' || isspace((unsigned char)n[-1])))
+                if (n[-1] == ']') { while (n > a && *--n != '['); } else n--;
+
+            const char *b = n;
+            while (b > a && (isalnum((unsigned char)b[-1]) || b[-1] == '_')) b--;
+
+            // the type, not the name, has to be atomic_uint
+            for (const char *k = a; k < b; k++)
+                has |= isWord(k, src, "atomic_uint");
+
+            if (!has || b == n || strlen(params) + (size_t)(n - b) + 2 >= sizeof params)
+                atomic_only = false;
+            else
+                snprintf(params + strlen(params), sizeof params - strlen(params), "%s%.*s",
+                         params[0] ? ", " : "", (int)(n - b), b);
+
+            a = e + 1;
+        }
+
+        if (!atomic_only || params[0] == 0)
+            continue;
+
+        body = close + 1;
+        while (isspace((unsigned char)*body)) body++;
+
+        if (*body == ';')
+        {
+            // a declaration of one: drop it
+            end = body + 1;
+        }
+        else if (*body == '{')
+        {
+            for (end = body; *end; end++)
+            {
+                if (*end == '{') depth++;
+                if (*end == '}' && --depth == 0) break;
+                if (*end == '#' || isWord(end, src, "return")) break;
+            }
+
+            if (*end != '}')
+                continue;
+
+            end++;
+        }
+        else
+            continue;
+
+        size_t need = len + (size_t)(p - copied) + (size_t)(end - p) + strlen(params) + 64;
+
+        if (need > cap)
+        {
+            char *grown = (char *)realloc(out, need * 2);
+
+            if (grown == NULL)
+            {
+                free(out);
+                return NULL;
+            }
+
+            out = grown;
+            cap = need * 2;
+        }
+
+        memcpy(out + len, copied, (size_t)(p - copied));
+        len += (size_t)(p - copied);
+
+        if (*body == '{')
+        {
+            int lines = 0;
+
+            len += (size_t)sprintf(out + len, "\n#define %.*s(%s) ", (int)(open - name), name, params);
+
+            // one line, with comments gone and the line count kept after it
+            for (const char *k = body; k < end; k++)
+            {
+                if (k[0] == '/' && k[1] == '/')
+                    while (k + 1 < end && k[1] != '\n') k++;
+                else if (k[0] == '/' && k[1] == '*')
+                {
+                    for (k += 2; k + 1 < end && !(k[0] == '*' && k[1] == '/'); k++)
+                        lines += *k == '\n';
+                    k++;
+                }
+                else if (*k == '\n')
+                {
+                    out[len++] = ' ';
+                    lines++;
+                }
+                else
+                    out[len++] = *k;
+            }
+
+            out[len++] = '\n';
+
+            while (lines-- > 0)
+                out[len++] = '\n';
+        }
+
+        copied = end;
+        p = end - 1;
+    }
+
+    if (out == NULL)
+        return NULL;
+
+    {
+        size_t rest = strlen(copied);
+        char *grown = (char *)realloc(out, len + rest + 1);
+
+        if (grown == NULL)
+        {
+            free(out);
+            return NULL;
+        }
+
+        out = grown;
+        memcpy(out + len, copied, rest + 1);
+    }
+
+    return out;
+}
+
 // glslang drops gl_NumSamples when it is generating SPIR-V, because Vulkan has
 // no such built-in -- but it is core GLSL and the CTS leans on it. Rename it to
 // a plain uniform of the same length, which MGL writes at draw time.
@@ -1148,6 +1317,67 @@ static char *rewriteNumSamples(const char *src)
         memmove(ins + sizeof(decl) - 1, ins, strlen(ins) + 1);
         memcpy(ins, decl, sizeof(decl) - 1);
     }
+
+    return out;
+}
+
+// gl_DepthRange is left out of SPIR-V for GL too, so its fields become a
+// vec3 uniform MGL writes at draw time: near, far, diff.
+// Returns a new string when something changed, NULL when nothing did.
+static char *rewriteDepthRange(const char *src)
+{
+    static const char gl_name[] = "gl_DepthRange";
+    static const char decl[] = "\nuniform highp vec3 " MGL_DEPTH_RANGE_NAME ";\n";
+    const size_t n = sizeof(gl_name) - 1;
+    char *out, *ins;
+    size_t len = 0, cap;
+    const char *p = src, *hit;
+
+    if (strstr(src, gl_name) == NULL)
+        return NULL;
+
+    cap = strlen(src) * 2 + sizeof(decl) + 64;
+    out = (char *)malloc(cap);
+
+    if (out == NULL)
+        return NULL;
+
+    while ((hit = strstr(p, gl_name)) != NULL)
+    {
+        const char *q = hit + n, *field;
+
+        memcpy(out + len, p, (size_t)(hit - p));
+        len += (size_t)(hit - p);
+
+        while (*q == ' ' || *q == '\t')
+            q++;
+
+        field = *q == '.' ? q + 1 : NULL;
+
+        while (field && (*field == ' ' || *field == '\t'))
+            field++;
+
+        if (field && !strncmp(field, "near", 4) && !isalnum((unsigned char)field[4]))
+            len += (size_t)sprintf(out + len, MGL_DEPTH_RANGE_NAME ".x"), p = field + 4;
+        else if (field && !strncmp(field, "far", 3) && !isalnum((unsigned char)field[3]))
+            len += (size_t)sprintf(out + len, MGL_DEPTH_RANGE_NAME ".y"), p = field + 3;
+        else if (field && !strncmp(field, "diff", 4) && !isalnum((unsigned char)field[4]))
+            len += (size_t)sprintf(out + len, MGL_DEPTH_RANGE_NAME ".z"), p = field + 4;
+        else
+        {
+            memcpy(out + len, hit, n);
+            len += n;
+            p = hit + n;
+        }
+    }
+
+    strcpy(out + len, p);
+
+    // the declaration goes after #version, which the preprocessor keeps first
+    ins = strstr(out, "#version");
+    ins = ins && strchr(ins, '\n') ? strchr(ins, '\n') + 1 : out;
+    memmove(ins + sizeof(decl) - 1, ins, strlen(ins) + 1);
+    memcpy(ins, decl, sizeof(decl) - 1);
 
     return out;
 }
@@ -1943,11 +2173,9 @@ void mglCompileShader(GLMContext ctx, GLuint shader)
 {
     Shader *ptr;
 
-    ERROR_CHECK_RETURN(isShader(ctx, shader), GL_INVALID_VALUE);
-
     ptr = findShader(ctx, shader);
 
-    ERROR_CHECK_RETURN(ptr, GL_INVALID_OPERATION);
+    ERROR_CHECK_RETURN(ptr, mglShaderNameError(ctx, shader));
 
     // ARB_gl_spirv 7.1: a shader carrying a SPIR-V module is finalized with
     // SpecializeShader, never CompileShader.
@@ -1983,21 +2211,43 @@ static void compileShaderObject(GLMContext ctx, Shader *ptr)
         }
     }
 
+    const char *src = ptr->src;
+    char *es_src = NULL;
+
+#ifdef MGL_OGL_ES
+    if (ctx->es)
+    {
+        char *problem = mglESShaderSource(ctx, ptr->src, ptr->type, &es_src);
+
+        if (problem)
+        {
+            free(ptr->log);
+            ptr->log = problem;
+            return;
+        }
+
+        if (es_src)
+            src = es_src;
+    }
+#endif
+
     ctx->error_suppress++;
 
     // A source may end in a // comment with no newline, or in a line
     // continuation; either would swallow the first line of anything added
     // after it. Two newlines end both, and change nothing for glslang.
-    size_t src_len = strlen(ptr->src);
+    size_t src_len = strlen(src);
     char *ended = (char *)malloc(src_len + 3);
 
     if (ended == NULL)
     {
+        free(es_src);
         ctx->error_suppress--;
         return;
     }
 
-    memcpy(ended, ptr->src, src_len);
+    memcpy(ended, src, src_len);
+    free(es_src);
     memcpy(ended + src_len, "\n\n", 3);
 
 
@@ -2021,6 +2271,17 @@ static void compileShaderObject(GLMContext ctx, Shader *ptr)
         {
             free(raised);
             raised = flat;
+            front = raised;
+        }
+    }
+
+    {
+        char *inlined = macroAtomicFunctions(front);
+
+        if (inlined)
+        {
+            free(raised);
+            raised = inlined;
             front = raised;
         }
     }
@@ -2130,6 +2391,16 @@ static void compileShaderObject(GLMContext ctx, Shader *ptr)
                 {
                     free(fixed);
                     fixed = limited;
+                }
+
+                {
+                    char *ranged = rewriteDepthRange(fixed);
+
+                    if (ranged)
+                    {
+                        free(fixed);
+                        fixed = ranged;
+                    }
                 }
 
                 if (ptr->glm_type == _FRAGMENT_SHADER)
@@ -2355,7 +2626,7 @@ void mglGetShaderiv(GLMContext ctx, GLuint shader, GLenum pname, GLint *params)
 
     ptr = findShader(ctx, shader);
 
-    ERROR_CHECK_RETURN(ptr, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(ptr, mglShaderNameError(ctx, shader));
 
     switch(pname)
     {
@@ -2385,23 +2656,18 @@ void mglGetShaderiv(GLMContext ctx, GLuint shader, GLenum pname, GLint *params)
             *params = GL_TRUE;
             break;
 
+        // false until a compile succeeds
         case GL_COMPILE_STATUS:
-            if (ptr->log)
-            {
-                *params = GL_FALSE;
-            }
-            else
-            {
-                *params = GL_TRUE;
-            }
+            *params = ptr->compiled_glsl_shader && ptr->log == NULL ? GL_TRUE : GL_FALSE;
             break;
 
         case GL_INFO_LOG_LENGTH:
             *params = ptr->log ? (GLint)strlen(ptr->log) + 1 : 0;
             break;
 
+        // the null at the end counts
         case GL_SHADER_SOURCE_LENGTH:
-            *params = (GLint)ptr->src_len;
+            *params = ptr->src ? (GLint)ptr->src_len + 1 : 0;
             break;
 
         // ARB_gl_spirv / GL 4.6: TRUE while the shader is associated with a
@@ -2423,7 +2689,7 @@ void mglGetShaderInfoLog(GLMContext ctx, GLuint shader, GLsizei bufSize, GLsizei
 
     ptr = findShader(ctx, shader);
 
-    ERROR_CHECK_RETURN(ptr, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(ptr, mglShaderNameError(ctx, shader));
     ERROR_CHECK_RETURN(bufSize >= 0, GL_INVALID_VALUE);
 
     // as much as fits with its terminator, and an empty string when there is
@@ -2453,7 +2719,7 @@ void mglGetShaderSource(GLMContext ctx, GLuint shader, GLsizei bufSize, GLsizei 
 
     ptr = findShader(ctx, shader);
 
-    ERROR_CHECK_RETURN(ptr, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(ptr, mglShaderNameError(ctx, shader));
     ERROR_CHECK_RETURN(bufSize >= 0, GL_INVALID_VALUE);
 
     // GL 4.6 section 7.1: at most bufSize characters are written, terminator
@@ -2639,9 +2905,7 @@ void mglSpecializeShader(GLMContext ctx, GLuint shader, const GLchar *pEntryPoin
     Shader *ptr = findShader(ctx, shader);
     char *ep;
 
-    // a program's name is the wrong kind of object rather than no object
-    ERROR_CHECK_RETURN(ptr || findProgram(ctx, shader) == NULL, GL_INVALID_OPERATION);
-    ERROR_CHECK_RETURN(ptr, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(ptr, mglShaderNameError(ctx, shader));
     ERROR_CHECK_RETURN(ptr->spirv_binary, GL_INVALID_OPERATION);
     ERROR_CHECK_RETURN(ptr->specialized == GL_FALSE, GL_INVALID_OPERATION);
     ERROR_CHECK_RETURN(numSpecializationConstants == 0 ||
