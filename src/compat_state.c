@@ -433,6 +433,7 @@ static int pnameCount(GLenum pname)
 
 static void lightv(GLMContext ctx, GLenum light, GLenum pname, const GLfloat *p)
 {
+    C->values_serial++;
     MGLLight *l;
 
     ERROR_CHECK_RETURN(light >= GL_LIGHT0 && light < GL_LIGHT0 + MGL_COMPAT_LIGHTS, GL_INVALID_ENUM);
@@ -556,6 +557,7 @@ static void cGetLightiv(GLMContext ctx, GLenum light, GLenum pname, GLint *param
 
 static void materialv(GLMContext ctx, GLenum face, GLenum pname, const GLfloat *p)
 {
+    C->values_serial++;
     int first, last;
 
     switch (face)
@@ -659,6 +661,7 @@ static void cGetMaterialiv(GLMContext ctx, GLenum face, GLenum pname, GLint *par
 
 static void lightModelv(GLMContext ctx, GLenum pname, const GLfloat *p)
 {
+    C->values_serial++;
     switch (pname)
     {
         case GL_LIGHT_MODEL_AMBIENT: memcpy(C->model_ambient, p, 4 * sizeof(GLfloat)); break;
@@ -764,6 +767,7 @@ static bool validSource(GLenum s)
 
 static void texEnvv(GLMContext ctx, GLenum target, GLenum pname, const GLfloat *p, bool ints)
 {
+    C->values_serial++;
     MGLTexEnv *e = activeEnv(ctx);
     GLenum v = (GLenum)p[0];
 
@@ -934,6 +938,7 @@ static void cGetTexEnviv(GLMContext ctx, GLenum target, GLenum pname, GLint *par
 
 static void texGenv(GLMContext ctx, GLenum coord, GLenum pname, const GLfloat *p)
 {
+    C->values_serial++;
     MGLTexEnv *e = activeEnv(ctx);
     int c = (int)coord - GL_S;
 
@@ -1070,6 +1075,7 @@ static void cGetTexGendv(GLMContext ctx, GLenum coord, GLenum pname, GLdouble *p
 
 static void fogv(GLMContext ctx, GLenum pname, const GLfloat *p, bool ints)
 {
+    C->values_serial++;
     GLenum v = (GLenum)p[0];
 
     switch (pname)
@@ -1132,6 +1138,7 @@ static void cFogiv(GLMContext ctx, GLenum pname, const GLint *params)
 
 static void cClipPlane(GLMContext ctx, GLenum plane, const GLdouble *eq)
 {
+    C->values_serial++;
     GLfloat inv[16], p[4];
     GLuint i = plane - GL_CLIP_PLANE0;
 
@@ -1853,6 +1860,7 @@ static void initStack(MGLMatrixStack *s, int max)
 
 static void setDefaults(GLMContext ctx)
 {
+    C->values_serial++;
     C->matrix_mode = GL_MODELVIEW;
     initStack(&C->modelview, MGL_MODELVIEW_DEPTH);
     initStack(&C->projection, MGL_PROJECTION_DEPTH);

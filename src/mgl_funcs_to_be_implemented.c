@@ -364,6 +364,11 @@ static bool copyImageTexComplete(const Texture *t)
 	if (t->samples > 0)
 		return copyImageLevelExists(t, (GLint)base);
 
+	// GL 4.6 8.17: without a mipmapped minification filter only the base
+	// level is needed
+	if (t->params.min_filter == GL_NEAREST || t->params.min_filter == GL_LINEAR)
+		return copyImageLevelExists(t, (GLint)base);
+
 	if (last >= t->mipmap_levels)
 		last = t->mipmap_levels - 1;
 

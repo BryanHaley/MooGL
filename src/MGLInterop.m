@@ -30,6 +30,7 @@
 - (void) endComputeEncoding;
 - (void) applyPendingClears;
 - (bool) bindMTLTexture:(Texture *)tex;
+- (void) allowImageWrites:(Texture *)tex;
 @end
 
 Texture *findTexture(GLMContext ctx, GLuint texture);
@@ -51,6 +52,9 @@ void *MGLgetMetalTexture(GLMContext ctx, GLuint texture)
         id renderer = (__bridge id)ctx->mtl_funcs.mtlObj;
 
         [renderer applyPendingClears];
+
+        // the caller may write it from a shader of its own
+        [renderer allowImageWrites:tex];
 
         if (![renderer bindMTLTexture:tex])
             return NULL;

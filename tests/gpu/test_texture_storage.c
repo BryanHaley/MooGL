@@ -1180,3 +1180,110 @@ GPU_TEST(texture_storage, a_1d_array_keeps_its_layers_at_every_level)
     glDeleteFramebuffers(1, &f);
     glDeleteTextures(1, &t);
 }
+
+// A small texture is filled straight from the CPU when it is made; every level
+// and layer has to land, and a later update, after the GPU has drawn with it,
+// has to land too
+GPU_TEST(texture_storage, a_small_texture_keeps_every_level_and_later_updates)
+{
+    static const char *VS =
+        "#version 460 core\n"
+        "layout(location = 0) in vec2 pos;\n"
+        "void main() { gl_Position = vec4(pos, 0.0, 1.0); }\n";
+    static const char *FS =
+        "#version 460 core\n"
+        "uniform sampler2DArray t;\n"
+        "layout(location = 0) out vec4 frag;\n"
+        "void main() { frag = texture(t, vec3(0.5, 0.5, 1.0)); }\n";
+    // a level reads back with both layers
+    GLuint tex, p, vao, vbo, px[16 * 16], back[2 * 16 * 16];
+    MGLTestTarget t;
+    char log[1024];
+
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, tex);
+    glTexStorage3D(GL_TEXTURE_2D_ARRAY, 3, GL_RGBA8, 16, 16, 2);
+    for (int l = 0; l < 3; l++)
+        for (int z = 0; z < 2; z++)
+        {
+            for (int i = 0; i < 256; i++)
+                px[i] = 0xff000000u | (GLuint)(l * 16 + z);
+            glTexSubImage3D(GL_TEXTURE_2D_ARRAY, l, 0, 0, z, 16 >> l, 16 >> l, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        }
+
+    for (int l = 0; l < 3; l++)
+    {
+        int n = (16 >> l) * (16 >> l);
+
+        glGetTexImage(GL_TEXTURE_2D_ARRAY, l, GL_RGBA, GL_UNSIGNED_BYTE, back);
+        CHECK_MSG(back[0] == (0xff000000u | (GLuint)(l * 16)) && back[n] == (0xff000000u | (GLuint)(l * 16 + 1)),
+                  "level %d holds %08x and %08x", l, back[0], back[n]);
+    }
+
+    if (!mgl_target_create(&t, 8, 8, GL_RGBA8, 0)) SKIP("no target");
+    p = mgl_build_program(VS, FS, log, sizeof log);
+    CHECK(p);
+    vao = mgl_fullscreen_quad(&vbo);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    mgl_target_bind(&t);
+    glUseProgram(p);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+
+    for (int i = 0; i < 256; i++)
+        px[i] = 0xff0000ffu;
+    glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, 1, 16, 16, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glGetTexImage(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA, GL_UNSIGNED_BYTE, back);
+    CHECK_MSG(back[256] == 0xff0000ffu && back[0] == 0xff000000u, "after the update %08x %08x", back[256], back[0]);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+
+    glDeleteProgram(p);
+    glDeleteTextures(1, &tex);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo);
+    mgl_target_destroy(&t);
+}
+
+// RGB9_E5 copied with glCopyImageSubData, also into R11F_G11F_B10F: with
+// Metal's lossless compression on them, the bits came back changed
+GPU_TEST(texture_storage, rgb9_e5_copies_arrive_whole)
+{
+    static unsigned char src[16 * 16 * 4], dst[16 * 16 * 4], back[16 * 16 * 4];
+    GLuint tex[2];
+
+    for (int i = 0; i < (int)sizeof src; i++)
+    {
+        src[i] = (unsigned char)(i * 37 + 11);
+        dst[i] = (unsigned char)(i * 13 + 200);
+    }
+
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glGenTextures(2, tex);
+    for (int t = 0; t < 2; t++)
+    {
+        glBindTexture(GL_TEXTURE_2D, tex[t]);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB9_E5, 16, 16, 0, GL_RGB, GL_UNSIGNED_INT_5_9_9_9_REV, t ? dst : src);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+    }
+    glCopyImageSubData(tex[0], GL_TEXTURE_2D, 0, 0, 0, 0, tex[1], GL_TEXTURE_2D, 0, 0, 0, 0, 16, 16, 1);
+
+    glBindTexture(GL_TEXTURE_2D, tex[0]);
+    glGetTexImage(GL_TEXTURE_2D, 0, GL_RGB, GL_UNSIGNED_INT_5_9_9_9_REV, back);
+    CHECK_MSG(!memcmp(src, back, sizeof src), "the source changed");
+    glBindTexture(GL_TEXTURE_2D, tex[1]);
+    glGetTexImage(GL_TEXTURE_2D, 0, GL_RGB, GL_UNSIGNED_INT_5_9_9_9_REV, back);
+    CHECK_MSG(!memcmp(src, back, sizeof src), "the copy arrived changed");
+
+    // the same bits copied into the other packed float format
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R11F_G11F_B10F, 16, 16, 0, GL_RGB, GL_UNSIGNED_INT_10F_11F_11F_REV, dst);
+    glCopyImageSubData(tex[0], GL_TEXTURE_2D, 0, 0, 0, 0, tex[1], GL_TEXTURE_2D, 0, 0, 0, 0, 16, 16, 1);
+    glGetTexImage(GL_TEXTURE_2D, 0, GL_RGB, GL_UNSIGNED_INT_10F_11F_11F_REV, back);
+    CHECK_MSG(!memcmp(src, back, sizeof src), "the copy into R11F_G11F_B10F arrived changed");
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glDeleteTextures(2, tex);
+}

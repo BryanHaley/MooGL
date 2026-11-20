@@ -109,6 +109,9 @@ struct MGLCompat_t {
     GLfloat clip_planes[MGL_COMPAT_PLANES][4];   // in eye space
     // bumped when a matrix changes, so uniforms are rewritten only then
     GLuint matrix_serial;
+    // the same for lights, materials, fog, clip planes, texgen and texture
+    // environment values
+    GLuint values_serial;
 
     // --- vertex arrays ---
     GLuint client_active_texture;

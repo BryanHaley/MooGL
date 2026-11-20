@@ -304,6 +304,8 @@ bool mglCompatStreamReserve(GLMContext ctx, size_t bytes)
 
         if (initBufferData(ctx, C->stream, (GLsizeiptr)size, NULL, false) != 0)
             return false;
+        // Metal wraps these pages instead of copying them all at the first draw
+        C->stream->storage_flags |= GL_CLIENT_STORAGE_BIT;
         C->stream_used = 0;
     }
 

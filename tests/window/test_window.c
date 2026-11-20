@@ -238,6 +238,23 @@ int main(void)
         glDrawBuffer(GL_FRONT);
     }
 
+    // with vsync off a swap does not wait for the screen: 240 frames at 120 Hz
+    // would take 2 s
+    {
+        double start;
+
+        glfwSwapInterval(0);
+        start = glfwGetTime();
+        for (int i = 0; i < 240; i++)
+        {
+            glClear(GL_COLOR_BUFFER_BIT);
+            glfwSwapBuffers(window);
+        }
+        glFinish();
+        check(glfwGetTime() - start < 1.0, "with vsync off, swaps are not paced to the display");
+        glfwSwapInterval(1);
+    }
+
     check(glGetError() == GL_NO_ERROR, "no GL errors");
 
     // a window made to share sees the first one's program, not its vertex array

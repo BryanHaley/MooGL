@@ -197,6 +197,57 @@ GPU_TEST(shared_contexts, a_texture_and_program_from_one_context_draw_in_another
     MGLsetCurrentContext(a);
 }
 
+// Uploads are not waited for, so one queued in a busy context has to be
+// waited for by another context that draws with the texture after a glFlush
+GPU_TEST(shared_contexts, an_upload_reaches_another_context_after_a_flush)
+{
+    static const unsigned char red[16] = { 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255 };
+    GLMContext a = MGLgetCurrentContext(), b = newContext(a);
+    char log[1024];
+    unsigned char c[4];
+    GLuint tex, slow, prog;
+    MGLTestTarget ta, tb;
+
+    CHECK(b);
+    if (!b) return;
+
+    slow = mgl_build_program(VS, FS_SLOW_GREEN, log, sizeof log);
+    prog = mgl_build_program(VS, FS_TEX, log, sizeof log);
+    CHECK(slow && prog);
+    mgl_target_create(&ta, W, H, GL_RGBA8, 0);
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 2, 2, 0, GL_RGBA, GL_UNSIGNED_BYTE, red);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glFinish();
+
+    // the upload is queued behind slow work
+    drawQuad(&ta, slow);
+    glFlush();
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    drawQuad(&ta, prog);
+    glFlush();
+
+    MGLsetCurrentContext(b);
+    mgl_target_create(&tb, W, H, GL_RGBA8, 0);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    drawQuad(&tb, prog);
+    centre(&tb, c);
+    CHECK_MSG(c[0] > 250 && c[1] < 5, "other context drew %d,%d,%d, want red", c[0], c[1], c[2]);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+    mgl_target_destroy(&tb);
+
+    MGLsetCurrentContext(a);
+    mgl_target_destroy(&ta);
+    glDeleteTextures(1, &tex);
+    glDeleteProgram(slow);
+    glDeleteProgram(prog);
+    destroyGLMContext(b);
+    MGLsetCurrentContext(a);
+}
+
 // One context renders into a shared texture; another waits on its fence and
 // samples what it drew
 GPU_TEST(shared_contexts, a_fence_orders_rendering_between_contexts)

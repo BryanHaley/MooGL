@@ -1515,3 +1515,56 @@ GPU_TEST(image_store, a_depth_texture_takes_image_stores_as_r16)
     glDeleteProgram(prog);
     glDeleteTextures(1, &tex);
 }
+
+// A texture made before its first image binding is made again so shaders can
+// write it, through a unit and through a view, keeping what it held.
+GPU_TEST(image_store, a_texture_made_before_its_first_image_binding_can_be_written)
+{
+    static const char *CS =
+        "#version 430 core\n"
+        "layout(local_size_x = 1) in;\n"
+        "layout(rgba8, binding = 0) writeonly uniform image2D img;\n"
+        "void main() { imageStore(img, ivec2(1, 0), vec4(0, 1, 0, 1)); }\n";
+    char log[2048] = "";
+    GLuint prog = mgl_build_compute_program(CS, log, sizeof log);
+
+    CHECK_MSG(prog != 0, "did not build: %s", log);
+    if (prog == 0)
+        return;
+
+    for (int view = 0; view < 2; view++)
+    {
+        GLuint tex[2] = {0};
+        unsigned char texels[3 * 4];
+
+        memset(texels, 200, sizeof texels);
+        glGenTextures(2, tex);
+        glBindTexture(GL_TEXTURE_2D, tex[0]);
+        glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 3, 1);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 3, 1, GL_RGBA, GL_UNSIGNED_BYTE, texels);
+        // reading it back makes the Metal texture now
+        glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, texels);
+
+        if (view)
+            glTextureView(tex[1], GL_TEXTURE_2D, tex[0], GL_RGBA8, 0, 1, 0, 1);
+
+        glBindImageTexture(0, tex[view], 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+        glUseProgram(prog);
+        glDispatchCompute(1, 1, 1);
+        glMemoryBarrier(GL_TEXTURE_UPDATE_BARRIER_BIT);
+
+        glBindTexture(GL_TEXTURE_2D, tex[0]);
+        glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, texels);
+        CHECK_EQ_UINT(GL_NO_ERROR, mgl_drain_errors());
+        CHECK_MSG(texels[0] == 200 && texels[8] == 200, "%s: kept %u %u, expected 200",
+                  view ? "view" : "texture", texels[0], texels[8]);
+        CHECK_MSG(texels[4] == 0 && texels[5] == 255, "%s: wrote %u %u, expected 0 255",
+                  view ? "view" : "texture", texels[4], texels[5]);
+
+        glBindImageTexture(0, 0, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA8);
+        glDeleteTextures(2, tex);
+    }
+
+    glUseProgram(0);
+    glDeleteProgram(prog);
+}

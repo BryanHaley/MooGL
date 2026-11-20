@@ -88,6 +88,9 @@ struct MGLFFProgram_t {
     // what was last written, so unchanged state is not written again
     GLfloat matrix[(2 + MGL_COMPAT_UNITS) * 16], normal[9], vec[132 * 4], frag[18 * 4];
     bool written;
+    GLuint matrix_serial;   // C->matrix_serial when matrix and normal were last written
+    GLuint values_serial;   // C->values_serial when vec and frag were
+    GLfloat point_size;
     MGLFFProgram *next;
 };
 
@@ -1175,20 +1178,27 @@ void mglCompatForgetBuiltins(Program *prog)
     prog->compat_cache = NULL;
 }
 
+// mat and normal, and vec and frag, are only filled when they are not NULL
 static void ffValues(GLMContext ctx, GLfloat *mat, GLfloat *normal, GLfloat *vec, GLfloat *frag)
 {
     const GLfloat *mv = mglCompatModelview(ctx);
     GLfloat inv[16], ps = STATE_VAR(point_size);
 
-    memcpy(mat, mv, 64);
-    mglMatMul(mat + 16, mglCompatProjection(ctx), mv);
-    for (int u = 0; u < MGL_COMPAT_UNITS; u++)
-        memcpy(mat + (2 + u) * 16, mglCompatTextureMatrix(ctx, (GLuint)u), 64);
+    if (mat)
+    {
+        memcpy(mat, mv, 64);
+        mglMatMul(mat + 16, mglCompatProjection(ctx), mv);
+        for (int u = 0; u < MGL_COMPAT_UNITS; u++)
+            memcpy(mat + (2 + u) * 16, mglCompatTextureMatrix(ctx, (GLuint)u), 64);
 
-    mglMatInvert(mv, inv);
-    for (int c = 0; c < 3; c++)
-        for (int r = 0; r < 3; r++)
-            normal[c * 3 + r] = inv[r * 4 + c];
+        mglMatInvert(mv, inv);
+        for (int c = 0; c < 3; c++)
+            for (int r = 0; r < 3; r++)
+                normal[c * 3 + r] = inv[r * 4 + c];
+    }
+
+    if (vec == NULL)
+        return;
 
     memset(vec, 0, FV_COUNT * 4 * sizeof(GLfloat));
     vec[FV_POINT * 4 + 0] = ps > 0.0f ? ps : 1.0f;
@@ -1250,27 +1260,42 @@ static void writeFF(GLMContext ctx, MGLFFProgram *ff)
 {
     GLfloat mat[FF_MATRICES * 16], normal[9], vec[FV_COUNT * 4], frag[FG_COUNT * 4];
     GLenum err = STATE(error);
+    bool matrices = !ff->written || ff->matrix_serial != C->matrix_serial;
+    bool values = !ff->written || ff->values_serial != C->values_serial ||
+                  ff->point_size != STATE_VAR(point_size);
 
-    ffValues(ctx, mat, normal, vec, frag);
+    if (!matrices && !values)
+        return;
+
+    ffValues(ctx, matrices ? mat : NULL, normal, values ? vec : NULL, frag);
 
     ctx->error_suppress++;
 
-    if (ff->loc_matrix >= 0 && (!ff->written || memcmp(mat, ff->matrix, sizeof(mat))))
+    if (matrices && ff->loc_matrix >= 0 && (!ff->written || memcmp(mat, ff->matrix, sizeof(mat))))
         mglProgramUniformMatrix4fv(ctx, ff->name, ff->loc_matrix, FF_MATRICES, GL_FALSE, mat);
-    if (ff->loc_normal >= 0 && (!ff->written || memcmp(normal, ff->normal, sizeof(normal))))
+    if (matrices && ff->loc_normal >= 0 && (!ff->written || memcmp(normal, ff->normal, sizeof(normal))))
         mglProgramUniformMatrix3fv(ctx, ff->name, ff->loc_normal, 1, GL_FALSE, normal);
-    if (ff->loc_vec >= 0 && (!ff->written || memcmp(vec, ff->vec, sizeof(vec))))
+    if (values && ff->loc_vec >= 0 && (!ff->written || memcmp(vec, ff->vec, sizeof(vec))))
         mglProgramUniform4fv(ctx, ff->name, ff->loc_vec, FV_COUNT, vec);
-    if (ff->loc_frag >= 0 && (!ff->written || memcmp(frag, ff->frag, sizeof(frag))))
+    if (values && ff->loc_frag >= 0 && (!ff->written || memcmp(frag, ff->frag, sizeof(frag))))
         mglProgramUniform4fv(ctx, ff->name, ff->loc_frag, FG_COUNT, frag);
 
     ctx->error_suppress--;
     STATE(error) = err;
 
-    memcpy(ff->matrix, mat, sizeof(mat));
-    memcpy(ff->normal, normal, sizeof(normal));
-    memcpy(ff->vec, vec, sizeof(vec));
-    memcpy(ff->frag, frag, sizeof(frag));
+    if (matrices)
+    {
+        memcpy(ff->matrix, mat, sizeof(mat));
+        memcpy(ff->normal, normal, sizeof(normal));
+        ff->matrix_serial = C->matrix_serial;
+    }
+    if (values)
+    {
+        memcpy(ff->vec, vec, sizeof(vec));
+        memcpy(ff->frag, frag, sizeof(frag));
+        ff->values_serial = C->values_serial;
+        ff->point_size = STATE_VAR(point_size);
+    }
     ff->written = true;
 }
 

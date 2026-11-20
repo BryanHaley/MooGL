@@ -13,6 +13,8 @@
 #include "MGLContext.h"
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
 
 #define W 32
 #define H 32
@@ -700,4 +702,186 @@ GPU_TEST(perf, normalised_signed_10_10_10_2_needs_no_conversion)
     glDeleteVertexArrays(1, &vao);
     glDeleteBuffers(2, vbo);
     mgl_target_destroy(&t);
+}
+
+// An upload does not wait for the GPU. With slow draws queued ahead of each
+// upload, the loop that queues them should end long before the GPU does.
+GPU_TEST(perf, texture_uploads_do_not_wait_for_the_gpu)
+{
+    static const char *FS_SLOW =
+        "#version 460 core\n"
+        "layout(location = 0) out vec4 frag;\n"
+        "void main() {\n"
+        "    float v = gl_FragCoord.x;\n"
+        "    for (int i = 0; i < 3000; i++) v = sin(v) + 0.5;\n"
+        "    frag = vec4(0.0, 1.0, 0.0, v * 1e-9);\n"
+        "}\n";
+    enum { N = 20 };
+    GLuint tex[N], px[16];
+    MGLTestTarget t;
+    char log[1024];
+    GLuint slow, p, vao, vbo;
+    unsigned char c[4];
+    struct timespec a, b, e;
+
+    for (int i = 0; i < 16; i++)
+        px[i] = 0xff00ff00u;
+
+    if (!mgl_target_create(&t, 256, 256, GL_RGBA8, 0)) SKIP("no target");
+    slow = mgl_build_program(VS, FS_SLOW, log, sizeof log);
+    p = mgl_build_program(VS, FS_TEX, log, sizeof log);
+    CHECK(slow && p);
+    vao = mgl_fullscreen_quad(&vbo);
+    mgl_target_bind(&t);
+    glBindVertexArray(vao);
+    glGenTextures(N, tex);
+    // build both pipelines before the timing starts
+    glUseProgram(slow);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glUseProgram(p);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glFinish();
+
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    for (int i = 0; i < N; i++)
+    {
+        glUseProgram(slow);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+        glFlush();
+
+        glBindTexture(GL_TEXTURE_2D, tex[i]);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 4, 4, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glUseProgram(p);
+        // the draw makes the Metal texture and sends it
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    glFinish();
+    clock_gettime(CLOCK_MONOTONIC, &e);
+
+    double queued = (b.tv_sec - a.tv_sec) * 1e3 + (b.tv_nsec - a.tv_nsec) / 1e6;
+    double all = (e.tv_sec - a.tv_sec) * 1e3 + (e.tv_nsec - a.tv_nsec) / 1e6;
+    CHECK_MSG(queued < all / 2, "queueing took %.1f ms of the %.1f ms the GPU needed", queued, all);
+
+    pixel(&t, 128, 128, c);
+    CHECK_MSG(IS(c, 0, 1, 0), "the last texture drew %d,%d,%d, want green", c[0], c[1], c[2]);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+
+    glDeleteProgram(slow);
+    glDeleteProgram(p);
+    glDeleteTextures(N, tex);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo);
+    mgl_target_destroy(&t);
+}
+
+// Leaving a framebuffer after real drawing sends the work to the GPU, so it
+// gets on with it while the application builds the next one
+GPU_TEST(perf, leaving_a_framebuffer_sends_its_work)
+{
+    static const char *FS_SLOW =
+        "#version 460 core\n"
+        "layout(location = 0) out vec4 frag;\n"
+        "void main() {\n"
+        "    float v = gl_FragCoord.x;\n"
+        "    for (int i = 0; i < 3000; i++) v = sin(v) + 0.5;\n"
+        "    frag = vec4(0.0, 1.0, 0.0, v * 1e-9);\n"
+        "}\n";
+    MGLTestTarget a, b;
+    char log[1024];
+    GLuint p, vao, vbo;
+    struct timespec t0, t1;
+    double gpu, wait;
+
+    if (!mgl_target_create(&a, 256, 256, GL_RGBA8, 0) || !mgl_target_create(&b, 16, 16, GL_RGBA8, 0))
+        SKIP("no target");
+    p = mgl_build_program(VS, FS_SLOW, log, sizeof log);
+    CHECK(p);
+    vao = mgl_fullscreen_quad(&vbo);
+    glBindVertexArray(vao);
+    glUseProgram(p);
+    mgl_target_bind(&a);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glFinish();
+
+    // how long the GPU takes for the work
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int i = 0; i < 20; i++)
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+    glFinish();
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    gpu = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+
+    // the same, then another framebuffer, and time enough for the GPU to do it
+    for (int i = 0; i < 20; i++)
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+    mgl_target_bind(&b);
+    usleep((useconds_t)(gpu * 1500));
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    glFinish();
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    wait = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+
+    CHECK_MSG(wait < gpu / 2, "glFinish still waited %.1f ms of the %.1f ms the work takes", wait, gpu);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+
+    glDeleteProgram(p);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo);
+    mgl_target_destroy(&a);
+    mgl_target_destroy(&b);
+}
+
+// Each framebuffer left after real drawing is a command buffer of its own, so
+// a frame of many passes queues many; queueing them does not wait for the GPU
+GPU_TEST(perf, many_passes_queue_without_waiting)
+{
+    static const char *FS_SLOW =
+        "#version 460 core\n"
+        "layout(location = 0) out vec4 frag;\n"
+        "void main() {\n"
+        "    float v = gl_FragCoord.x;\n"
+        "    for (int i = 0; i < 1500; i++) v = sin(v) + 0.5;\n"
+        "    frag = vec4(0.0, 1.0, 0.0, v * 1e-9);\n"
+        "}\n";
+    // more than the 64 command buffers Metal used to allow in flight
+    enum { PASSES = 90 };
+    MGLTestTarget a, b;
+    char log[1024];
+    GLuint p, vao, vbo;
+    struct timespec t0, t1, t2;
+
+    if (!mgl_target_create(&a, 128, 128, GL_RGBA8, 0) || !mgl_target_create(&b, 128, 128, GL_RGBA8, 0))
+        SKIP("no target");
+    p = mgl_build_program(VS, FS_SLOW, log, sizeof log);
+    CHECK(p);
+    vao = mgl_fullscreen_quad(&vbo);
+    glBindVertexArray(vao);
+    glUseProgram(p);
+    mgl_target_bind(&a);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glFinish();
+
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int i = 0; i < PASSES; i++)
+    {
+        mgl_target_bind(i & 1 ? &b : &a);
+        for (int d = 0; d < 16; d++)
+            glDrawArrays(GL_TRIANGLES, 0, 6);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    glFinish();
+    clock_gettime(CLOCK_MONOTONIC, &t2);
+
+    double queued = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    double all = (t2.tv_sec - t0.tv_sec) * 1e3 + (t2.tv_nsec - t0.tv_nsec) / 1e6;
+    CHECK_MSG(queued < all * 0.15, "queueing %d passes took %.1f ms of the %.1f ms the GPU needed", PASSES, queued, all);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+
+    glDeleteProgram(p);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo);
+    mgl_target_destroy(&a);
+    mgl_target_destroy(&b);
 }

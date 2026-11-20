@@ -88,6 +88,32 @@ GPU_TEST(copy_image, rejects_a_mipmap_incomplete_texture)
     glDeleteTextures(1, &dst);
 }
 
+// GL 4.6 8.17: a filter that takes no mipmaps needs only the base level, so
+// the same texture with GL_NEAREST is complete
+GPU_TEST(copy_image, a_texture_filtered_without_mipmaps_needs_only_its_base_level)
+{
+    GLuint src = make_tex(GL_RGBA8, 4, 4, 0x01);
+    GLuint dst = 0;
+    GLubyte px[4 * 4 * 4] = {0}, got[4 * 4 * 4];
+
+    glGenTextures(1, &dst);
+    glBindTexture(GL_TEXTURE_2D, dst);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 4, 4, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+
+    mgl_drain_errors();
+
+    glCopyImageSubData(src, GL_TEXTURE_2D, 0, 0, 0, 0,
+                       dst, GL_TEXTURE_2D, 0, 0, 0, 0, 4, 4, 1);
+    CHECK_EQ_UINT(GL_NO_ERROR, glGetError());
+
+    glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, got);
+    CHECK_EQ_INT(0x01, got[0]);
+
+    glDeleteTextures(1, &src);
+    glDeleteTextures(1, &dst);
+}
+
 GPU_TEST(copy_image, rejects_mismatched_texel_sizes)
 {
     GLuint a = make_tex(GL_RGBA8, 4, 4, 0x01);      /* 4 bytes per texel */

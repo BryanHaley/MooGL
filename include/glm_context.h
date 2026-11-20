@@ -482,6 +482,8 @@ typedef struct Texture_t {
     // an image unit asked for another format; the remake waits for a draw
     // that reads it without atomics, which Metal allows only on the texture
     GLboolean format_view_wanted;
+    // bound as an image, so Metal has to let shaders write it
+    GLboolean image_write;
     // an image unit does atomics on it through a 32-bit integer cast, so its
     // storage is R32 under a view in its own format, however often remade.
     // The Metal format of that storage, signed or not, or 0.
@@ -1947,6 +1949,8 @@ typedef struct GLMContextRec_t {
     // was last known to be done with all of it
     uint64_t    gpu_epoch;
     uint64_t    idle_epoch;
+    // gpu_epoch when leaving a framebuffer last sent the work to the GPU
+    uint64_t    switch_flush_epoch;
 
     struct {
         GLuint pipelines_built;

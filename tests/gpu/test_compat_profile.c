@@ -352,6 +352,49 @@ GPU_TEST(compat_profile, fog_blends_toward_its_colour)
     closeCompat(c, &t);
 }
 
+// Fixed-function values are only sent again when something changed them, so a
+// change with nothing else between two draws has to reach the second
+GPU_TEST(compat_profile, a_new_fog_colour_reaches_the_next_draw)
+{
+    MGLTestTarget t;
+    unsigned char p[4];
+    GLMContext c = openCompat(&t);
+    static const GLfloat blue[4] = { 0, 0, 1, 1 }, green[4] = { 0, 1, 0, 1 };
+
+    CHECK(c != NULL);
+    if (!c)
+        return;
+
+    glEnable(GL_FOG);
+    glFogi(GL_FOG_MODE, GL_LINEAR);
+    glFogf(GL_FOG_START, 0.0f);
+    glFogf(GL_FOG_END, 0.5f);
+    glFogfv(GL_FOG_COLOR, blue);
+    // eye depth 1 is past the end of the fog, so only its colour shows
+    glMatrixMode(GL_MODELVIEW);
+    glTranslatef(0, 0, -1);
+    glColor3f(1, 0, 0);
+    glRectf(-1, -1, 1, 1);
+    pixel(&t, 16, 16, p);
+    CHECK_MSG(NEAR(p[2], 255) && NEAR(p[1], 0), "first draw %d %d %d, want blue", p[0], p[1], p[2]);
+
+    glFogfv(GL_FOG_COLOR, green);
+    glRectf(-1, -1, 1, 1);
+    pixel(&t, 16, 16, p);
+    CHECK_MSG(NEAR(p[1], 255) && NEAR(p[2], 0), "second draw %d %d %d, want green", p[0], p[1], p[2]);
+
+    // and a pop that puts the old colour back
+    glPushAttrib(GL_FOG_BIT);
+    glFogfv(GL_FOG_COLOR, blue);
+    glPopAttrib();
+    glRectf(-1, -1, 1, 1);
+    pixel(&t, 16, 16, p);
+    CHECK_MSG(NEAR(p[1], 255) && NEAR(p[2], 0), "after the pop %d %d %d, want green", p[0], p[1], p[2]);
+    CHECK_EQ_UINT(glGetError(), GL_NO_ERROR);
+
+    closeCompat(c, &t);
+}
+
 GPU_TEST(compat_profile, push_and_pop_attrib_restore_state)
 {
     MGLTestTarget t;

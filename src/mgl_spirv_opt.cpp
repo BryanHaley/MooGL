@@ -93,8 +93,12 @@ extern "C" bool mglInlineSpirv(const unsigned int *words, size_t count,
     opt.RegisterPass(spvtools::CreateInlineExhaustivePass());
 
     std::vector<uint32_t> result;
+    spvtools::OptimizerOptions options;
 
-    if (!opt.Run(words, count, &result) || result.empty())
+    // glslang made the module, so checking it again only costs time
+    options.set_run_validator(false);
+
+    if (!opt.Run(words, count, &result, options) || result.empty())
         return false;
 
     unsigned int *buf = (unsigned int *)malloc(result.size() * sizeof(unsigned int));

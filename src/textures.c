@@ -551,6 +551,7 @@ void mglBindImageTexture(GLMContext ctx, GLuint unit, GLuint texture, GLint leve
     unit_params.tex = ptr;
 
     ctx->state.image_units[unit] = unit_params;
+    (ptr->view_of ? ptr->view_of : ptr)->image_write = GL_TRUE;
 
     // another format of the same size reads the texels as that format, which
     // Metal only allows on a texture made to be viewed that way; the renderer

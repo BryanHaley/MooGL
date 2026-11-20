@@ -338,7 +338,18 @@ void mglBindFramebuffer(GLMContext ctx, GLenum target, GLuint framebuffer)
     }
 
     if ((target == GL_FRAMEBUFFER || target == GL_DRAW_FRAMEBUFFER) && ctx->state.framebuffer != ptr)
+    {
         mglApplyClearsFor(ctx, ctx->state.framebuffer);
+
+        // A framebuffer left after real drawing goes to the GPU now, as a
+        // glFlush would, so the GPU works on it while the next is built.
+        // Otherwise a frame of many passes only starts at the swap.
+        if (ctx->gpu_epoch - ctx->switch_flush_epoch >= 16 && ctx->mtl_funcs.mtlFlush)
+        {
+            ctx->mtl_funcs.mtlFlush(ctx, false);
+            ctx->switch_flush_epoch = ctx->gpu_epoch;
+        }
+    }
 
     switch(target) {
         case GL_DRAW_FRAMEBUFFER:

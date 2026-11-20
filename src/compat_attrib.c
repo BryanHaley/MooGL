@@ -189,6 +189,7 @@ static void restoreTextures(GLMContext ctx, MGLAttribFrame *f)
 
 static void cPopAttrib(GLMContext ctx)
 {
+    C->values_serial++;
     MGLAttribFrame *f;
     GLbitfield m;
 

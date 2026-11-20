@@ -217,6 +217,7 @@ GLuint64 glGetImageHandleARB(GLuint texture, GLint level, GLboolean layered, GLi
 
     h->tex = tex;
     h->image = GL_TRUE;
+    (tex->view_of ? tex->view_of : tex)->image_write = GL_TRUE;
     h->level = level;
     h->layered = layered;
     h->layer = layer;

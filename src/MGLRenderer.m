@@ -19,6 +19,7 @@
  */
 
 #include <os/lock.h>
+#include <stdatomic.h>
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <objc/runtime.h>
@@ -164,6 +165,7 @@ typedef struct SyncList_t {
 } SyncList;
 
 MTLPixelFormat mtlPixelFormatForGLTex(Texture * gl_tex);
+static int uploadKind(MTLPixelFormat f);
 MTLPixelFormat mtlFormatForGLInternalFormat(GLenum internal_format);
 
 static bool isDepthFormat(MTLPixelFormat f)
@@ -273,6 +275,20 @@ typedef struct {
 
     CAMetalLayer *_layer;
     id<CAMetalDrawable> _drawable;
+
+    // With vsync off a frame is copied to a spare texture, and a queue of its
+    // own shows the newest one whenever the window can take one.
+    dispatch_queue_t _presentQueue;
+    os_unfair_lock _presentLock;
+    NSMutableArray<id<MTLTexture>> *_presentFree;
+    id<MTLTexture> _presentPending;
+    bool _presentPendingFlip;          // a back buffer, bottom row first
+    NSMutableArray<id<MTLTexture>> *_backFree;
+    id<MTLRenderPipelineState> _presentPipeline;
+    uint64_t _presentPendingValue;
+    bool _presentBusy;
+    id<MTLSharedEvent> _presentEvent;
+    uint64_t _presentValue;
 
     GLMContext  ctx;    // context macros need this exact name
 
@@ -494,6 +510,12 @@ typedef struct {
 
     // the shader blit, for copies Metal's own cannot make
     id<MTLLibrary>             _blitLibrary;
+    id<MTLLibrary>             _uploadLibrary;
+    NSMutableDictionary<NSNumber *, id<MTLRenderPipelineState>> *_uploadPipelines;
+    os_unfair_lock             _uploadPipelineLock;
+    // while a texture's levels go up together, the command buffer they share
+    bool                       _batchingUploads;
+    id<MTLCommandBuffer>       _uploadBatch;
     NSMapTable                *_clipVariants;
 
     // what the last draw used, on which encoder
@@ -2331,6 +2353,15 @@ static bool isRGB32BufferFormat(GLenum f)
 
     id<MTLTexture> texture;
 
+    // A small texture with data is made CPU visible, so its levels can be
+    // written straight in while the GPU has not seen it yet (uploadBytes)
+    // only the plain formats the draw upload takes
+    if ((tex->dirty_bits & DIRTY_TEXTURE_DATA) && !tex->is_render_target && !tex->sparse &&
+        tex_desc.sampleCount <= 1 && uploadKind(tex_desc.pixelFormat) >= 0 &&
+        tex_desc.width * tex_desc.height * tex_desc.depth * tex_desc.arrayLength *
+            mglFormatDesc(tex->internalformat)->bytes_per_block <= 384 * 1024)
+        tex_desc.storageMode = MTLStorageModeShared;
+
     if (tex->sparse && tex->immutable_storage)
     {
         // made once and never remade, so it takes every use it could need;
@@ -2365,6 +2396,8 @@ static bool isRGB32BufferFormat(GLenum f)
               tex->target, tex->internalformat, tex->num_levels);
 
         MTLRegion region;
+
+        _batchingUploads = true;
 
         for(int face=0; face<num_faces; face++)
         {
@@ -2762,6 +2795,11 @@ static bool isRGB32BufferFormat(GLenum f)
                 }
             }
         }
+
+        _batchingUploads = false;
+        if (_uploadBatch)
+            [self commitUpload: _uploadBatch];
+        _uploadBatch = nil;
     }
     else
     {
@@ -3614,6 +3652,9 @@ static bool isRGB32BufferFormat(GLenum f)
     if (tex == NULL || [self makeBindlessTables] == false)
         return false;
 
+    if (h->image)
+        [self allowImageWrites: tex];
+
     if ([self bindMTLTexture: tex] == false || tex->mtl_data == NULL)
         return false;
 
@@ -4018,6 +4059,15 @@ static id<MTLTexture> atomicStorage(id<MTLTexture> t)
     return nil;
 }
 
+static MTLTextureUsage accessUsage(Texture *tex, MTLPixelFormat pixelFormat);
+
+// Metal will not make a multisample, depth or stencil texture a shader can write
+static bool shaderWritable(Texture *tex)
+{
+    return tex->samples <= 1 && (mglFormatCaps(tex->internalformat) & MGL_FMT_CAP_WRITE) &&
+           !(mglFormatCaps(tex->internalformat) & MGL_FMT_CAP_DS_ATT);
+}
+
 // Whether a texture already allows what an image unit needs: views of
 // another format, and for atomics a 32-bit integer texture underneath in the
 // signedness the unit asks for. Atomics through a view of the other
@@ -4045,6 +4095,11 @@ static bool textureReadyForCast(id<MTLTexture> t, MTLPixelFormat atomic)
 // a view of it in the original format; atomics reach through to the parent.
 - (id<MTLTexture>) remakeForFormatViews: (Texture *) tex atomic: (MTLPixelFormat) atomic
 {
+    return [self remake: tex atomic: atomic formatViews: true];
+}
+
+- (id<MTLTexture>) remake: (Texture *) tex atomic: (MTLPixelFormat) atomic formatViews: (bool) format_views
+{
     id<MTLTexture> old = (__bridge id<MTLTexture>)(tex->mtl_data);
     MTLPixelFormat own = old.pixelFormat;
     MTLTextureDescriptor *d = [[MTLTextureDescriptor alloc] init];
@@ -4065,7 +4120,9 @@ static bool textureReadyForCast(id<MTLTexture> t, MTLPixelFormat atomic)
     d.arrayLength = old.arrayLength;
     d.sampleCount = old.sampleCount;
     d.storageMode = old.storageMode;
-    d.usage = old.usage | MTLTextureUsagePixelFormatView;
+    // Metal leaves atomics out of a cube texture's reported usage, so it is
+    // worked out again rather than copied
+    d.usage = old.usage | accessUsage(tex, d.pixelFormat) | (format_views ? MTLTextureUsagePixelFormatView : 0);
 
     if (integer_storage)
     {
@@ -4127,9 +4184,26 @@ static bool textureReadyForCast(id<MTLTexture> t, MTLPixelFormat atomic)
 
     CFBridgingRelease(tex->mtl_data);
     tex->mtl_data = (void *)CFBridgingRetain(use);
-    tex->format_view = GL_TRUE;
+    if (format_views)
+        tex->format_view = GL_TRUE;
 
     return use;
+}
+
+// Remakes a texture made before it was first bound as an image, so shaders
+// can write it. A view is a view of its original, which is what gets remade.
+- (void) allowImageWrites: (Texture *) tex
+{
+    Texture *root = tex->view_of ? tex->view_of : tex;
+
+    root->image_write = GL_TRUE;
+
+    // a sparse texture keeps its tiles; its images write through a copy
+    if (root->sparse || !shaderWritable(root) || [self bindMTLTexture: root] == false || root->mtl_data == NULL)
+        return;
+
+    if (!(((__bridge id<MTLTexture>)root->mtl_data).usage & MTLTextureUsageShaderWrite))
+        [self remake: root atomic: (MTLPixelFormat)root->atomic_storage formatViews: false];
 }
 
 - (id<MTLTexture>) imageTexture: (ImageUnit *) iu cubeAsArray: (bool) cube_as_array atomic: (bool) atomic
@@ -5592,6 +5666,209 @@ static NSUInteger layerCount(id<MTLTexture> t)
     return true;
 }
 
+// Uploads are not waited for, and each context has a queue of its own. A
+// texture uploaded in one context and used in another after only a glFlush
+// has always worked, so a context first waits for what other queues uploaded.
+// Each queue runs in order, so its newest upload is enough to wait for.
+static os_unfair_lock uploadLock = OS_UNFAIR_LOCK_INIT;
+static NSMapTable<id<MTLCommandQueue>, id<MTLCommandBuffer>> *newestUpload;
+// the one queue with uploads that may be pending, NULL for none, or
+// SEVERAL_QUEUES when more than one has
+static _Atomic(void *) uploadingQueue;
+#define SEVERAL_QUEUES ((void *)1)
+
+static void noteUpload(id<MTLCommandQueue> queue, id<MTLCommandBuffer> cmd)
+{
+    os_unfair_lock_lock(&uploadLock);
+    if (newestUpload == nil)
+        newestUpload = [NSMapTable weakToStrongObjectsMapTable];
+    [newestUpload setObject: cmd forKey: queue];
+    void *was = atomic_load(&uploadingQueue);
+    atomic_store(&uploadingQueue, was == NULL || was == (__bridge void *)queue ? (__bridge void *)queue : SEVERAL_QUEUES);
+    os_unfair_lock_unlock(&uploadLock);
+}
+
+static void waitForOtherUploads(id<MTLCommandQueue> queue)
+{
+    NSMutableArray<id<MTLCommandBuffer>> *wait = nil;
+    void *uploading = atomic_load(&uploadingQueue);
+
+    // the usual case: nothing pending, or only this context's own uploads
+    if (uploading == NULL || uploading == (__bridge void *)queue)
+        return;
+
+    os_unfair_lock_lock(&uploadLock);
+    for (id<MTLCommandQueue> q in newestUpload.keyEnumerator.allObjects)
+    {
+        id<MTLCommandBuffer> cmd = [newestUpload objectForKey: q];
+
+        if (cmd.status >= MTLCommandBufferStatusCompleted)
+            [newestUpload removeObjectForKey: q];
+        else if (q != queue)
+            [wait ?: (wait = [NSMutableArray new]) addObject: cmd];
+    }
+    // only this queue's own uploads are left
+    if (wait == nil)
+        atomic_store(&uploadingQueue, [newestUpload objectForKey: queue] ? (__bridge void *)queue : NULL);
+    os_unfair_lock_unlock(&uploadLock);
+
+    for (id<MTLCommandBuffer> cmd in wait)
+        [cmd waitUntilCompleted];
+}
+
+// Which shader output a format takes for an exact copy, or -1 when the draw
+// path does not take it: floats can lose denormals, and sRGB and snorm do not
+// come back bit for bit.
+static int uploadKind(MTLPixelFormat f)
+{
+    switch (f)
+    {
+        case MTLPixelFormatR8Unorm: case MTLPixelFormatRG8Unorm: case MTLPixelFormatRGBA8Unorm:
+        case MTLPixelFormatBGRA8Unorm: case MTLPixelFormatR16Unorm: case MTLPixelFormatRG16Unorm:
+        case MTLPixelFormatRGBA16Unorm: case MTLPixelFormatRGB10A2Unorm:
+            return 0;
+        case MTLPixelFormatR8Sint: case MTLPixelFormatRG8Sint: case MTLPixelFormatRGBA8Sint:
+        case MTLPixelFormatR16Sint: case MTLPixelFormatRG16Sint: case MTLPixelFormatRGBA16Sint:
+        case MTLPixelFormatR32Sint: case MTLPixelFormatRG32Sint: case MTLPixelFormatRGBA32Sint:
+            return 1;
+        case MTLPixelFormatR8Uint: case MTLPixelFormatRG8Uint: case MTLPixelFormatRGBA8Uint:
+        case MTLPixelFormatR16Uint: case MTLPixelFormatRG16Uint: case MTLPixelFormatRGBA16Uint:
+        case MTLPixelFormatR32Uint: case MTLPixelFormatRG32Uint: case MTLPixelFormatRGBA32Uint:
+            return 2;
+        default:
+            return -1;
+    }
+}
+
+static const char *uploadMSL =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "vertex float4 mgl_upload_vs(uint v [[vertex_id]]) {\n"
+    "    return float4(v == 1 ? 3.0 : -1.0, v == 2 ? 3.0 : -1.0, 0.0, 1.0);\n"
+    "}\n"
+    "fragment float4 mgl_upload_f(float4 p [[position]], texture2d<float> s [[texture(0)]]) { return s.read(uint2(p.xy)); }\n"
+    "fragment int4 mgl_upload_i(float4 p [[position]], texture2d<int> s [[texture(0)]]) { return s.read(uint2(p.xy)); }\n"
+    "fragment uint4 mgl_upload_u(float4 p [[position]], texture2d<uint> s [[texture(0)]]) { return s.read(uint2(p.xy)); }\n";
+
+// Made once a format, and from any thread: the common ones are made in the
+// background when the renderer starts
+- (id<MTLRenderPipelineState>) uploadPipelineFor: (MTLPixelFormat) format
+{
+    static NSString *const frag[] = { @"mgl_upload_f", @"mgl_upload_i", @"mgl_upload_u" };
+    int kind = uploadKind(format);
+    NSError *err = nil;
+    id<MTLRenderPipelineState> pipeline = nil;
+
+    if (kind < 0)
+        return nil;
+
+    os_unfair_lock_lock(&_uploadPipelineLock);
+
+    pipeline = _uploadPipelines[@(format)];
+
+    if (pipeline == nil)
+    {
+        if (_uploadLibrary == nil)
+            _uploadLibrary = [_device newLibraryWithSource: @(uploadMSL) options: nil error: &err];
+
+        MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+
+        d.vertexFunction = [_uploadLibrary newFunctionWithName: @"mgl_upload_vs"];
+        d.fragmentFunction = [_uploadLibrary newFunctionWithName: frag[kind]];
+        d.colorAttachments[0].pixelFormat = format;
+        if (d.vertexFunction && d.fragmentFunction)
+            pipeline = [_device newRenderPipelineStateWithDescriptor: d error: &err];
+
+        if (pipeline)
+        {
+            if (_uploadPipelines == nil)
+                _uploadPipelines = [NSMutableDictionary new];
+            _uploadPipelines[@(format)] = pipeline;
+        }
+    }
+
+    os_unfair_lock_unlock(&_uploadPipelineLock);
+    return pipeline;
+}
+
+// The GPU's own copy from a buffer needs a pipeline the driver builds for each
+// new size of texture, which stalls a frame that loads many. A draw that reads
+// the staging buffer as a linear texture needs one pipeline per format.
+- (bool) drawUpload: (id<MTLBuffer>) staging rowBytes: (NSUInteger) rowBytes imageBytes: (NSUInteger) imageBytes
+          toTexture: (id<MTLTexture>) texture slice: (NSUInteger) slice level: (NSUInteger) level
+              width: (NSUInteger) width height: (NSUInteger) height depth: (NSUInteger) depth
+               into: (id<MTLCommandBuffer>) cmd
+{
+    int kind = uploadKind(texture.pixelFormat);
+    MTLTextureType type = texture.textureType;
+
+    if (kind < 0 || !(texture.usage & MTLTextureUsageRenderTarget) || texture.sampleCount > 1 ||
+        (type != MTLTextureType2D && type != MTLTextureType2DArray && type != MTLTextureTypeCube &&
+         type != MTLTextureTypeCubeArray && type != MTLTextureType3D) ||
+        rowBytes % [_device minimumLinearTextureAlignmentForPixelFormat: texture.pixelFormat] != 0)
+        return false;
+
+    // the draw covers the whole level, so the upload has to as well
+    if (width != MAX(texture.width >> level, (NSUInteger)1) || height != MAX(texture.height >> level, (NSUInteger)1) ||
+        (type == MTLTextureType3D && depth != MAX(texture.depth >> level, (NSUInteger)1)) ||
+        (type != MTLTextureType3D && depth != 1))
+        return false;
+
+    id<MTLRenderPipelineState> pipeline = [self uploadPipelineFor: texture.pixelFormat];
+
+    if (pipeline == nil)
+        return false;
+
+    // all the sources first, so a refusal leaves nothing half encoded
+    NSMutableArray<id<MTLTexture>> *sources = [NSMutableArray arrayWithCapacity: depth];
+    MTLTextureDescriptor *ld = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat: texture.pixelFormat
+                                                                                  width: width height: height
+                                                                              mipmapped: NO];
+    ld.storageMode = MTLStorageModeShared;
+    ld.usage = MTLTextureUsageShaderRead;
+
+    for (NSUInteger z = 0; z < depth; z++)
+    {
+        id<MTLTexture> src = [staging newTextureWithDescriptor: ld offset: z * imageBytes bytesPerRow: rowBytes];
+
+        if (src == nil)
+            return false;
+        [sources addObject: src];
+    }
+
+    for (NSUInteger z = 0; z < depth; z++)
+    {
+        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+
+        rp.colorAttachments[0].texture = texture;
+        rp.colorAttachments[0].level = level;
+        rp.colorAttachments[0].slice = type == MTLTextureType3D ? 0 : slice;
+        rp.colorAttachments[0].depthPlane = type == MTLTextureType3D ? z : 0;
+        rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+
+        id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor: rp];
+
+        [enc setRenderPipelineState: pipeline];
+        [enc setFragmentTexture: sources[z] atIndex: 0];
+        [enc drawPrimitives: MTLPrimitiveTypeTriangle vertexStart: 0 vertexCount: 3];
+        [enc endEncoding];
+    }
+
+    return true;
+}
+
+// Later work on this queue runs after it, so nothing waits for it here
+- (void) commitUpload: (id<MTLCommandBuffer>) cmd
+{
+    [cmd addCompletedHandler: ^(id<MTLCommandBuffer> done) {
+        if (done.error)
+            MGL_NSERR(@"MGL Error: texture upload failed: %@", done.error);
+    }];
+    [cmd commit];
+    noteUpload(_commandQueue, cmd);
+}
+
 - (bool) uploadBytes:(const void *)src
            toTexture:(id<MTLTexture>)texture
          bytesPerRow:(NSUInteger)srcBytesPerRow
@@ -5616,6 +5893,16 @@ static NSUInteger layerCount(id<MTLTexture> t)
         return [self uploadDepthStencil: src toTexture: texture bytesPerRow: srcBytesPerRow
                                   slice: slice level: level width: width height: height depth: depth];
 
+    // a texture being made has not been near the GPU, so the CPU can fill it
+    if (_batchingUploads && texture.storageMode == MTLStorageModeShared)
+    {
+        NSUInteger rows = [self storedRows: height];
+
+        [texture replaceRegion: MTLRegionMake3D(0, 0, 0, width, height, depth) mipmapLevel: level slice: slice
+                     withBytes: src bytesPerRow: srcBytesPerRow bytesPerImage: srcBytesPerRow * rows];
+        return true;
+    }
+
     // Every upload takes a staging buffer and a command buffer. Without a pool
     // of its own they pile up until the process runs out of room.
     @autoreleasepool {
@@ -5627,8 +5914,15 @@ static NSUInteger layerCount(id<MTLTexture> t)
     NSUInteger dstBytesPerImage = dstBytesPerRow * rows;
     NSUInteger totalBytes = dstBytesPerImage * depth;
 
-    id<MTLBuffer> staging = [_device newBufferWithLength:totalBytes
-                                                 options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> cmd = _batchingUploads ? (_uploadBatch ?: (_uploadBatch = [_commandQueue commandBuffer]))
+                                                : [_commandQueue commandBuffer];
+    if (cmd == nil)
+    {
+        MGL_NSERR(@"MGL Error: no command buffer for texture upload");
+        return false;
+    }
+
+    id<MTLBuffer> staging = [_scratchPool bufferOfLength: totalBytes forCommandBuffer: cmd];
     if (staging == nil)
     {
         MGL_NSERR(@"MGL Error: could not allocate %lu byte staging buffer for texture upload",
@@ -5645,11 +5939,12 @@ static NSUInteger layerCount(id<MTLTexture> t)
                    s8  + z * srcBytesPerRow * rows + row * srcBytesPerRow,
                    srcBytesPerRow);
 
-    id<MTLCommandBuffer> cmd = [_commandQueue commandBuffer];
-    if (cmd == nil)
+    if ([self drawUpload: staging rowBytes: dstBytesPerRow imageBytes: dstBytesPerImage toTexture: texture
+                   slice: slice level: level width: width height: height depth: depth into: cmd])
     {
-        MGL_NSERR(@"MGL Error: no command buffer for texture upload");
-        return false;
+        if (!_batchingUploads)
+            [self commitUpload: cmd];
+        return true;
     }
 
     id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
@@ -5670,14 +5965,8 @@ static NSUInteger layerCount(id<MTLTexture> t)
        destinationOrigin:MTLOriginMake(0, 0, 0)];
     [blit endEncoding];
 
-    [cmd commit];
-    [cmd waitUntilCompleted];
-
-    if (cmd.error)
-    {
-        MGL_NSERR(@"MGL Error: texture upload blit failed: %@", cmd.error);
-        return false;
-    }
+    if (!_batchingUploads)
+        [self commitUpload: cmd];
 
     MGL_NSDEBUG(@"MGL: uploaded %lux%lux%lu level %lu slice %lu",
                 (unsigned long)width, (unsigned long)height, (unsigned long)depth,
@@ -5689,9 +5978,7 @@ static NSUInteger layerCount(id<MTLTexture> t)
 
 
 // What a shader may do with the texture. Metal fixes usage when a texture is
-// made, and glBindImageTexture can ask for writes -- or atomic counting --
-// long after that, so every texture that could ever be an image is made
-// ready for it up front rather than remade later.
+// made; one first bound as an image after that is remade (allowImageWrites).
 static MTLTextureUsage accessUsage(Texture *tex, MTLPixelFormat pixelFormat)
 {
     MTLTextureUsage usage = MTLTextureUsageShaderRead;
@@ -5706,13 +5993,13 @@ static MTLTextureUsage accessUsage(Texture *tex, MTLPixelFormat pixelFormat)
     if (mglFormatCaps(tex->internalformat) & (MGL_FMT_CAP_COLOR_ATT | MGL_FMT_CAP_DS_ATT))
         usage |= MTLTextureUsageRenderTarget;
 
-    // A multisample texture cannot be written by a shader at all
     if (tex->samples > 1)
         return usage;
 
-    // Metal will not make a depth or stencil texture a shader can write
-    if ((mglFormatCaps(tex->internalformat) & MGL_FMT_CAP_WRITE) &&
-        !(mglFormatCaps(tex->internalformat) & MGL_FMT_CAP_DS_ATT))
+    // shader writes turn off Apple's lossless compression, so only images get
+    // them; the packed float formats compressed came back wrong from copies
+    if ((tex->image_write || pixelFormat == MTLPixelFormatRGB9E5Float || pixelFormat == MTLPixelFormatRG11B10Float) &&
+        shaderWritable(tex))
         usage |= MTLTextureUsageShaderWrite;
 
     // GL's imageAtomic* calls become Metal texture atomics, which Metal only
@@ -5880,6 +6167,8 @@ static MTLTextureType viewTextureType(GLenum target)
 
 - (bool)bindMTLTexture:(Texture *)tex
 {
+    waitForOtherUploads(_commandQueue);
+
     // an upload gives the texture contents an invalidated attachment would lose
     if (tex && (tex->dirty_bits & (DIRTY_TEXTURE_DATA | DIRTY_TEXTURE_LEVEL)))
         _invalidFbo = NULL;
@@ -6222,23 +6511,30 @@ static MTLTextureType viewTextureType(GLenum target)
     return ptr->spirv_resources_list[stage][type].list[index].location;
 }
 
-- (id<MTLLibrary>) compileShader: (const char *) str
+// The fp64 emulation (MGLtf, MGLdf) adds floats to get one double, and
+// reordering them throws away the low bits it depends on.
+static MTLCompileOptions *shaderCompileOptions(const char *msl)
 {
-    id<MTLLibrary> library;
-    __autoreleasing NSError *error = nil;
-
-    // The fp64 emulation adds three floats to get one double. Fast math would
-    // reorder that and throw away the low bits it depends on.
     MTLCompileOptions *opts = [MTLCompileOptions new];
+    bool doubles = strstr(msl, "MGLtf") || strstr(msl, "MGLdf");
 
     if (@available(macOS 15.0, *)) {
-        opts.mathMode = MTLMathModeSafe;
+        opts.mathMode = doubles ? MTLMathModeSafe : MTLMathModeRelaxed;
     } else {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
         opts.fastMathEnabled = NO;
 #pragma clang diagnostic pop
     }
+
+    return opts;
+}
+
+- (id<MTLLibrary>) compileShader: (const char *) str
+{
+    id<MTLLibrary> library;
+    __autoreleasing NSError *error = nil;
+    MTLCompileOptions *opts = shaderCompileOptions(str);
 
     NSString *source = [NSString stringWithUTF8String: str];
 
@@ -6428,7 +6724,8 @@ static id<MTLFunction> stageFunction(id<MTLLibrary> library, const char *entry)
     tex_desc.width = size.width;
     tex_desc.height = size.height;
     tex_desc.pixelFormat = pixelFormat;
-    tex_desc.usage = MTLTextureUsageRenderTarget;
+    // the present queue reads the colour one
+    tex_desc.usage = MTLTextureUsageRenderTarget | (depthStencil ? 0 : MTLTextureUsageShaderRead);
 
     if (depthStencil)
     {
@@ -11048,12 +11345,13 @@ static MTLWinding mtlWindingFor(const Program *p)
 
             // a dvec3 or dvec4 is still one GL location; its last doubles
             // come in at doubleHighAttribute(), where the shader looks for them
-            GLuint high = doubleHighAttribute(ctx->state.program, (GLuint)i);
+            GLuint rows = is_double ? doubleInputRowsAt(ctx->state.program, (GLuint)i) : 0;
+            GLuint high = rows > 2 ? doubleHighAttribute(ctx->state.program, (GLuint)i) : 0;
 
             // past attribute 30 the shader did not compile anyway
-            if (high > 30)
+            if (rows <= 2 || high > 30)
                 ;
-            else if (is_double && doubleInputRowsAt(ctx->state.program, (GLuint)i) > 2 && VAO_ATTRIB_STATE(i).size > 2)
+            else if (VAO_ATTRIB_STATE(i).size > 2)
             {
                 vl->attr[high].buffer = (uint32_t)(slot->buffer_base_index);
                 vl->attr[high].offset = (uint64_t)(attrib_base - slot->offset + 16);
@@ -11061,10 +11359,8 @@ static MTLWinding mtlWindingFor(const Program *p)
                                                                                          : MTLVertexFormatUInt2);
             }
             // the shader wants more than the array gives: z and w are 0 and 1
-            else if (is_double && doubleInputRowsAt(ctx->state.program, (GLuint)i) > 2)
+            else
             {
-                GLuint rows = doubleInputRowsAt(ctx->state.program, (GLuint)i);
-
                 vl->attr[high].buffer = (uint32_t)(MGL_CONSTANT_ATTRIB_BUFFER_INDEX);
                 vl->attr[high].offset = (uint64_t)(MGL_CONSTANT_ATTRIB_DEFAULT_D + 16);
                 vl->attr[high].format = (uint32_t)(rows == 4 ? MTLVertexFormatUInt4 : MTLVertexFormatUInt2);
@@ -11959,6 +12255,16 @@ static bool unitTakesAtomics(GLMContext ctx, int unit)
             break;
         }
 
+    // a program with no images has nothing to copy; most draws are this
+    Program *program = ctx->state.program;
+    bool images = false;
+
+    for (int stage = 0; program && stage < _MAX_SHADER_TYPES && !images; stage++)
+        images = program->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_STORAGE_IMAGE].count != 0;
+
+    if (!images)
+        return;
+
     for (int i = 0; i < TEXTURE_UNITS; i++)
     {
         ImageUnit *iu = &ctx->state.image_units[i];
@@ -12277,17 +12583,9 @@ static bool unitTakesAtomics(GLMContext ctx, int unit)
 
     if (v == nil)
     {
-        MTLCompileOptions *opts = [MTLCompileOptions new];
+        MTLCompileOptions *opts = shaderCompileOptions(sp->msl_str);
         NSError *err = nil;
 
-        if (@available(macOS 15.0, *)) {
-            opts.mathMode = MTLMathModeSafe;
-        } else {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-            opts.fastMathEnabled = NO;
-#pragma clang diagnostic pop
-        }
         opts.preprocessorMacros = @{ @"SPV_CLIP_ZERO_TO_ONE": @1 };
 
         id<MTLLibrary> lib = [_device newLibraryWithSource: [NSString stringWithUTF8String: sp->msl_str]
@@ -12353,7 +12651,10 @@ static bool unitTakesAtomics(GLMContext ctx, int unit)
 
     // any image cast has to be settled before this draw opens an encoder
     if (draw_command)
+    {
         [self prepareImageFormatViews: _VERTEX_SHADER last: _FRAGMENT_SHADER];
+        [self prepareImageFormatViews: _TASK_SHADER last: _MESH_SHADER];
+    }
 
     // gl_NumSamples belongs to the framebuffer, not the application, so its
     // uniform is written here rather than by a glUniform call.
@@ -13030,6 +13331,8 @@ static void allowFormatViews(GLMContext glm_ctx, Texture *tex, MTLPixelFormat at
 
                 if (tex == NULL)
                     continue;
+
+                [self allowImageWrites: tex];
 
                 // pending uploads go in before the shader can write, or they
                 // land on top of what it wrote. They also remake the texture
@@ -13763,6 +14066,10 @@ void mtlDeleteMTLObj (GLMContext glm_ctx, void *obj)
         _currentCommandBufferSyncList->size = new_size;
         _currentCommandBufferSyncList->list = new_list;
     }
+
+    // Sending the work now lets the GPU get through it while the application
+    // goes on, so a wait on the fence later finds it done or nearly.
+    [self flushCommandBuffer: false];
 }
 
 bool mtlSyncSignaled(Sync *sync)
@@ -14038,6 +14345,211 @@ void mtlFlush (GLMContext glm_ctx, bool finish)
     }
 }
 
+// A window hands its drawables back only once the screen has shown them, so
+// waiting for one paces the application to the display even with vsync off.
+// Instead the frame goes to a spare texture and the present queue shows the
+// newest; frames the screen had no time for are dropped.
+- (bool) queueFrameForPresent
+{
+    CGSize size = _layer.drawableSize;
+    NSUInteger w = (NSUInteger)size.width, h = (NSUInteger)size.height;
+    MTLPixelFormat format = _layer.pixelFormat;
+
+    if (w == 0 || h == 0)
+        return false;
+
+    if (_presentQueue == nil)
+    {
+        _presentQueue = dispatch_queue_create("MGL present", DISPATCH_QUEUE_SERIAL);
+        _presentEvent = [_device newSharedEvent];
+        _presentFree = [NSMutableArray new];
+        _backFree = [NSMutableArray new];
+    }
+
+    if (_currentCommandBuffer == nil || _currentCommandBuffer.status >= MTLCommandBufferStatusCommitted)
+        [self newCommandBuffer];
+
+    if (_currentCommandBuffer == nil)
+        return false;
+
+    // GL leaves the back buffer undefined after a swap, so the frame itself
+    // goes to the present queue and the next one is drawn into another
+    id<MTLTexture> back = _drawBuffers[_BACK].drawbuffer, next = nil;
+
+    if (_lastDefaultTarget == back && back.width == w && back.height == h)
+    {
+        os_unfair_lock_lock(&_presentLock);
+        while (next == nil && _backFree.count)
+        {
+            next = _backFree.lastObject;
+            [_backFree removeLastObject];
+            if (next.width != w || next.height != h || next.pixelFormat != back.pixelFormat)
+                next = nil;
+        }
+        os_unfair_lock_unlock(&_presentLock);
+
+        if (next == nil)
+            next = [self newDrawBuffer: back.pixelFormat isDepthStencil: false];
+    }
+
+    if (next)
+    {
+        [self endRenderEncoding];
+        [self handFrameToPresent: back flip: true];
+        _drawBuffers[_BACK].drawbuffer = next;
+        _lastDefaultTarget = next;
+        [self syncLayerSize];
+        [self newCommandBuffer];
+        return true;
+    }
+
+    id<MTLTexture> staging = nil;
+
+    os_unfair_lock_lock(&_presentLock);
+    while (staging == nil && _presentFree.count)
+    {
+        staging = _presentFree.lastObject;
+        [_presentFree removeLastObject];
+    }
+    os_unfair_lock_unlock(&_presentLock);
+
+    if (staging && (staging.width != w || staging.height != h || staging.pixelFormat != format))
+        staging = nil;
+
+    if (staging == nil)
+    {
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat: format
+                                                                                     width: w
+                                                                                    height: h
+                                                                                 mipmapped: NO];
+        d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        d.storageMode = MTLStorageModePrivate;
+        staging = [_device newTextureWithDescriptor: d];
+
+        if (staging == nil)
+            return false;
+    }
+
+    // the frame is held bottom row first; the window wants it top first
+    _blitFlipY = true;
+    [self shaderBlitFrom: _lastDefaultTarget origin: MTLOriginMake(0, 0, 0)
+                    size: MTLSizeMake(_lastDefaultTarget.width, _lastDefaultTarget.height, 1)
+                      to: staging origin: MTLOriginMake(0, 0, 0) size: MTLSizeMake(w, h, 1)];
+    _blitFlipY = false;
+    [self endRenderEncoding];
+    [self handFrameToPresent: staging flip: false];
+    [self syncLayerSize];
+    [self newCommandBuffer];
+
+    return true;
+}
+
+// Sends the work drawing the frame, and makes it the one the present queue
+// shows next; an older one it had not got to yet goes back to its pool
+- (void) handFrameToPresent: (id<MTLTexture>) frame flip: (bool) flip
+{
+    uint64_t value = ++_presentValue;
+
+    [_currentCommandBuffer encodeSignalEvent: _presentEvent value: value];
+    [self commitCommandBufferWithAGXRecovery: _currentCommandBuffer];
+    ctx->stats.frames_presented++;
+
+    os_unfair_lock_lock(&_presentLock);
+    if (_presentPending)
+        [(_presentPendingFlip ? _backFree : _presentFree) addObject: _presentPending];
+    _presentPending = frame;
+    _presentPendingFlip = flip;
+    _presentPendingValue = value;
+    bool start = !_presentBusy;
+    _presentBusy = true;
+    os_unfair_lock_unlock(&_presentLock);
+
+    if (start)
+        dispatch_async(_presentQueue, ^{ [self presentPending]; });
+}
+
+static const char *presentMSL =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "vertex float4 mgl_present_vs(uint v [[vertex_id]]) {\n"
+    "    return float4(v == 1 ? 3.0 : -1.0, v == 2 ? 3.0 : -1.0, 0.0, 1.0);\n"
+    "}\n"
+    "fragment float4 mgl_present_fs(float4 p [[position]], texture2d<float> src [[texture(0)]],\n"
+    "                               constant float3 &dst [[buffer(0)]]) {\n"
+    "    float2 pix = floor(p.xy);\n"
+    "    if (dst.z != 0.0) pix.y = dst.y - 1.0 - pix.y;\n"
+    "    float2 size = float2(src.get_width(), src.get_height());\n"
+    "    return src.read(uint2(clamp(floor((pix + 0.5) * (size / dst.xy)), float2(0.0), size - 1.0)));\n"
+    "}\n";
+
+// On the present queue: shows the newest frame until none is waiting
+- (void) presentPending
+{
+    for (;;)
+    {
+        os_unfair_lock_lock(&_presentLock);
+        id<MTLTexture> t = _presentPending;
+        bool flip = _presentPendingFlip;
+        NSMutableArray<id<MTLTexture>> *pool = flip ? _backFree : _presentFree;
+        uint64_t value = _presentPendingValue;
+        _presentPending = nil;
+        if (t == nil)
+            _presentBusy = false;
+        os_unfair_lock_unlock(&_presentLock);
+
+        if (t == nil)
+            return;
+
+        @autoreleasepool {
+            id<CAMetalDrawable> d = [_layer nextDrawable];
+            id<MTLCommandBuffer> cb = d ? [_commandQueue commandBuffer] : nil;
+
+            if (cb && _presentPipeline == nil)
+            {
+                id<MTLLibrary> lib = [_device newLibraryWithSource: @(presentMSL) options: nil error: nil];
+                MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+
+                pd.vertexFunction = [lib newFunctionWithName: @"mgl_present_vs"];
+                pd.fragmentFunction = [lib newFunctionWithName: @"mgl_present_fs"];
+                pd.colorAttachments[0].pixelFormat = d.texture.pixelFormat;
+                _presentPipeline = [_device newRenderPipelineStateWithDescriptor: pd error: nil];
+            }
+
+            if (cb == nil || _presentPipeline == nil)
+            {
+                os_unfair_lock_lock(&_presentLock);
+                [pool addObject: t];
+                os_unfair_lock_unlock(&_presentLock);
+                continue;
+            }
+
+            [cb encodeWaitForEvent: _presentEvent value: value];
+
+            MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+
+            rp.colorAttachments[0].texture = d.texture;
+            rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+            rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+
+            id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor: rp];
+            float dst[3] = { (float)d.texture.width, (float)d.texture.height, flip ? 1.0f : 0.0f };
+
+            [enc setRenderPipelineState: _presentPipeline];
+            [enc setFragmentTexture: t atIndex: 0];
+            [enc setFragmentBytes: dst length: sizeof dst atIndex: 0];
+            [enc drawPrimitives: MTLPrimitiveTypeTriangle vertexStart: 0 vertexCount: 3];
+            [enc endEncoding];
+            [cb presentDrawable: d];
+            [cb addCompletedHandler: ^(id<MTLCommandBuffer> done) {
+                os_unfair_lock_lock(&self->_presentLock);
+                [pool addObject: t];
+                os_unfair_lock_unlock(&self->_presentLock);
+            }];
+            [cb commit];
+        }
+    }
+}
+
 #pragma mark C interface to mtlSwapBuffers
 -(void) mtlSwapBuffers:(GLMContext) glm_ctx
 {
@@ -14058,6 +14570,13 @@ void mtlFlush (GLMContext glm_ctx, bool finish)
         RETURN_ON_FAILURE([self processGLState: false]);
 
         [self endRenderEncoding];
+
+        if (ctx->swap_interval == 0 && _lastDefaultTarget != nil && _layer != nil && [self queueFrameForPresent])
+            return;
+
+        // vsync back on: what the present queue still holds goes first
+        if (_presentQueue)
+            dispatch_sync(_presentQueue, ^{});
 
         if (_drawable == NULL)
         {
@@ -17016,6 +17535,13 @@ static CGFloat viewScale(NSView *view)
     _scratchPool = [[MGLScratchBufferPool alloc] initWithDevice: _device];
     _kernels = [[MGLKernelLibrary alloc] initWithDevice: _device];
 
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        static const MTLPixelFormat common[] = { MTLPixelFormatRGBA8Unorm, MTLPixelFormatBGRA8Unorm,
+                                                 MTLPixelFormatR8Unorm, MTLPixelFormatRG8Unorm };
+        for (size_t i = 0; i < sizeof common / sizeof common[0]; i++)
+            [self uploadPipelineFor: common[i]];
+    });
+
     // built now, because making one later would need a blit and would retire
     // whatever encoder is open at the time
     [self dummyTextureForGLType: GL_SAMPLER_2D];
@@ -17036,7 +17562,10 @@ static CGFloat viewScale(NSView *view)
 
     // Create command queue with virtualization-safe settings
     // 64 is Metal's default
-    NSUInteger maxCommandBuffers = 64;
+    // A frame can send a command buffer for each framebuffer it leaves, and a
+    // busy machine runs their completions late; at 64 the next one waited.
+    // More than this lets a program that sends many run too far ahead.
+    NSUInteger maxCommandBuffers = 96;
     if (isVirtualized) {
         MGL_NSINFO(@"MGL INFO: VIRTUALIZED AGX - Enabling virtualization-safe command queue settings");
         maxCommandBuffers = 16;  // Limit concurrent buffers for virtualization safety

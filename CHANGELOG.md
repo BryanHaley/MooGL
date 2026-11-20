@@ -71,6 +71,47 @@
   the nearest of the three.
 
 ### Faster
+- With vsync off, a swap no longer waits for the window to hand back a drawable. A window
+  takes a new frame only once per screen refresh, so before, everything ran at the display's
+  rate. The newest frame is now shown when the screen can take one, and older ones are skipped,
+  as Apple's OpenGL does.
+- A small texture with data is made CPU visible and filled straight in when it is created,
+  before the GPU has seen it, with no copy on the GPU at all.
+- Shader builds skip SPIRV-Tools' check of the module before inlining; glslang made it, so it
+  only cost time. Old-style drawing builds a program for each new combination of state, so
+  this shortens the stalls the first time each one is drawn.
+- Texture levels for common formats are written with a small draw of MooGL's own instead of
+  the GPU's copy from a buffer, which needs a pipeline the driver builds for each new texture
+  size. A texture's levels go up together, and the pipelines for the usual formats are made in
+  the background when a context starts.
+- Old-style drawing sends the fixed-function matrices and values again only when they changed,
+  rather than working them all out and comparing them before every draw.
+- Format lookups use an index instead of searching the format table, and draws with programs
+  that use no images skip the image bookkeeping.
+- MooGL's stream buffer for client-side arrays is handed to Metal as it is, rather than copied
+  into a new Metal buffer each time it fills up.
+- Texture uploads no longer wait for the GPU. Each level used to wait for everything queued
+  before it, so loading a level's textures in Half-Life stalled a frame for a quarter of a
+  second. Another context that draws with a texture after only a `glFlush` still waits for it.
+- Leaving a framebuffer after real drawing sends that work to the GPU, as a `glFlush` would,
+  so the GPU draws one pass while the application builds the next. Before, a frame of many
+  passes only started on the GPU at the swap. SuperTuxKart went from about 270 to 336 fps.
+- Up to 96 command buffers can be in flight, not 64. A frame now sends one for each
+  framebuffer it leaves, and on a busy machine their completions run late, so the next one
+  waited; SuperTuxKart's slowest frames came from that.
+- With vsync off, the swap hands the back buffer itself to the present queue and draws the
+  next frame into another one, rather than copying the frame twice on its way to the window.
+- `glFenceSync` sends the work queued before it to the GPU straight away, so a later wait on
+  the fence finds it done. SuperTuxKart waits on one every frame.
+- Shaders that use no doubles compile with Metal's relaxed maths, which allows faster maths
+  but keeps infinities and NaNs. Shaders that use doubles keep exact maths, which the double
+  emulation needs.
+- Textures get Metal's shader-write usage only once they are bound as images, through a unit
+  or a bindless handle, or handed out with `MGLgetMetalTexture`. That usage turns off Apple's
+  lossless compression, which render targets like a G-buffer benefit from. A texture made
+  before its first image binding is made again, contents and all. `GL_RGB9_E5` and
+  `GL_R11F_G11F_B10F` keep the usage always: compressed, some of their bit patterns came back
+  changed from a copy.
 - Old-style drawing is much faster. GLQuake's `timedemo demo1` went from 48 to about 225 fps,
   and Half-Life under Xash3D went from about 105 to about 130 fps.
   - A draw that switches the program or vertex array away and back to the ones the last draw
@@ -84,6 +125,9 @@
     each draw.
 
 ### Fixed
+- `glCopyImageSubData` no longer refuses a texture that has only its base level when its
+  minification filter is `GL_NEAREST` or `GL_LINEAR`; such a texture is complete, since the
+  filter needs no mipmaps.
 - Drawing into a `GL_RGB9_E5` renderbuffer no longer aborts in Metal's pipeline check.
 - `glGen*` no longer hands out a name an app already brought to life by binding it, and a
   name deleted twice is not handed out twice.

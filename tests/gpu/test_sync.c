@@ -5,6 +5,8 @@
  * Sync objects (fences), memory barriers and texture barrier.
  */
 
+#include <unistd.h>
+
 #include "mgl_test.h"
 #include "harness.h"
 
@@ -302,6 +304,29 @@ GPU_TEST(sync, flush_with_sync_flush_bit)
               "1 second should be enough for a fence on a headless "
               "context; got TIMEOUT_EXPIRED. This may be a driver issue.");
 
+    glDeleteSync(s);
+}
+
+// A fence goes to the GPU when it is made, so it goes off without a flush and
+// a wait on it later finds the work done
+GPU_TEST(sync, fence_goes_off_without_a_flush)
+{
+    GLsync s;
+    GLint status = GL_UNSIGNALED;
+
+    glClearColor(0, 0, 1, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    s = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    CHECK(s != NULL);
+
+    for (int i = 0; i < 1000 && status != GL_SIGNALED; i++)
+    {
+        usleep(1000);
+        glGetSynciv(s, GL_SYNC_STATUS, 1, NULL, &status);
+    }
+
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+    CHECK_MSG(status == GL_SIGNALED, "the fence had not gone off after 1 s");
     glDeleteSync(s);
 }
 

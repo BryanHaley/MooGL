@@ -213,6 +213,8 @@ GPU_TEST(bindless, compute_writes_an_image_by_handle)
     glBindTexture(GL_TEXTURE_2D, tex);
     glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 2, 1);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 2, 1, GL_RGBA, GL_UNSIGNED_BYTE, texels);
+    // made now, before it is an image, so the handle has to have it made again
+    glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, texels);
 
     GLuint64 h = glGetImageHandleARB(tex, 0, GL_FALSE, 0, GL_RGBA8);
 

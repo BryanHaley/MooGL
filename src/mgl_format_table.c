@@ -23,6 +23,7 @@
 #include "mgl_format_table.h"
 #include "mgl_legacy_enums.h"
 #include "pixel_utils.h"
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -668,12 +669,49 @@ static bool mtl_format_usable(uint16_t mtl_format)
 /*  lookups                                                          */
 /* ================================================================ */
 
+/* Lookups run several times a draw, so the table is indexed once: GL enums
+ * by an open-addressed hash, Metal formats, which are small, directly. */
+#define GL_SLOTS 1024
+#define MTL_SLOTS 1024
+
+static const MGLFormatDesc *gl_index[GL_SLOTS];
+static const MGLFormatDesc *mtl_index[MTL_SLOTS];
+static pthread_once_t index_once = PTHREAD_ONCE_INIT;
+
+static size_t glSlot(GLenum e)
+{
+    return (e * 2654435761u) % GL_SLOTS;
+}
+
+static void buildIndex(void)
+{
+    for (size_t i = 0; i < gl_table_count; i++)
+    {
+        size_t at = glSlot(gl_table[i].gl_format);
+
+        while (gl_index[at] && gl_index[at]->gl_format != gl_table[i].gl_format)
+            at = (at + 1) % GL_SLOTS;
+        if (gl_index[at] == NULL)
+            gl_index[at] = &gl_table[i];
+    }
+
+    // the first row wins, and a row whose own format matches beats a substitute
+    for (size_t i = 0; i < gl_table_count; i++)
+        if (gl_table[i].mtl_format < MTL_SLOTS && mtl_index[gl_table[i].mtl_format] == NULL)
+            mtl_index[gl_table[i].mtl_format] = &gl_table[i];
+    for (size_t i = 0; i < gl_table_count; i++)
+        if (gl_table[i].mtl_substitute < MTL_SLOTS && mtl_index[gl_table[i].mtl_substitute] == NULL)
+            mtl_index[gl_table[i].mtl_substitute] = &gl_table[i];
+}
+
 const MGLFormatDesc *mglFormatDesc(GLenum gl_internal_format)
 {
-    for (size_t i = 0; i < gl_table_count; i++) {
-        if (gl_table[i].gl_format == gl_internal_format)
-            return &gl_table[i];
-    }
+    pthread_once(&index_once, buildIndex);
+
+    for (size_t at = glSlot(gl_internal_format); gl_index[at]; at = (at + 1) % GL_SLOTS)
+        if (gl_index[at]->gl_format == gl_internal_format)
+            return gl_index[at];
+
     return &_unknown_gl;
 }
 
@@ -716,6 +754,11 @@ const MGLMetalFormatDesc *mglMetalFormatDesc(uint16_t mtl_format)
 
 const MGLFormatDesc *mglFormatDescForMetal(uint16_t mtl_format)
 {
+    pthread_once(&index_once, buildIndex);
+
+    if (mtl_format < MTL_SLOTS)
+        return mtl_index[mtl_format] ? mtl_index[mtl_format] : &_unknown_gl;
+
     for (size_t i = 0; i < gl_table_count; i++) {
         if (gl_table[i].mtl_format == mtl_format)
             return &gl_table[i];
