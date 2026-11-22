@@ -847,3 +847,179 @@ GPU_TEST(geometry_shader, fragment_reads_the_written_primitive_id)
     glDeleteProgram(prog);
     mgl_target_destroy(&t);
 }
+
+// Iris shaderpacks declare several varyings in one statement
+GPU_TEST(geometry_shader, varyings_declared_in_one_statement)
+{
+    static const GLfloat pts[2] = { 0.0f, 0.0f };
+    static const char *vs =
+        "#version 410\n"
+        "layout(location = 0) in vec2 p;\n"
+        "flat out vec3 aV, bV;\n"
+        "void main() { gl_Position = vec4(p, 0.0, 1.0); aV = vec3(0.2, 0.0, 0.0); bV = vec3(0.0, 0.8, 0.0); }\n";
+    static const char *gs =
+        "#version 410\n"
+        "layout(points) in;\n"
+        "layout(triangle_strip, max_vertices = 4) out;\n"
+        "flat in vec3 aV[1], bV[1];\n"
+        "flat out vec3 a, b;\n"
+        "void main() {\n"
+        "    for (int i = 0; i < 4; i++) {\n"
+        "        gl_Position = vec4(float(i & 1) * 2.0 - 1.0, float(i >> 1) * 2.0 - 1.0, 0.0, 1.0);\n"
+        "        a = aV[0]; b = bV[0];\n"
+        "        EmitVertex();\n"
+        "    }\n"
+        "    EndPrimitive();\n"
+        "}\n";
+    static const char *fs =
+        "#version 410\n"
+        "flat in vec3 a, b;\n"
+        "out vec4 o;\n"
+        "void main() { o = vec4(a + b, 1.0); }\n";
+    MGLTestTarget t;
+    GLuint prog, vao, vbo;
+    char log[2048];
+    unsigned char *px, c[4];
+
+    prog = linkVGF(vs, gs, fs, log, sizeof log);
+    CHECK_MSG(prog != 0, "geometry program did not link: %s", log);
+
+    if (!prog || !mgl_target_create(&t, 8, 8, GL_RGBA8, 0))
+        return;
+
+    mgl_target_bind(&t);
+    glUseProgram(prog);
+    vao = pointsVAO(pts, sizeof pts, &vbo);
+    glViewport(0, 0, 8, 8);
+    glClearColor(0, 0, 1, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArrays(GL_POINTS, 0, 1);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+
+    px = mgl_read_rgba8(&t);
+    if (px)
+    {
+        mgl_pixel_at(px, &t, 4, 4, c);
+        CHECK_MSG(c[0] > 45 && c[0] < 58 && c[1] > 198 && c[1] < 210 && c[2] == 0,
+                  "read %d %d %d", c[0], c[1], c[2]);
+        free(px);
+    }
+
+    glUseProgram(0);
+    glDeleteProgram(prog);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo);
+    mgl_target_destroy(&t);
+}
+
+// a parameter named like an output is the parameter inside its function
+GPU_TEST(geometry_shader, a_parameter_hides_an_output_of_the_same_name)
+{
+    static const GLfloat pts[2] = { 0.0f, 0.0f };
+    static const char *vs =
+        "#version 410\n"
+        "layout(location = 0) in vec2 p;\n"
+        "void main() { gl_Position = vec4(p, 0.0, 1.0); }\n";
+    static const char *gs =
+        "#version 410\n"
+        "layout(points) in;\n"
+        "layout(triangle_strip, max_vertices = 4) out;\n"
+        "flat out int mat;\n"
+        "int twice(int mat) { return mat * 2; }\n"
+        "void main() {\n"
+        "    for (int i = 0; i < 4; i++) {\n"
+        "        gl_Position = vec4(float(i & 1) * 2.0 - 1.0, float(i >> 1) * 2.0 - 1.0, 0.0, 1.0);\n"
+        "        mat = twice(50);\n"
+        "        EmitVertex();\n"
+        "    }\n"
+        "    EndPrimitive();\n"
+        "}\n";
+    static const char *fs =
+        "#version 410\n"
+        "flat in int mat;\n"
+        "out vec4 o;\n"
+        "void main() { o = vec4(float(mat) / 255.0, 0.0, 0.0, 1.0); }\n";
+    MGLTestTarget t;
+    GLuint prog, vao, vbo;
+    char log[2048];
+    unsigned char *px, c[4];
+
+    prog = linkVGF(vs, gs, fs, log, sizeof log);
+    CHECK_MSG(prog != 0, "geometry program did not link: %s", log);
+
+    if (!prog || !mgl_target_create(&t, 8, 8, GL_RGBA8, 0))
+        return;
+
+    mgl_target_bind(&t);
+    glUseProgram(prog);
+    vao = pointsVAO(pts, sizeof pts, &vbo);
+    glViewport(0, 0, 8, 8);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArrays(GL_POINTS, 0, 1);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+
+    px = mgl_read_rgba8(&t);
+    if (px)
+    {
+        mgl_pixel_at(px, &t, 4, 4, c);
+        CHECK_MSG(c[0] == 100, "read %d, want 100", c[0]);
+        free(px);
+    }
+
+    glUseProgram(0);
+    glDeleteProgram(prog);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo);
+    mgl_target_destroy(&t);
+}
+
+// Sodium draws with a large base vertex; the capture was sized from vertex 0
+GPU_TEST(geometry_shader, a_large_first_vertex_draws)
+{
+    static const char *vs =
+        "#version 410\n"
+        "void main() { gl_Position = vec4(float(gl_VertexID - 1000000000), 0.0, 0.0, 1.0); }\n";
+    static const char *gs =
+        "#version 410\n"
+        "layout(points) in;\n"
+        "layout(triangle_strip, max_vertices = 4) out;\n"
+        "void main() {\n"
+        "    for (int i = 0; i < 4; i++) {\n"
+        "        gl_Position = gl_in[0].gl_Position + vec4(float(i & 1) * 2.0 - 1.0, float(i >> 1) * 2.0 - 1.0, 0.0, 0.0);\n"
+        "        EmitVertex();\n"
+        "    }\n"
+        "    EndPrimitive();\n"
+        "}\n";
+    static const char *fs =
+        "#version 410\n"
+        "out vec4 o;\n"
+        "void main() { o = vec4(0.0, 1.0, 0.0, 1.0); }\n";
+    MGLTestTarget t;
+    GLuint prog, vao;
+    char log[2048];
+    int green;
+
+    prog = linkVGF(vs, gs, fs, log, sizeof log);
+    CHECK_MSG(prog != 0, "geometry program did not link: %s", log);
+
+    if (!prog || !mgl_target_create(&t, 8, 8, GL_RGBA8, 0))
+        return;
+
+    mgl_target_bind(&t);
+    glUseProgram(prog);
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    glViewport(0, 0, 8, 8);
+    glClearColor(1, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArrays(GL_POINTS, 1000000000, 1);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+
+    green = countWhere(&t, 0, 60, 200, 255);
+    CHECK_MSG(green == 64, "%d of 64 pixels drawn", green);
+
+    glUseProgram(0);
+    glDeleteProgram(prog);
+    glDeleteVertexArrays(1, &vao);
+    mgl_target_destroy(&t);
+}

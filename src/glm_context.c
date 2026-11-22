@@ -574,6 +574,17 @@ void MGLsetSwapInterval(GLMContext ctx, int interval)
         ctx->mtl_funcs.mtlSetSwapInterval(ctx, interval);
 }
 
+void MGLsetContextView(GLMContext ctx, void *view)
+{
+    if (ctx == NULL)
+        ctx = _ctx;
+
+    if (ctx == NULL || ctx->mtl_funcs.mtlSetView == NULL)
+        return;
+
+    ctx->mtl_funcs.mtlSetView(ctx, view);
+}
+
 // CRITICAL FIX: Proper context destruction to prevent memory leaks
 // Everything a table still holds, freed the way deleting it would.
 typedef void (*FreeObjectFunc)(GLMContext ctx, void *obj);

@@ -1992,3 +1992,46 @@ GPU_TEST(misc_core, too_many_vertex_inputs_do_not_link)
     glDeleteProgram(p);
     mgl_drain_errors();
 }
+
+// GLSL lets a variable be called what C++, and so Metal, keeps as a keyword
+GPU_TEST(misc_core, variables_named_like_cpp_keywords)
+{
+    static const char *VS =
+        "#version 430\n"
+        "layout(location = 0) in vec2 p;\n"
+        "void main() { gl_Position = vec4(p, 0.0, 1.0); }\n";
+    static const char *FS =
+        "#version 430\n"
+        "uniform float operator;\n"
+        "out vec4 o;\n"
+        "void main() {\n"
+        "    bool new = gl_FragCoord.x >= 0.0;\n"
+        "    float and = 0.25, delete = 0.5, nullptr = operator;\n"
+        "    o = vec4(new ? and : 0.0, delete, nullptr, 1.0);\n"
+        "}\n";
+    unsigned char *px, c[4];
+    MGLTestTarget t;
+    GLuint prog, vao, vbo;
+    char log[1024];
+
+    prog = mgl_build_program(VS, FS, log, sizeof log);
+    CHECK_MSG(prog != 0, "did not build: %s", log);
+    if (!prog || !mgl_target_create(&t, 1, 1, GL_RGBA8, 0)) return;
+
+    glUseProgram(prog);
+    glUniform1f(glGetUniformLocation(prog, "operator"), 0.75f);
+    vao = mgl_fullscreen_quad(&vbo);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    px = mgl_read_rgba8(&t);
+    if (px)
+    {
+        mgl_pixel_at(px, &t, 0, 0, c);
+        CHECK_MSG(c[0] >= 63 && c[0] <= 64 && c[1] >= 127 && c[1] <= 128 && c[2] >= 191 && c[2] <= 192,
+                  "read %d %d %d", c[0], c[1], c[2]);
+        free(px);
+    }
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo);
+    glDeleteProgram(prog);
+    mgl_target_destroy(&t);
+}

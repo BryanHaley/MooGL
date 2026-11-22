@@ -2353,6 +2353,74 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage, Spirv *sp
         }
     }
 
+    // more sampled textures than Metal has sampler slots: one argument buffer
+    ptr->tex_table[stage] = 0;
+    GLuint table_tex_id[MGL_TEX_PARAM_SLOTS], table_smp_id[MGL_TEX_PARAM_SLOTS];
+    if (ptr->bindless[stage].count == 0)
+    {
+        spvc_resources tr = NULL;
+        const spvc_reflected_resource *list = NULL;
+        size_t count = 0;
+        GLuint sizes[MGL_TEX_PARAM_SLOTS], total = 0;
+
+        spvc_set active = NULL;
+
+        if (spvc_compiler_get_active_interface_variables(compiler_msl, &active) == SPVC_SUCCESS &&
+            spvc_compiler_create_shader_resources_for_active_variables(compiler_msl, &tr, active) == SPVC_SUCCESS &&
+            spvc_resources_get_resource_list_for_type(tr, SPVC_RESOURCE_TYPE_SAMPLED_IMAGE, &list, &count) == SPVC_SUCCESS)
+        {
+            for (size_t r = 0; r < count && r < MGL_TEX_PARAM_SLOTS; r++)
+            {
+                spvc_type t = spvc_compiler_get_type_handle(compiler_msl, list[r].type_id);
+
+                sizes[r] = spvc_type_get_num_array_dimensions(t) ? spvc_type_get_array_dimension(t, 0) : 1;
+                total += sizes[r] ? sizes[r] : 1;
+            }
+        }
+
+        if (total > MGL_METAL_SAMPLERS && MGL_TEX_TABLE_FIRST_ID + total <= MGL_TEX_PARAM_SLOTS)
+        {
+            GLuint next = MGL_TEX_TABLE_FIRST_ID;
+            spvc_msl_resource_binding rb;
+
+            for (size_t r = 0; r < count; r++)
+            {
+                spvc_msl_resource_binding_2 tb;
+
+                spvc_compiler_set_decoration(compiler_msl, list[r].id, SpvDecorationDescriptorSet, MGL_TEX_TABLE_SET);
+                spvc_compiler_set_decoration(compiler_msl, list[r].id, SpvDecorationBinding, (unsigned)r);
+
+                table_tex_id[r] = next;
+                table_smp_id[r] = next + total;
+                next += sizes[r];
+
+                // an array in an argument buffer is as long as count says
+                spvc_msl_resource_binding_init_2(&tb);
+                tb.stage = spvc_compiler_get_execution_model(compiler_msl);
+                tb.desc_set = MGL_TEX_TABLE_SET;
+                tb.binding = (unsigned)r;
+                tb.count = sizes[r];
+                tb.msl_texture = table_tex_id[r];
+                tb.msl_sampler = table_smp_id[r];
+                spvc_compiler_msl_add_resource_binding_2(compiler_msl, &tb);
+            }
+
+            spvc_msl_resource_binding_init(&rb);
+            rb.stage = spvc_compiler_get_execution_model(compiler_msl);
+            rb.desc_set = MGL_TEX_TABLE_SET;
+            rb.binding = SPVC_MSL_ARGUMENT_BUFFER_BINDING;
+            rb.msl_buffer = MGL_TEX_TABLE_MSL_SLOT;
+            spvc_compiler_msl_add_resource_binding(compiler_msl, &rb);
+
+            spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_MSL_ARGUMENT_BUFFERS, SPVC_TRUE);
+            spvc_compiler_options_set_uint(options, SPVC_COMPILER_OPTION_MSL_ARGUMENT_BUFFERS_TIER, 1);
+            for (unsigned set = 0; set < MGL_TEX_TABLE_SET; set++)
+                spvc_compiler_msl_add_discrete_descriptor_set(compiler_msl, set);
+
+            ptr->tex_table[stage] = 2 * total;
+        }
+    }
+
     // Metal gives a stage 31 buffer slots. Past a handful of plain uniforms
     // they share one, as a table of pointers to them.
     sp->plain_table = GL_FALSE;
@@ -2771,6 +2839,23 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage, Spirv *sp
         }
     }
 
+    // glslang numbers only the blocks it thinks are used, and one read only
+    // from a global's initializer keeps binding 0, where SPIRV-Cross takes it
+    // for an alias of another block. The GL bindings were recorded above.
+    {
+        SpirvResourceList *ub = &ptr->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_UNIFORM_BUFFER];
+
+        for (GLuint i = 0; i < ub->count; i++)
+            for (GLuint j = 0; j < i; j++)
+                if (ub->list[j].set == ub->list[i].set &&
+                    spvc_compiler_get_decoration(compiler_msl, ub->list[j]._id, SpvDecorationBinding) ==
+                    spvc_compiler_get_decoration(compiler_msl, ub->list[i]._id, SpvDecorationBinding))
+                {
+                    spvc_compiler_set_decoration(compiler_msl, ub->list[i]._id, SpvDecorationBinding, 1000 + i);
+                    break;
+                }
+    }
+
     // A failure here means SPIRV-Cross could not turn the SPIR-V into MSL.
     // Returning NULL fails the link, which is the honest answer -- ignoring it
     // hands Metal broken source and the program silently draws nothing.
@@ -2922,6 +3007,17 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage, Spirv *sp
                                                                                          rlist->list[i]._id);
 
                 rlist->list[i].msl_sampler_index = (sidx == (unsigned)-1) ? rlist->list[i].msl_index : sidx;
+            }
+
+            if (res_type == SPVC_RESOURCE_TYPE_SAMPLED_IMAGE && ptr->tex_table[stage])
+            {
+                unsigned b = spvc_compiler_get_decoration(compiler_msl, rlist->list[i]._id, SpvDecorationBinding);
+
+                if (b < MGL_TEX_PARAM_SLOTS)
+                {
+                    rlist->list[i].msl_index = table_tex_id[b];
+                    rlist->list[i].msl_sampler_index = table_smp_id[b];
+                }
             }
 
             rlist->list[i].gl_type = glTypeFromSpirv(compiler_msl, rlist->list[i].type_id,

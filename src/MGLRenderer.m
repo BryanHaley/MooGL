@@ -379,6 +379,8 @@ typedef struct {
     // every sparse texture takes its pages from here
     id<MTLHeap> _sparseHeap;
     id<MTLSamplerState> _incompleteSampler;
+    id<MTLSamplerState> _incompleteTableSampler;
+    NSMapTable *_tableSamplers;
 
     // cull distance: record the distances, then pick the primitives that live
     id<MTLRenderPipelineState>  _cullCapturePipeline;
@@ -723,6 +725,39 @@ MTLVertexFormat glTypeSizeToMtlType(GLuint type, GLuint size, bool normalized)
 
 // An attribute in a format Metal has no vertex format for: doubles the shader
 // reads as floats, and the packed ten-bit formats when not normalised.
+// 1 when the vertex shader reads location loc as signed integers, -1 for
+// unsigned, 0 otherwise
+static int shaderIntSign(GLMContext ctx, int loc)
+{
+    Program *p = ctx->state.program;
+
+    if (p == NULL)
+        return 0;
+
+    SpirvResourceList *in = &p->spirv_resources_list[_VERTEX_SHADER][SPVC_RESOURCE_TYPE_STAGE_INPUT];
+
+    for (GLuint i = 0; i < in->count; i++)
+    {
+        if ((int)in->list[i].location != loc)
+            continue;
+
+        switch (in->list[i].gl_type)
+        {
+            case GL_INT: case GL_INT_VEC2: case GL_INT_VEC3: case GL_INT_VEC4:
+                return 1;
+            case GL_UNSIGNED_INT: case GL_UNSIGNED_INT_VEC2: case GL_UNSIGNED_INT_VEC3: case GL_UNSIGNED_INT_VEC4:
+                return -1;
+        }
+    }
+
+    return 0;
+}
+
+static bool glTypeSigned(GLenum type)
+{
+    return type == GL_BYTE || type == GL_SHORT || type == GL_INT;
+}
+
 static bool attribNeedsConversion(GLMContext ctx, int a)
 {
     if (VAO_ATTRIB_STATE(a).type == GL_DOUBLE)
@@ -734,6 +769,20 @@ static bool attribNeedsConversion(GLMContext ctx, int a)
     // Metal reads an attribute only at a 4 byte aligned offset and stride
     if ((VAO_ATTRIB_BINDING(a)->offset + VAO_ATTRIB_STATE(a).relativeoffset) & 3 || VAO_ATTRIB_BINDING(a)->stride & 3)
         return true;
+
+    // an integer input fed by glVertexAttribPointer gets the values as integers
+    if (!VAO_ATTRIB_STATE(a).is_integer && shaderIntSign(ctx, a))
+        return true;
+
+    // Metal will not read an unsigned format into int, or a signed one into uint
+    if (VAO_ATTRIB_STATE(a).is_integer)
+    {
+        int sign = shaderIntSign(ctx, a);
+
+        if ((sign == 1 && !glTypeSigned(VAO_ATTRIB_STATE(a).type)) ||
+            (sign == -1 && glTypeSigned(VAO_ATTRIB_STATE(a).type)))
+            return true;
+    }
 
     // Metal turns bytes and shorts into floats, but not 32-bit integers,
     // normalised or not
@@ -962,14 +1011,9 @@ static inline int mglDebugCompute(void)
 {
     MTLResourceOptions options;
 
-    // Apple silicon has one copy of memory, which Shared storage uses directly
+    // Apple silicon has one copy of memory, which Shared storage uses directly.
+    // Not write-combined: copies and renames read these back on the CPU.
     options = MTLResourceCPUCacheModeDefaultCache | MTLResourceStorageModeShared;
-
-    // ways we will only write to this
-    if ((ptr->storage_flags & GL_MAP_READ_BIT) == 0)
-    {
-        options |= MTLResourceCPUCacheModeWriteCombined;
-    }
 
     // Wrapping the memory we already have, rather than copying it and freeing
     // the original, keeps any pointer the application was given still good. A
@@ -1208,15 +1252,16 @@ static inline int mglDebugCompute(void)
 
         // The attribute slots have to clear every uniform slot MSL handed out,
         // and those are sparse, so take the highest one rather than the count.
+        // A uniform in the plain table has a table index, not a slot.
         GLuint attrib_slot = 0;
         for (int b=0; b<vao_buffer_start; b++)
-            if (buffer_map->buffers[b].buffer_base_index >= attrib_slot)
+            if (!buffer_map->buffers[b].in_table && buffer_map->buffers[b].buffer_base_index >= attrib_slot)
                 attrib_slot = buffer_map->buffers[b].buffer_base_index + 1;
 
-        // CRITICAL SECURITY FIX: Check array bounds instead of using assert()
-        if (buffer_map->count >= ctx->state.max_vertex_attribs) {
-            MGL_NSERR(@"MGL SECURITY ERROR: buffer_map count %d exceeds max_vertex_attribs %d",
-                  buffer_map->count, ctx->state.max_vertex_attribs);
+        // the attributes go after what is already mapped
+        if (buffer_map->count + ctx->state.max_vertex_attribs > MAX_MAPPED_BUFFERS) {
+            MGL_NSERR(@"MGL ERROR: %d mapped buffers leave no room for the vertex attributes",
+                  buffer_map->count);
             return false;
         }
         buffer_map->buffers[vao_buffer_start].buf = NULL;
@@ -1763,6 +1808,14 @@ static bool bufferSizesFor(Program *program, int stage, const BufferMapList *lis
     {
         if (VAO_ATTRIB_STATE(a).is_integer)
             convertAttribElementInt(type, size, src + k * stride, (int32_t *)(dst + k * 4));
+        else if (shaderIntSign(ctx, a))
+        {
+            float f[4];
+
+            convertAttribElement(type, size, VAO_ATTRIB_STATE(a).normalized, src + k * stride, f);
+            for (int c = 0; c < 4; c++)
+                ((int32_t *)dst)[k * 4 + c] = (int32_t)f[c];
+        }
         else
             convertAttribElement(type, size, VAO_ATTRIB_STATE(a).normalized, src + k * stride, dst + k * 4);
     }
@@ -4039,6 +4092,48 @@ static void formatChannels(Texture *tex, id<MTLTexture> base, MTLTextureSwizzle 
     return sampler ? sampler : [self incompleteSampler];
 }
 
+// The same sampling state for a stage that reads its textures through an
+// argument buffer. Such samplers are slow to make, so only these are.
+- (id<MTLSamplerState>) tableSamplerForUnit: (GLuint) unit texture: (Texture *) ptr
+{
+    id<MTLSamplerState> plain = ptr ? [self samplerForUnit: unit texture: ptr] : nil;
+    id<MTLSamplerState> s = nil;
+
+    if (_tableSamplers == nil)
+        _tableSamplers = [NSMapTable weakToStrongObjectsMapTable];
+
+    if (plain && plain != _incompleteSampler)
+    {
+        s = [_tableSamplers objectForKey: plain];
+
+        if (s == nil)
+        {
+            Sampler *so = STATE(texture_samplers[unit]);
+
+            _makingBindlessSampler = true;
+            s = [self createMTLSamplerForTexParam: so ? &so->params : &ptr->params target: ptr->target];
+            _makingBindlessSampler = false;
+
+            if (s)
+                [_tableSamplers setObject: s forKey: plain];
+        }
+    }
+
+    if (s == nil)
+    {
+        if (_incompleteTableSampler == nil)
+        {
+            MTLSamplerDescriptor *d = [MTLSamplerDescriptor new];
+
+            d.supportArgumentBuffers = YES;
+            _incompleteTableSampler = [_device newSamplerStateWithDescriptor: d];
+        }
+        s = _incompleteTableSampler;
+    }
+
+    return s;
+}
+
 // What an image unit hands a shader: the bound level, and just the one layer
 // when the binding is not layered.
 // The 32-bit integer storage under a cast texture, however many views MGL
@@ -4511,15 +4606,45 @@ static MGLTexParam texParamFor(GLMContext ctx, const TextureParameter *p, GLenum
 // Binds every texture and image a stage reads, each into the Metal slot
 // SPIRV-Cross gave it. The GL unit decides which texture; the slot is fixed
 // when the shader is compiled and has nothing to do with the unit number.
+typedef void (^MGLSetTable)(const void *ids, NSUInteger length, id<MTLResource> __unsafe_unretained *used, NSUInteger count);
+
 - (bool) bindTexturesForStage: (int) stage
                    setTexture: (void (^)(id<MTLTexture>, NSUInteger)) setTexture
                    setSampler: (void (^)(id<MTLSamplerState>, NSUInteger)) setSampler
                   setParams: (void (^)(const void *, NSUInteger)) setParams
+                   setTable: (MGLSetTable) setTable
 {
     Program *program = ctx->state.program;
 
     if (program == NULL)
         return true;
+
+    // the stage reads its sampled textures through an argument buffer
+    GLuint table_len = program->tex_table[stage];
+    MTLResourceID table[table_len ? table_len : 1];
+    NSMutableArray<id<MTLResource>> *table_used = nil;
+
+    if (table_len)
+    {
+        void (^direct)(id<MTLTexture>, NSUInteger) = setTexture;
+        MTLResourceID *ids = table;
+
+        memset(table, 0, sizeof table);
+        table_used = [NSMutableArray new];
+        setTexture = ^(id<MTLTexture> t, NSUInteger i) {
+            if (i >= MGL_TEX_TABLE_FIRST_ID && i - MGL_TEX_TABLE_FIRST_ID < table_len)
+            {
+                ids[i - MGL_TEX_TABLE_FIRST_ID] = t.gpuResourceID;
+                [table_used addObject: t];
+            }
+            else
+                direct(t, i);
+        };
+        setSampler = ^(id<MTLSamplerState> smp, NSUInteger i) {
+            if (i >= MGL_TEX_TABLE_FIRST_ID && i - MGL_TEX_TABLE_FIRST_ID < table_len)
+                ids[i - MGL_TEX_TABLE_FIRST_ID] = smp.gpuResourceID;
+        };
+    }
 
     MGLTexParam params[MGL_TEX_PARAM_SLOTS];
     GLuint param_count = 0;
@@ -4566,12 +4691,14 @@ static MGLTexParam texParamFor(GLMContext ctx, const TextureParameter *p, GLenum
             {
                 texture = [self dummyTextureForGLType: res->gl_type];
                 setTexture(texture ? texture : [self incompleteTexture], res->msl_index + e);
-                setSampler([self incompleteSampler], res->msl_sampler_index + e);
+                setSampler(table_len ? [self tableSamplerForUnit: unit texture: NULL] : [self incompleteSampler],
+                           res->msl_sampler_index + e);
                 continue;
             }
 
             setTexture(texture, res->msl_index + e);
-            setSampler([self samplerForUnit: unit texture: ptr], res->msl_sampler_index + e);
+            setSampler(table_len ? [self tableSamplerForUnit: unit texture: ptr] : [self samplerForUnit: unit texture: ptr],
+                       res->msl_sampler_index + e);
 
             GLuint slot = res->msl_index + (GLuint)e;
 
@@ -4661,6 +4788,15 @@ static MGLTexParam texParamFor(GLMContext ctx, const TextureParameter *p, GLenum
             setParams(params, head);
     }
 
+    if (table_len && setTable)
+    {
+        id<MTLResource> __unsafe_unretained used[table_used.count ? table_used.count : 1];
+
+        for (NSUInteger k = 0; k < table_used.count; k++)
+            used[k] = table_used[k];
+        setTable(table, sizeof table, used, table_used.count);
+    }
+
     return true;
 }
 
@@ -4672,24 +4808,28 @@ static MGLTexParam texParamFor(GLMContext ctx, const TextureParameter *p, GLenum
         return [self bindTexturesForStage: stage
                                setTexture: ^(id<MTLTexture> t, NSUInteger i) { [self->_currentRenderEncoder setMeshTexture: t atIndex: i]; }
                                setSampler: ^(id<MTLSamplerState> s, NSUInteger i) { [self->_currentRenderEncoder setMeshSamplerState: s atIndex: i]; }
-                                setParams: ^(const void *p, NSUInteger n) { [self->_currentRenderEncoder setMeshBytes: p length: n atIndex: MGL_VERTEX_TEX_PARAM_MSL_SLOT]; }];
+                                setParams: ^(const void *p, NSUInteger n) { [self->_currentRenderEncoder setMeshBytes: p length: n atIndex: MGL_VERTEX_TEX_PARAM_MSL_SLOT]; }
+                               setTable: ^(const void *p, NSUInteger n, id<MTLResource> __unsafe_unretained *u, NSUInteger c) { [self->_currentRenderEncoder setMeshBytes: p length: n atIndex: MGL_TEX_TABLE_MSL_SLOT]; [self->_currentRenderEncoder useResources: u count: c usage: MTLResourceUsageRead stages: MTLRenderStageMesh]; }];
 
     if (stage == _TASK_SHADER)
         return [self bindTexturesForStage: stage
                                setTexture: ^(id<MTLTexture> t, NSUInteger i) { [self->_currentRenderEncoder setObjectTexture: t atIndex: i]; }
                                setSampler: ^(id<MTLSamplerState> s, NSUInteger i) { [self->_currentRenderEncoder setObjectSamplerState: s atIndex: i]; }
-                                setParams: ^(const void *p, NSUInteger n) { [self->_currentRenderEncoder setObjectBytes: p length: n atIndex: MGL_VERTEX_TEX_PARAM_MSL_SLOT]; }];
+                                setParams: ^(const void *p, NSUInteger n) { [self->_currentRenderEncoder setObjectBytes: p length: n atIndex: MGL_VERTEX_TEX_PARAM_MSL_SLOT]; }
+                               setTable: ^(const void *p, NSUInteger n, id<MTLResource> __unsafe_unretained *u, NSUInteger c) { [self->_currentRenderEncoder setObjectBytes: p length: n atIndex: MGL_TEX_TABLE_MSL_SLOT]; [self->_currentRenderEncoder useResources: u count: c usage: MTLResourceUsageRead stages: MTLRenderStageObject]; }];
 
     if (stage == _VERTEX_SHADER)
         return [self bindTexturesForStage: stage
                                setTexture: ^(id<MTLTexture> t, NSUInteger i) { [self->_currentRenderEncoder setVertexTexture: t atIndex: i]; }
                                setSampler: ^(id<MTLSamplerState> s, NSUInteger i) { [self->_currentRenderEncoder setVertexSamplerState: s atIndex: i]; }
-                                setParams: ^(const void *p, NSUInteger n) { [self->_currentRenderEncoder setVertexBytes: p length: n atIndex: MGL_VERTEX_TEX_PARAM_MSL_SLOT]; }];
+                                setParams: ^(const void *p, NSUInteger n) { [self->_currentRenderEncoder setVertexBytes: p length: n atIndex: MGL_VERTEX_TEX_PARAM_MSL_SLOT]; }
+                               setTable: ^(const void *p, NSUInteger n, id<MTLResource> __unsafe_unretained *u, NSUInteger c) { [self->_currentRenderEncoder setVertexBytes: p length: n atIndex: MGL_TEX_TABLE_MSL_SLOT]; [self->_currentRenderEncoder useResources: u count: c usage: MTLResourceUsageRead stages: MTLRenderStageVertex]; }];
 
     return [self bindTexturesForStage: stage
                            setTexture: ^(id<MTLTexture> t, NSUInteger i) { [self->_currentRenderEncoder setFragmentTexture: t atIndex: i]; }
                            setSampler: ^(id<MTLSamplerState> s, NSUInteger i) { [self->_currentRenderEncoder setFragmentSamplerState: s atIndex: i]; }
-                            setParams: ^(const void *p, NSUInteger n) { [self->_currentRenderEncoder setFragmentBytes: p length: n atIndex: MGL_TEX_PARAM_MSL_SLOT]; }];
+                            setParams: ^(const void *p, NSUInteger n) { [self->_currentRenderEncoder setFragmentBytes: p length: n atIndex: MGL_TEX_PARAM_MSL_SLOT]; }
+                               setTable: ^(const void *p, NSUInteger n, id<MTLResource> __unsafe_unretained *u, NSUInteger c) { [self->_currentRenderEncoder setFragmentBytes: p length: n atIndex: MGL_TEX_TABLE_MSL_SLOT]; [self->_currentRenderEncoder useResources: u count: c usage: MTLResourceUsageRead stages: MTLRenderStageFragment]; }];
 }
 
 // The stages MGL runs as compute passes, or through another stage's slot,
@@ -4701,7 +4841,8 @@ static MGLTexParam texParamFor(GLMContext ctx, const TextureParameter *p, GLenum
     [self bindTexturesForStage: stage
                     setTexture: ^(id<MTLTexture> t, NSUInteger i) { [enc setTexture: t atIndex: i]; }
                     setSampler: ^(id<MTLSamplerState> s, NSUInteger i) { [enc setSamplerState: s atIndex: i]; }
-                     setParams: ^(const void *p, NSUInteger n) { [enc setBytes: p length: n atIndex: MGL_VERTEX_TEX_PARAM_MSL_SLOT]; }];
+                     setParams: ^(const void *p, NSUInteger n) { [enc setBytes: p length: n atIndex: MGL_VERTEX_TEX_PARAM_MSL_SLOT]; }
+                               setTable: ^(const void *p, NSUInteger n, id<MTLResource> __unsafe_unretained *u, NSUInteger c) { [enc setBytes: p length: n atIndex: MGL_TEX_TABLE_MSL_SLOT]; [enc useResources: u count: c usage: MTLResourceUsageRead]; }];
 }
 
 - (void) bindTexturesForStageAsVertex: (int) stage
@@ -4709,7 +4850,8 @@ static MGLTexParam texParamFor(GLMContext ctx, const TextureParameter *p, GLenum
     [self bindTexturesForStage: stage
                     setTexture: ^(id<MTLTexture> t, NSUInteger i) { [self->_currentRenderEncoder setVertexTexture: t atIndex: i]; }
                     setSampler: ^(id<MTLSamplerState> s, NSUInteger i) { [self->_currentRenderEncoder setVertexSamplerState: s atIndex: i]; }
-                     setParams: ^(const void *p, NSUInteger n) { [self->_currentRenderEncoder setVertexBytes: p length: n atIndex: MGL_VERTEX_TEX_PARAM_MSL_SLOT]; }];
+                     setParams: ^(const void *p, NSUInteger n) { [self->_currentRenderEncoder setVertexBytes: p length: n atIndex: MGL_VERTEX_TEX_PARAM_MSL_SLOT]; }
+                               setTable: ^(const void *p, NSUInteger n, id<MTLResource> __unsafe_unretained *u, NSUInteger c) { [self->_currentRenderEncoder setVertexBytes: p length: n atIndex: MGL_TEX_TABLE_MSL_SLOT]; [self->_currentRenderEncoder useResources: u count: c usage: MTLResourceUsageRead stages: MTLRenderStageVertex]; }];
 }
 
 - (bool) bindTexturesToCurrentRenderEncoder
@@ -5099,6 +5241,30 @@ static MTLColorWriteMask writeMaskFor(MTLPixelFormat f, MTLColorWriteMask m)
 // there is no window, made on first use the way a draw would make it
 - (id<MTLTexture>) defaultSurface
 {
+    // a window resized or moved since the last draw into it
+    if (_lastDefaultTarget != nil && _layer != nil && ![self isHeadless])
+    {
+        [self syncLayerSize];
+
+        for (int i = 0; i < _MAX_DRAW_BUFFERS; i++)
+        {
+            if (_drawBuffers[i].drawbuffer != _lastDefaultTarget || [self drawBufferSizeMatches: i])
+                continue;
+
+            id<MTLTexture> t = [self newDrawBuffer: ctx->pixel_format.mtl_pixel_format isDepthStencil: false];
+
+            if (t == nil)
+                return nil;
+
+            _drawBuffers[i].drawbuffer = t;
+            _drawBuffers[i].depthbuffer = nil;
+            _drawBuffers[i].stencilbuffer = nil;
+            _drawBuffers[i].width = (GLuint)t.width;
+            _drawBuffers[i].height = (GLuint)t.height;
+            _lastDefaultTarget = t;
+        }
+    }
+
     if (_lastDefaultTarget != nil)
         return _lastDefaultTarget;
 
@@ -6520,6 +6686,9 @@ static MTLCompileOptions *shaderCompileOptions(const char *msl)
 
     if (@available(macOS 15.0, *)) {
         opts.mathMode = doubles ? MTLMathModeSafe : MTLMathModeRelaxed;
+        // SPIRV-Cross writes MSL 3.2; left unset, Metal picks the version
+        // the program was built against, 3.1 in Minecraft's Java
+        opts.languageVersion = MTLLanguageVersion3_2;
     } else {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -9740,9 +9909,9 @@ static const char *mgl_gs_capture_msl =
             return true;
     }
 
-    // one instance's vertices, and every instance after it sits that far on
-    NSUInteger per_instance = (NSUInteger)(first > 0 ? first : 0) +
-                              (gs_indices ? (NSUInteger)top_index + 1 : (NSUInteger)count);
+    // one instance's vertices, counted from the draw's first or base vertex,
+    // and every instance after it sits that far on
+    NSUInteger per_instance = gs_indices ? (NSUInteger)top_index + 1 : (NSUInteger)count;
     NSUInteger in_verts = per_instance * (NSUInteger)instances;
     NSUInteger slots = (NSUInteger)prims * (NSUInteger)gi->invocations * (NSUInteger)instances;
 
@@ -11313,9 +11482,12 @@ static MTLWinding mtlWindingFor(const Program *p)
                 format = VAO_ATTRIB_STATE(i).size >= 2 ? MTLVertexFormatUInt4 : MTLVertexFormatUInt2;
             // the slot is fed a float4 copy, or an int4 one for an integer attribute
             else if (attribNeedsConversion(ctx, i))
-                format = !VAO_ATTRIB_STATE(i).is_integer ? MTLVertexFormatFloat4 :
-                         (VAO_ATTRIB_STATE(i).type == GL_BYTE || VAO_ATTRIB_STATE(i).type == GL_SHORT ||
-                          VAO_ATTRIB_STATE(i).type == GL_INT) ? MTLVertexFormatInt4 : MTLVertexFormatUInt4;
+            {
+                int sign = shaderIntSign(ctx, i);
+
+                format = !VAO_ATTRIB_STATE(i).is_integer && !sign ? MTLVertexFormatFloat4 :
+                         (sign ? sign > 0 : glTypeSigned(VAO_ATTRIB_STATE(i).type)) ? MTLVertexFormatInt4 : MTLVertexFormatUInt4;
+            }
             else
                 format = glTypeSizeToMtlType(VAO_ATTRIB_STATE(i).type,
                                              VAO_ATTRIB_STATE(i).size,
@@ -11399,6 +11571,10 @@ static MTLWinding mtlWindingFor(const Program *p)
                 case _ATTRIB_CONST_UINT: format = MTLVertexFormatUInt4;  break;
                 default:                 format = MTLVertexFormatFloat4; break;
             }
+
+            // the default (0, 0, 0, 1) reads as zeros into an integer input
+            if (format == MTLVertexFormatFloat4 && shaderIntSign(ctx, i))
+                format = shaderIntSign(ctx, i) > 0 ? MTLVertexFormatInt4 : MTLVertexFormatUInt4;
 
             vl->attr[i].buffer = (uint32_t)(MGL_CONSTANT_ATTRIB_BUFFER_INDEX);
             vl->attr[i].offset = (uint64_t)(i * 16);
@@ -13277,7 +13453,8 @@ static bool unitTakesAtomics(GLMContext ctx, int unit)
     bool ok = [self bindTexturesForStage: _COMPUTE_SHADER
                               setTexture: ^(id<MTLTexture> t, NSUInteger i) { [computeCommandEncoder setTexture: t atIndex: i]; }
                               setSampler: ^(id<MTLSamplerState> s, NSUInteger i) { [computeCommandEncoder setSamplerState: s atIndex: i]; }
-                               setParams: ^(const void *p, NSUInteger n) { [computeCommandEncoder setBytes: p length: n atIndex: MGL_TEX_PARAM_MSL_SLOT]; }];
+                               setParams: ^(const void *p, NSUInteger n) { [computeCommandEncoder setBytes: p length: n atIndex: MGL_TEX_PARAM_MSL_SLOT]; }
+                               setTable: ^(const void *p, NSUInteger n, id<MTLResource> __unsafe_unretained *u, NSUInteger c) { [computeCommandEncoder setBytes: p length: n atIndex: MGL_TEX_TABLE_MSL_SLOT]; [computeCommandEncoder useResources: u count: c usage: MTLResourceUsageRead]; }];
 
     ctx->state.dirty_bits &= ~(DIRTY_TEX_BINDING | DIRTY_SAMPLER | DIRTY_IMAGE_UNIT_STATE);
 
@@ -13437,9 +13614,26 @@ static void allowFormatViews(GLMContext glm_ctx, Texture *tex, MTLPixelFormat at
     if (computePipelineState == nil)
     {
         NSError *errors;
+        MTLComputePipelineDescriptor *desc = [MTLComputePipelineDescriptor new];
+        NSUInteger threads = MAX(program->local_workgroup_size.x, 1u) * MAX(program->local_workgroup_size.y, 1u) *
+                             MAX(program->local_workgroup_size.z, 1u);
 
-        computePipelineState = [_device newComputePipelineStateWithFunction:func error: &errors];
+        // left alone, a kernel using many registers allows fewer threads than
+        // the work group GL promised, and Metal drops the dispatch
+        desc.computeFunction = func;
+        desc.maxTotalThreadsPerThreadgroup = threads;
+        computePipelineState = [_device newComputePipelineStateWithDescriptor: desc options: MTLPipelineOptionNone
+                                                                   reflection: nil error: &errors];
+        if (computePipelineState == nil)
+        {
+            MGL_NSERR(@"MGL ERROR: program %u's compute pipeline for %lu threads: %@", program->name,
+                      (unsigned long)threads, errors);
+            computePipelineState = [_device newComputePipelineStateWithFunction: func error: &errors];
+        }
         MTL_CHECK_RETURN_FALSE(computePipelineState, GL_OUT_OF_MEMORY);
+        if (computePipelineState.maxTotalThreadsPerThreadgroup < threads)
+            MGL_NSERR(@"MGL ERROR: program %u's work group of %lu is more than Metal can run (%lu)", program->name,
+                      (unsigned long)threads, (unsigned long)computePipelineState.maxTotalThreadsPerThreadgroup);
         program->spirv[_COMPUTE_SHADER].mtl_compute_pipeline = (void *)CFBridgingRetain(computePipelineState);
     }
 
@@ -13868,6 +14062,13 @@ void mtlSetSwapInterval(GLMContext glm_ctx, int interval)
 {
     @autoreleasepool {
         [(__bridge id) glm_ctx->mtl_funcs.mtlObj mtlSetSwapInterval: interval];
+    }
+}
+
+void mtlSetView(GLMContext glm_ctx, void *view)
+{
+    @autoreleasepool {
+        [(__bridge id) glm_ctx->mtl_funcs.mtlObj mtlSetView: (__bridge NSView *)view];
     }
 }
 
@@ -15528,8 +15729,9 @@ void mtlGetTexImage(GLMContext glm_ctx, Texture *tex, void *pixelBytes, GLuint b
     // end encoding on current render encoder
     [self endRenderEncoding];
 
-    // no failure path..?
-    RETURN_ON_FAILURE([self bindMTLTexture:tex]);
+    // the texture is made again with room for the new levels; what was
+    // drawn into level 0 has to come with it
+    RETURN_ON_FAILURE([self refreshTexture:tex]);
     MTL_CHECK_RETURN(tex->mtl_data, GL_OUT_OF_MEMORY);
 
     id<MTLTexture> texture;
@@ -17169,6 +17371,7 @@ void mtlMultiDrawElementsIndirect(GLMContext glm_ctx, GLenum mode, GLenum type, 
     glm_ctx->mtl_funcs.mtlBindBuffer = mtlBindBuffer;
     glm_ctx->mtl_funcs.mtlBindTexture = mtlBindTexture;
     glm_ctx->mtl_funcs.mtlSetSwapInterval = mtlSetSwapInterval;
+    glm_ctx->mtl_funcs.mtlSetView = mtlSetView;
     glm_ctx->mtl_funcs.mtlBindlessSampler = mtlBindlessSampler;
     glm_ctx->mtl_funcs.mtlDrawMeshTasks = mtlDrawMeshTasks;
     glm_ctx->mtl_funcs.mtlSparseTileSize = mtlSparseTileSize;
@@ -17343,6 +17546,38 @@ static CGFloat viewScale(NSView *view)
     CGFloat scale = [view window] && retina ? [[view window] backingScaleFactor] : 1.0;
 
     return scale < 1.0 ? 1.0 : scale;
+}
+
+// Moves the window's layer to another view, as NSOpenGLContext's setView
+// does. Needs the main thread, like any AppKit view change.
+- (void) mtlSetView: (NSView *) view
+{
+    if (view == _view || _layer == nil)
+        return;
+
+    [self flushCommandBuffer: false];
+    if (_presentQueue)
+        dispatch_sync(_presentQueue, ^{});
+    _drawable = nil;
+
+    [CATransaction begin];
+    [CATransaction setDisableActions: YES];
+    if (_view.layer == _layer)
+        [_view setLayer: nil];
+    _view = view;
+    if (view)
+    {
+        [view setLayer: _layer];
+        [view setWantsLayer: YES];
+        [view setLayerContentsRedrawPolicy: NSViewLayerContentsRedrawDuringViewResize];
+    }
+    [CATransaction commit];
+
+    if (ctx->mtl_funcs.mtlView)
+        CFBridgingRelease(ctx->mtl_funcs.mtlView);
+    ctx->mtl_funcs.mtlView = view ? (void *)CFBridgingRetain(view) : NULL;
+
+    [self syncLayerSize];
 }
 
 // setting drawableSize by hand stops CAMetalLayer tracking the view, so do it here

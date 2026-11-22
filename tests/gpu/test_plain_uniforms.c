@@ -210,3 +210,42 @@ GPU_TEST(plain_uniforms, an_explicit_location_at_the_top_leaves_room_below)
     glUseProgram(0);
     glDeleteProgram(prog);
 }
+
+// Iris's vertex shaders read more than 16 plain uniforms; the draw was refused
+GPU_TEST(plain_uniforms, a_vertex_shader_reads_twenty_uniforms)
+{
+    static const char *vs =
+        "#version 430 core\n"
+        "layout(location = 0) in vec2 p;\n"
+        "uniform float u0, u1, u2, u3, u4, u5, u6, u7, u8, u9,\n"
+        "              u10, u11, u12, u13, u14, u15, u16, u17, u18, u19;\n"
+        "out float v;\n"
+        "void main() {\n"
+        "    v = u0 + u1 + u2 + u3 + u4 + u5 + u6 + u7 + u8 + u9 +\n"
+        "        u10 + u11 + u12 + u13 + u14 + u15 + u16 + u17 + u18 + u19;\n"
+        "    gl_Position = vec4(p, 0.0, 1.0);\n"
+        "}\n";
+    static const char *fs =
+        "#version 430 core\n"
+        "in float v;\n"
+        "out vec4 o;\n"
+        "void main() { o = vec4(v, 0.0, 0.0, 1.0); }\n";
+    unsigned char c[4] = { 0 };
+    char log[1024], name[8];
+    GLuint prog = mgl_build_program(vs, fs, log, sizeof log);
+
+    CHECK_MSG(prog != 0, "did not build: %s", log);
+    if (!prog) return;
+
+    glUseProgram(prog);
+    for (int i = 0; i < 20; i++)
+    {
+        snprintf(name, sizeof name, "u%d", i);
+        glUniform1f(glGetUniformLocation(prog, name), 0.025f);
+    }
+
+    CHECK(drawCentre(prog, c));
+    CHECK_MSG(c[0] >= 126 && c[0] <= 129, "read %d, want 128", c[0]);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+    glDeleteProgram(prog);
+}

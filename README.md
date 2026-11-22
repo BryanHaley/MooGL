@@ -55,6 +55,30 @@ drawing 1600×900 pixels at about 130 fps. The frame shows:
 MooGL's build of the engine also turns on its subgroup, SPIR-V, debug-output and mesh shader
 paths, which stock macOS can't run, and its path tracer works too.
 
+## Minecraft shaderpacks on MooGL
+
+<p align="center">
+  <img src="docs/images/minecraft-bettervoxels.webp" alt="Minecraft 26.3 with the BetterVoxels shaderpack on MooGL" width="900">
+</p>
+
+Some shaderpacks need OpenGL 4.3 or later and won't run on Apple's 4.1. With MooGL they do,
+and Minecraft itself is not changed. Above, Minecraft 26.3 with Fabric, Sodium and Iris
+runs the BetterVoxels shaderpack on an M1 Max.
+
+1. Install Iris with its installer, as usual. It adds an Iris profile to the launcher.
+2. Put the shaderpack in `~/Library/Application Support/minecraft/shaderpacks`.
+3. In the launcher, open **Installations**, edit the Iris profile, open **More options**,
+   and add this to the end of **JVM arguments**, with the path to your SDK:
+
+   ```
+   -Dorg.lwjgl.sdl.libname=/path/to/MooGL-SDK/lib/libSDL3.0.dylib -Dorg.lwjgl.opengl.libname=/path/to/MooGL-SDK/lib/libmoogl.dylib
+   ```
+
+4. Start the game and choose the shaderpack under **Options > Video Settings > Shader Packs**.
+   The game log says `using drivers: 4.6.0 MooGL`.
+
+Minecraft 26.3 opens its window with SDL3. Versions that use GLFW instead haven't been tried.
+
 ## Legacy OpenGL
 
 <p align="center">

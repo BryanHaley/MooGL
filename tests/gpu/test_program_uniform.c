@@ -1063,7 +1063,8 @@ GPU_TEST(program_uniform, shader_info_log_is_always_a_string)
 
 // A fragment stage may read as many samplers as GL_MAX_TEXTURE_IMAGE_UNITS
 // says, and a program that does links. The limit said 128, past the 16
-// samplers Metal binds to one stage, so such a program failed in Metal.
+// samplers Metal binds to one stage, so such a program failed in Metal. Past
+// 16 they go through an argument buffer, so the limit is 32.
 GPU_TEST(program_uniform, fragment_samplers_up_to_the_limit_link)
 {
     static const char *VS =
@@ -1075,7 +1076,7 @@ GPU_TEST(program_uniform, fragment_samplers_up_to_the_limit_link)
     GLuint prog;
 
     glGetIntegerv(GL_MAX_TEXTURE_IMAGE_UNITS, &max);
-    CHECK_EQ_INT(max, 16);
+    CHECK_EQ_INT(max, 32);
 
     snprintf(fs, sizeof fs,
              "#version 430 core\n"

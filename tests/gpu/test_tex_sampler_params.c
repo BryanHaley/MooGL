@@ -5,6 +5,7 @@
  * Texture and sampler parameter setters, including the integer variants.
  */
 
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include "mgl_test.h"
@@ -1038,4 +1039,218 @@ GPU_TEST(tex_sampler_params, linear_filtering_blends_an_exact_border)
     glDeleteBuffers(1, &buf);
     glDeleteTextures(3, tex);
     glDeleteProgram(prog);
+}
+
+// Metal has 16 sampler slots a stage; Iris's composite passes sample more
+GPU_TEST(tex_sampler_params, a_shader_samples_twenty_textures)
+{
+    enum { N = 20 };
+    static const char *VS =
+        "#version 410\n"
+        "layout(location = 0) in vec2 p;\n"
+        "void main() { gl_Position = vec4(p, 0.0, 1.0); }\n";
+    static const char *FS =
+        "#version 410\n"
+        "uniform sampler2D t0, t1, t2, t3, t4, t5, t6, t7, t8, t9,\n"
+        "                  t10, t11, t12, t13, t14, t15, t16, t17, t18, t19;\n"
+        "out vec4 o;\n"
+        "void main() {\n"
+        "    vec2 uv = vec2(0.5);\n"
+        "    vec4 v[20] = vec4[20](texture(t0, uv), texture(t1, uv), texture(t2, uv), texture(t3, uv),\n"
+        "        texture(t4, uv), texture(t5, uv), texture(t6, uv), texture(t7, uv), texture(t8, uv),\n"
+        "        texture(t9, uv), texture(t10, uv), texture(t11, uv), texture(t12, uv), texture(t13, uv),\n"
+        "        texture(t14, uv), texture(t15, uv), texture(t16, uv), texture(t17, uv), texture(t18, uv),\n"
+        "        texture(t19, uv));\n"
+        "    o = v[int(gl_FragCoord.x)];\n"
+        "}\n";
+    MGLTestTarget target;
+    GLuint prog, tex[N], vbo, vao;
+    GLint units = 0;
+    unsigned char *px, c[4];
+    char log[1024], name[8];
+
+    glGetIntegerv(GL_MAX_TEXTURE_IMAGE_UNITS, &units);
+    CHECK_MSG(units >= N, "GL_MAX_TEXTURE_IMAGE_UNITS is %d", units);
+
+    prog = mgl_build_program(VS, FS, log, sizeof log);
+    CHECK_MSG(prog != 0, "did not build: %s", log);
+    if (!prog || !mgl_target_create(&target, N, 1, GL_RGBA8, 0)) return;
+
+    glUseProgram(prog);
+    glGenTextures(N, tex);
+    for (int i = 0; i < N; i++)
+    {
+        GLubyte texel[4] = { (GLubyte)(10 * i + 5), (GLubyte)(250 - 10 * i), 0, 255 };
+
+        glActiveTexture(GL_TEXTURE0 + i);
+        glBindTexture(GL_TEXTURE_2D, tex[i]);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, texel);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, i & 1 ? GL_LINEAR : GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, i & 1 ? GL_LINEAR : GL_NEAREST);
+        snprintf(name, sizeof name, "t%d", i);
+        glUniform1i(glGetUniformLocation(prog, name), i);
+    }
+    glActiveTexture(GL_TEXTURE0);
+
+    vao = mgl_fullscreen_quad(&vbo);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    px = mgl_read_rgba8(&target);
+
+    for (int i = 0; i < N; i++)
+    {
+        mgl_pixel_at(px, &target, i, 0, c);
+        CHECK_MSG(c[0] == 10 * i + 5 && c[1] == 250 - 10 * i, "texture %d read %d %d", i, c[0], c[1]);
+    }
+    free(px);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo);
+    glDeleteTextures(N, tex);
+    glDeleteProgram(prog);
+    mgl_target_destroy(&target);
+}
+
+// the same with textures of several kinds, an array, and an image beside them
+GPU_TEST(tex_sampler_params, a_shader_samples_twenty_textures_of_mixed_kinds)
+{
+    static const char *VS =
+        "#version 430\n"
+        "layout(location = 0) in vec2 p;\n"
+        "void main() { gl_Position = vec4(p, 0.0, 1.0); }\n";
+    static const char *FS =
+        "#version 430\n"
+        "uniform sampler3D v0;\n"
+        "uniform usampler2D u0;\n"
+        "uniform sampler2D a[4];\n"
+        "uniform sampler2DShadow sh;\n"
+        "uniform sampler2D t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11;\n"
+        "uniform isampler3D i0;\n"
+        "layout(rgba8) uniform readonly image2D img;\n"
+        "out vec4 o;\n"
+        "void main() {\n"
+        "    vec2 uv = vec2(0.5);\n"
+        "    int k = int(gl_FragCoord.x);\n"
+        "    float r = 0.0;\n"
+        "    if (k == 0) r = texture(v0, vec3(0.5)).r;\n"
+        "    else if (k == 1) r = float(texture(u0, uv).r) / 255.0;\n"
+        "    else if (k < 6) r = texture(a[k - 2], uv).r;\n"
+        "    else if (k == 6) r = texture(sh, vec3(uv, 0.5)) * 0.5;\n"
+        "    else if (k == 7) r = texture(t0, uv).r;\n"
+        "    else if (k == 8) r = texture(t1, uv).r;\n"
+        "    else if (k == 9) r = texture(t2, uv).r;\n"
+        "    else if (k == 10) r = texture(t3, uv).r;\n"
+        "    else if (k == 11) r = texture(t4, uv).r;\n"
+        "    else if (k == 12) r = texture(t5, uv).r;\n"
+        "    else if (k == 13) r = texture(t6, uv).r;\n"
+        "    else if (k == 14) r = texture(t7, uv).r;\n"
+        "    else if (k == 15) r = texture(t8, uv).r;\n"
+        "    else if (k == 16) r = texture(t9, uv).r;\n"
+        "    else if (k == 17) r = texture(t10, uv).r;\n"
+        "    else if (k == 18) r = texture(t11, uv).r;\n"
+        "    else if (k == 19) r = float(texture(i0, vec3(0.5)).r) / 255.0;\n"
+        "    else r = imageLoad(img, ivec2(0)).r;\n"
+        "    o = vec4(r, 0.0, 0.0, 1.0);\n"
+        "}\n";
+    enum { N = 21 };
+    MGLTestTarget target;
+    GLuint prog, tex[N], vbo, vao;
+    unsigned char *px, c[4];
+    char log[2048];
+    GLubyte want[N];
+    int unit = 0;
+
+    prog = mgl_build_program(VS, FS, log, sizeof log);
+    CHECK_MSG(prog != 0, "did not build: %s", log);
+    if (!prog || !mgl_target_create(&target, N, 1, GL_RGBA8, 0)) return;
+
+    glUseProgram(prog);
+    glGenTextures(N, tex);
+    for (int k = 0; k < N; k++)
+    {
+        GLubyte v = (GLubyte)(10 * k + 7);
+        GLubyte texel[4] = { v, 0, 0, 255 };
+
+        want[k] = k == 6 ? 128 : v;
+        glActiveTexture(GL_TEXTURE0 + (GLenum)k);
+        if (k == 0)
+        {
+            glBindTexture(GL_TEXTURE_3D, tex[k]);
+            glTexImage3D(GL_TEXTURE_3D, 0, GL_RGBA8, 1, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, texel);
+            glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glUniform1i(glGetUniformLocation(prog, "v0"), k);
+        }
+        else if (k == 1)
+        {
+            glBindTexture(GL_TEXTURE_2D, tex[k]);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8UI, 1, 1, 0, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, texel);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glUniform1i(glGetUniformLocation(prog, "u0"), k);
+        }
+        else if (k == 6)
+        {
+            GLfloat d = 1.0f;
+
+            glBindTexture(GL_TEXTURE_2D, tex[k]);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT32F, 1, 1, 0, GL_DEPTH_COMPONENT, GL_FLOAT, &d);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_REF_TO_TEXTURE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_FUNC, GL_LEQUAL);
+            glUniform1i(glGetUniformLocation(prog, "sh"), k);
+        }
+        else if (k == 19)
+        {
+            GLbyte itexel[4] = { (GLbyte)(v > 127 ? 127 : v), 0, 0, 1 };
+
+            want[k] = (GLubyte)itexel[0];
+            glBindTexture(GL_TEXTURE_3D, tex[k]);
+            glTexImage3D(GL_TEXTURE_3D, 0, GL_RGBA8I, 1, 1, 1, 0, GL_RGBA_INTEGER, GL_BYTE, itexel);
+            glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glUniform1i(glGetUniformLocation(prog, "i0"), k);
+        }
+        else if (k == 20)
+        {
+            glBindTexture(GL_TEXTURE_2D, tex[k]);
+            glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 1, 1);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, texel);
+            glBindImageTexture(0, tex[k], 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA8);
+            glUniform1i(glGetUniformLocation(prog, "img"), 0);
+        }
+        else
+        {
+            char name[8];
+
+            glBindTexture(GL_TEXTURE_2D, tex[k]);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, texel);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            if (k < 6)
+                snprintf(name, sizeof name, "a[%d]", k - 2);
+            else
+                snprintf(name, sizeof name, "t%d", k - 7);
+            glUniform1i(glGetUniformLocation(prog, name), k);
+        }
+        unit++;
+    }
+    glActiveTexture(GL_TEXTURE0);
+    (void)unit;
+
+    vao = mgl_fullscreen_quad(&vbo);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    px = mgl_read_rgba8(&target);
+
+    for (int k = 0; k < N; k++)
+    {
+        mgl_pixel_at(px, &target, k, 0, c);
+        CHECK_MSG(c[0] >= want[k] - 1 && c[0] <= want[k] + 1, "slot %d read %d, want %d", k, c[0], want[k]);
+    }
+    free(px);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo);
+    glDeleteTextures(N, tex);
+    glDeleteProgram(prog);
+    mgl_target_destroy(&target);
 }

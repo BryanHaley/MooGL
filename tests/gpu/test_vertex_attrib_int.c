@@ -8,6 +8,7 @@
  * Covers all 33 entry points listed in the brief.
  */
 
+#include <stdlib.h>
 #include "mgl_test.h"
 #include "harness.h"
 
@@ -798,5 +799,135 @@ GPU_TEST(vertex_attrib_int, mixed_formats_share_one_binding)
     glDeleteVertexArrays(1, &vao);
     glDeleteBuffers(1, &vbo);
     glDeleteBuffers(1, &ebo);
+    mgl_target_destroy(&t);
+}
+
+/* ---------- integer arrays of the other signedness ---------- */
+
+// Iris feeds unsigned shorts to an ivec3; Metal refused the pipeline
+GPU_TEST(vertex_attrib_int, unsigned_shorts_reach_a_signed_input)
+{
+    static const char *VS =
+        "#version 410\n"
+        "layout(location = 0) in vec2 p;\n"
+        "layout(location = 1) in ivec3 e;\n"
+        "flat out int v;\n"
+        "void main() { v = e.x + e.y + e.z; gl_Position = vec4(p, 0.0, 1.0); }\n";
+    static const char *FS =
+        "#version 410\n"
+        "flat in int v;\n"
+        "out vec4 o;\n"
+        "void main() { o = vec4(float(v) / 255.0, 0.0, 0.0, 1.0); }\n";
+    static const GLfloat pos[12] = { -1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1 };
+    GLushort ids[6 * 4];
+    MGLTestTarget t;
+    GLuint prog, vao, vbo[2];
+    unsigned char *px, c[4];
+    char log[1024];
+
+    for (int i = 0; i < 6; i++)
+    {
+        ids[i * 4 + 0] = 40;
+        ids[i * 4 + 1] = 50;
+        ids[i * 4 + 2] = 60;
+        ids[i * 4 + 3] = 0;
+    }
+
+    prog = mgl_build_program(VS, FS, log, sizeof log);
+    CHECK_MSG(prog != 0, "did not build: %s", log);
+    if (!prog || !mgl_target_create(&t, 4, 4, GL_RGBA8, 0)) return;
+
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    glGenBuffers(2, vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo[0]);
+    glBufferData(GL_ARRAY_BUFFER, sizeof pos, pos, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
+    glEnableVertexAttribArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo[1]);
+    glBufferData(GL_ARRAY_BUFFER, sizeof ids, ids, GL_STATIC_DRAW);
+    glVertexAttribIPointer(1, 3, GL_UNSIGNED_SHORT, 8, 0);
+    glEnableVertexAttribArray(1);
+
+    glUseProgram(prog);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+
+    px = mgl_read_rgba8(&t);
+    if (px)
+    {
+        mgl_pixel_at(px, &t, 2, 2, c);
+        CHECK_MSG(c[0] == 150, "read %d, want 150", c[0]);
+        free(px);
+    }
+
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(2, vbo);
+    glDeleteProgram(prog);
+    mgl_target_destroy(&t);
+}
+
+// glVertexAttribPointer feeding an ivec3, which Iris does; drivers pass the values
+GPU_TEST(vertex_attrib_int, a_plain_array_reaches_an_integer_input)
+{
+    static const char *VS =
+        "#version 410\n"
+        "layout(location = 0) in vec2 p;\n"
+        "layout(location = 1) in ivec3 e;\n"
+        "flat out int v;\n"
+        "void main() { v = e.x + e.y + e.z; gl_Position = vec4(p, 0.0, 1.0); }\n";
+    static const char *FS =
+        "#version 410\n"
+        "flat in int v;\n"
+        "out vec4 o;\n"
+        "void main() { o = vec4(float(v) / 255.0, 0.0, 0.0, 1.0); }\n";
+    static const GLfloat pos[12] = { -1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1 };
+    GLushort ids[6 * 4];
+    MGLTestTarget t;
+    GLuint prog, vao, vbo[2];
+    unsigned char *px, c[4];
+    char log[1024];
+
+    for (int i = 0; i < 6; i++)
+    {
+        ids[i * 4 + 0] = 40;
+        ids[i * 4 + 1] = 50;
+        ids[i * 4 + 2] = 60;
+        ids[i * 4 + 3] = 0;
+    }
+
+    prog = mgl_build_program(VS, FS, log, sizeof log);
+    CHECK_MSG(prog != 0, "did not build: %s", log);
+    if (!prog || !mgl_target_create(&t, 4, 4, GL_RGBA8, 0)) return;
+
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    glGenBuffers(2, vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo[0]);
+    glBufferData(GL_ARRAY_BUFFER, sizeof pos, pos, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
+    glEnableVertexAttribArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo[1]);
+    glBufferData(GL_ARRAY_BUFFER, sizeof ids, ids, GL_STATIC_DRAW);
+    glVertexAttribPointer(1, 3, GL_UNSIGNED_SHORT, GL_FALSE, 8, 0);
+    glEnableVertexAttribArray(1);
+
+    glUseProgram(prog);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+
+    px = mgl_read_rgba8(&t);
+    if (px)
+    {
+        mgl_pixel_at(px, &t, 2, 2, c);
+        CHECK_MSG(c[0] == 150, "read %d, want 150", c[0]);
+        free(px);
+    }
+
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(2, vbo);
+    glDeleteProgram(prog);
     mgl_target_destroy(&t);
 }

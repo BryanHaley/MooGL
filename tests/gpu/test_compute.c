@@ -1112,3 +1112,147 @@ GPU_TEST(compute, unused_storage_blocks_leave_uniforms_alone)
     glUseProgram(0);
     glDeleteBuffers(5, buf);
 }
+
+/* SPIRV-Cross writes this fence in MSL 3.2; a program built with an older SDK
+   compiled it as 3.1, where it does not exist */
+GPU_TEST(compute, shared_memory_barrier_builds_and_orders)
+{
+    static const char *CS =
+        "#version 430 core\n"
+        "layout(local_size_x = 64) in;\n"
+        "layout(std430, binding = 0) buffer Out { uint v[]; };\n"
+        "shared uint s[64];\n"
+        "void main() {\n"
+        "    uint i = gl_LocalInvocationID.x;\n"
+        "    s[i] = i * 3u;\n"
+        "    memoryBarrierShared();\n"
+        "    barrier();\n"
+        "    v[i] = s[63u - i];\n"
+        "}\n";
+    GLuint prog = compute_program(CS);
+    CHECK(prog != 0);
+    if (!prog) return;
+
+    GLuint got[64] = {0}, ssbo = 0;
+
+    glGenBuffers(1, &ssbo);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof got, got, GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo);
+
+    glUseProgram(prog);
+    glDispatchCompute(1, 1, 1);
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+    glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof got, got);
+    CHECK_EQ_UINT(GL_NO_ERROR, glGetError());
+
+    for (GLuint i = 0; i < 64; i++)
+        CHECK_EQ_INT((int)((63 - i) * 3), (int)got[i]);
+
+    glDeleteBuffers(1, &ssbo);
+    glDeleteProgram(prog);
+}
+
+/* a kernel that needs many registers: Metal's default pipeline allowed fewer
+   threads than the 1024 GL promised and dropped the whole dispatch */
+GPU_TEST(compute, a_heavy_kernel_runs_its_full_work_group)
+{
+    char src[16384];
+    int len;
+    GLuint prog, ssbo = 0, wrong = 0;
+    static GLuint got[1024];
+
+    len = snprintf(src, sizeof src,
+                   "#version 430 core\n"
+                   "layout(local_size_x = 32, local_size_y = 32) in;\n"
+                   "layout(std430, binding = 0) buffer Out { uint v[]; };\n"
+                   "uniform vec4 seed;\n"
+                   "void main() {\n"
+                   "    uint i = gl_LocalInvocationIndex;\n"
+                   "    vec4 a0 = sin(seed + float(i));\n");
+    // every value stays live until the sum at the end
+    for (int k = 1; k < 64; k++)
+        len += snprintf(src + len, sizeof src - (size_t)len,
+                        "    vec4 a%d = sin(a%d * %d.13 + seed.wzyx);\n", k, k - 1, k);
+    len += snprintf(src + len, sizeof src - (size_t)len, "    vec4 s = vec4(0.0);\n");
+    for (int k = 63; k >= 0; k--)
+        len += snprintf(src + len, sizeof src - (size_t)len, "    s += a%d * a%d.wzyx;\n", k, (k * 37) % 64);
+    snprintf(src + len, sizeof src - (size_t)len, "    v[i] = s.x > -100000.0 ? i + 1u : 0u;\n}\n");
+
+    prog = compute_program(src);
+    CHECK(prog != 0);
+    if (!prog) return;
+
+    memset(got, 0, sizeof got);
+    glGenBuffers(1, &ssbo);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof got, got, GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo);
+
+    glUseProgram(prog);
+    glUniform4f(glGetUniformLocation(prog, "seed"), 0.1f, 0.2f, 0.3f, 0.4f);
+    glDispatchCompute(1, 1, 1);
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+    glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof got, got);
+    CHECK_EQ_UINT(GL_NO_ERROR, glGetError());
+
+    for (GLuint i = 0; i < 1024; i++)
+        if (got[i] != i + 1)
+            wrong++;
+    CHECK_EQ_INT(0, (int)wrong);
+
+    glDeleteBuffers(1, &ssbo);
+    glDeleteProgram(prog);
+}
+
+/* Photon's sky pass: 27,648 bytes of shared vec3 in GL, over Metal's 32 KB
+   once each vec3 took 16 bytes */
+GPU_TEST(compute, a_large_shared_vec3_array_fits)
+{
+    static const char *CS =
+        "#version 430 core\n"
+        "layout(local_size_x = 256) in;\n"
+        "layout(std430, binding = 0) buffer Out { vec4 v[]; };\n"
+        "shared vec3 sm[256][9];\n"
+        "vec3 twice(vec3 a) { return a * 2.0; }\n"
+        "vec3 corner(uint j) { return sm[j][8]; }\n"
+        "void main() {\n"
+        "    uint i = gl_LocalInvocationIndex;\n"
+        "    for (int k = 0; k < 9; k++) sm[i][k] = vec3(float(i), float(k), 1.0);\n"
+        "    sm[i][8].z = 3.0;\n"
+        "    barrier();\n"
+        "    uint j = 255u - i;\n"
+        "    vec3 s = twice(sm[j][4]) + corner(j);\n"
+        "    v[i] = vec4(s, dot(sm[j][0], vec3(1.0)));\n"
+        "}\n";
+    GLuint prog = compute_program(CS);
+    CHECK(prog != 0);
+    if (!prog) return;
+
+    static GLfloat got[256 * 4];
+    GLuint ssbo = 0, wrong = 0;
+
+    memset(got, 0, sizeof got);
+    glGenBuffers(1, &ssbo);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof got, got, GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo);
+    glUseProgram(prog);
+    glDispatchCompute(1, 1, 1);
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+    glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof got, got);
+    CHECK_EQ_UINT(GL_NO_ERROR, glGetError());
+
+    for (GLuint i = 0; i < 256; i++)
+    {
+        GLfloat j = (GLfloat)(255 - i);
+
+        if (got[i * 4] != 3.0f * j || got[i * 4 + 1] != 8.0f + 8.0f || got[i * 4 + 2] != 5.0f ||
+            got[i * 4 + 3] != j + 1.0f)
+            wrong++;
+    }
+    CHECK_EQ_INT(0, (int)wrong);
+
+    glDeleteBuffers(1, &ssbo);
+    glDeleteProgram(prog);
+}

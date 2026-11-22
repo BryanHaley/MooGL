@@ -1,6 +1,14 @@
 ## MooGL 0.2.0
 
 ### Added
+- Minecraft runs on MooGL without being rebuilt: two JVM arguments in the launcher point
+  LWJGL at MooGL's SDL3 and `libmoogl`. Minecraft 26.3 with Fabric, Sodium and Iris runs the
+  BetterVoxels shaderpack, which needs OpenGL 4.3 and does not run on Apple's 4.1.
+- Up to 32 textures in each shader stage, up from 16. A stage that samples more than 16 reads
+  them through a Metal argument buffer, since Metal has 16 sampler slots a stage.
+- `MGLsetContextView`, which moves a context's drawing to another `NSView`, as
+  `NSOpenGLContext`'s `setView` does. MooGL's SDL3 uses it, so a context made with one window
+  can be made current with another.
 - OpenGL ES 3.1 contexts, in a build made with `make OGL_ES=1`; a plain build leaves them out,
   and the SDK has them. GLFW's `GLFW_OPENGL_ES_API` and SDL's `SDL_GL_CONTEXT_PROFILE_ES` make
   one (any request from ES 2.0 to 3.1 gets 3.1), and so does `createGLMContextProfile` with
@@ -71,6 +79,10 @@
   the nearest of the three.
 
 ### Faster
+- Buffers use cached CPU memory, not write-combined. Copying into a buffer the GPU is still
+  using reads the old contents back on the CPU, and from write-combined memory that is very
+  slow. Minecraft does this every frame: it went from 177 to about 1,380 FPS with shaders off,
+  and from 55 to 138 with BSL, ahead of Apple's OpenGL (389 and 113).
 - With vsync off, a swap no longer waits for the window to hand back a drawable. A window
   takes a new frame only once per screen refresh, so before, everything ran at the display's
   rate. The newest frame is now shown when the screen can take one, and older ones are skipped,
@@ -125,6 +137,31 @@
     each draw.
 
 ### Fixed
+- GLSL names that are C++ keywords, such as a variable called `new` or `and`, no longer make
+  Metal reject the shader. BSL's deferred pass has one.
+- A shared array of `vec3` takes 12 bytes an element, as in GL, instead of Metal's 16, so one
+  that fits GL's 32 KB fits Metal's too. Photon's sky pass needed 27,648 bytes and got 36,864.
+- A compute pipeline Metal will not build for the whole work group is made without that
+  request and the reason is logged, instead of every dispatch failing silently.
+- Uniform blocks no longer read each other's buffers when one of them is used only from a
+  global variable's initializer. glslang left that block at binding 0, where SPIRV-Cross took
+  it for the same buffer as another block. Iris's sky shaders hit this: Minecraft's sky read
+  its matrices out of the fog block and drew nothing.
+- Translated shaders are compiled as Metal 3.2. Left unset, Metal picked the version the
+  program was built against, which in Minecraft's Java was 3.1, and `memoryBarrierShared()`
+  did not compile.
+- Compute shaders run with the whole work group they declare. A shader using many registers
+  got a Metal pipeline that allowed fewer threads, and Metal dropped the dispatch.
+- `glGenerateMipmap` keeps what was drawn into level 0 when it makes room for the other levels.
+- A vertex shader with more than 16 plain uniforms draws. The draw was refused, and the vertex
+  data could land on the uniform table's slot.
+- Integer vertex inputs get their values when the array's signedness differs from the
+  input's, or when the array was set with `glVertexAttribPointer`. Metal refused the pipeline.
+- Geometry shaders: varyings declared several to a statement (`flat out vec3 a, b;`), a
+  function parameter named like an output, and draws with a large first or base vertex,
+  which used to size their buffer from vertex 0.
+- MooGL's SDL3 no longer shows the wrong part of the frame after a context moves to a window
+  of another size.
 - `glCopyImageSubData` no longer refuses a texture that has only its base level when its
   minification filter is `GL_NEAREST` or `GL_LINEAR`; such a texture is complete, since the
   filter needs no mipmaps.

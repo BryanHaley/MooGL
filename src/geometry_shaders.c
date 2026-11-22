@@ -1481,6 +1481,98 @@ static size_t memberAt(const char *src, size_t i, const GsVarying *list, int cou
     }
 }
 
+static bool typeWord(const char *w)
+{
+    static const char *plain[] = { "int", "uint", "float", "double", "bool" };
+    static const char *prefix[] = { "vec", "ivec", "uvec", "bvec", "dvec", "mat", "dmat" };
+
+    for (size_t k = 0; k < sizeof(plain) / sizeof(plain[0]); k++)
+        if (!strcmp(w, plain[k]))
+            return true;
+    for (size_t k = 0; k < sizeof(prefix) / sizeof(prefix[0]); k++)
+        if (!strncmp(w, prefix[k], strlen(prefix[k])) && w[strlen(prefix[k])] >= '2' && w[strlen(prefix[k])] <= '4')
+            return true;
+    return false;
+}
+
+// Whether a parameter or local of the function around i hides the global
+// called name there
+static bool shadowedAt(const char *src, size_t i, const char *name)
+{
+    size_t open = (size_t)-1;
+    int depth = 0;
+
+    for (size_t k = i; k-- > 0; )
+    {
+        if (src[k] == '}') depth++;
+        else if (src[k] == '{')
+        {
+            if (depth == 0) open = k;
+            else depth--;
+        }
+    }
+
+    // at file scope, inside parentheses: a parameter being declared
+    if (open == (size_t)-1)
+    {
+        depth = 0;
+        for (size_t k = i; k-- > 0; )
+        {
+            if (src[k] == ')') depth++;
+            else if (src[k] == '(' && depth-- == 0) return true;
+            else if (src[k] == ';' || src[k] == '}') break;
+        }
+        return false;
+    }
+
+    // the parameter list just before the body
+    size_t k = open;
+
+    while (k > 0 && (src[k - 1] == ' ' || src[k - 1] == '\t' || src[k - 1] == '\n' || src[k - 1] == '\r'))
+        k--;
+    if (k > 0 && src[k - 1] == ')')
+    {
+        int d = 0;
+        size_t close = k - 1, p = close;
+
+        for (; p > 0; p--)
+        {
+            if (src[p] == ')') d++;
+            else if (src[p] == '(' && --d == 0) break;
+        }
+        for (size_t q = p; q < close; q++)
+            if (wordAt(src, q, name) && (q == 0 || !identChar(src[q - 1])))
+                return true;
+    }
+
+    // a local declared before i: "TYPE name"
+    for (size_t q = open + 1; q < i; q++)
+    {
+        if (!wordAt(src, q, name) || identChar(src[q - 1]))
+            continue;
+
+        size_t e = q;
+
+        while (e > open && (src[e - 1] == ' ' || src[e - 1] == '\t' || src[e - 1] == '\n'))
+            e--;
+
+        size_t b = e;
+        char w[32];
+
+        while (b > open && identChar(src[b - 1]))
+            b--;
+        if (e - b > 0 && e - b < sizeof(w))
+        {
+            memcpy(w, src + b, e - b);
+            w[e - b] = 0;
+            if (typeWord(w))
+                return true;
+        }
+    }
+
+    return false;
+}
+
 static bool rewriteBody(const char *src, GsScan *sc, Buf *out)
 {
     size_t i = 0, copied = 0;
@@ -1761,6 +1853,12 @@ static bool rewriteBody(const char *src, GsScan *sc, Buf *out)
             for (int v = 0; v < sc->out_count; v++)
                 if (wordAt(src, i, sc->out[v].name)) { hit = v; break; }
 
+            if (hit >= 0 && shadowedAt(src, i, sc->out[hit].name))
+            {
+                i += strlen(sc->out[hit].name);
+                continue;
+            }
+
             if (hit >= 0)
             {
                 snprintf(repl, sizeof(repl), "mglCur.%s", sc->out[hit].name);
@@ -1952,6 +2050,114 @@ static void addWrittenBuiltins(const char *src, GsScan *sc)
     }
 }
 
+// "flat out vec3 a, b[2];" at file scope becomes one declaration a name, the
+// only shape the scan reads. NULL when there is nothing to split.
+static char *splitDeclarators(const char *src)
+{
+    Buf out = {0};
+    size_t i = 0, stmt = 0, copied = 0;
+    int depth = 0;
+    bool changed = false, line_start = true;
+
+    for (; src[i]; i++)
+    {
+        char c = src[i];
+
+        if (line_start && depth == 0 && src[skipSpace(src, i) ] == '#')
+        {
+            while (src[i] && src[i] != '\n') i++;
+            stmt = i + 1;
+            if (!src[i]) break;
+            continue;
+        }
+        line_start = c == '\n';
+
+        if (c == '{' || c == '(') depth++;
+        else if (c == '}' || c == ')')
+        {
+            if (--depth == 0 && c == '}') stmt = i + 1;
+        }
+        else if (c == ';' && depth == 0)
+        {
+            bool inout = false, plain = true;
+            int d = 0, commas = 0;
+
+            for (size_t k = stmt; k < i; k++)
+            {
+                if (src[k] == '(' || src[k] == '[') d++;
+                else if (src[k] == ')' || src[k] == ']') d--;
+                else if (src[k] == '{') plain = false;
+                else if (src[k] == ',' && d == 0) commas++;
+                else if (d == 0 && (wordAt(src, k, "in") || wordAt(src, k, "out")) &&
+                         (k == 0 || !identChar(src[k - 1])))
+                    inout = true;
+            }
+
+            if (inout && plain && commas)
+            {
+                // the prefix is the first part without its declarator
+                size_t first_end = stmt;
+
+                for (d = 0; first_end < i; first_end++)
+                {
+                    if (src[first_end] == '(' || src[first_end] == '[') d++;
+                    else if (src[first_end] == ')' || src[first_end] == ']') d--;
+                    else if (src[first_end] == ',' && d == 0) break;
+                }
+
+                size_t e = first_end;
+
+                while (e > stmt && (src[e - 1] == ' ' || src[e - 1] == '\t' || src[e - 1] == '\n' || src[e - 1] == ']'))
+                {
+                    if (src[e - 1] == ']')
+                    {
+                        while (e > stmt && src[e - 1] != '[') e--;
+                        if (e > stmt) e--;
+                    }
+                    else
+                        e--;
+                }
+                while (e > stmt && identChar(src[e - 1])) e--;
+
+                size_t prefix_end = e, part = e;
+
+                if (!bufAddN(&out, src + copied, stmt - copied))
+                    goto fail;
+
+                for (size_t k = e, dd = 0; k <= i; k++)
+                {
+                    if (src[k] == '(' || src[k] == '[') dd++;
+                    else if (src[k] == ')' || src[k] == ']') dd--;
+                    else if ((src[k] == ',' && dd == 0) || k == i)
+                    {
+                        if (!bufAddN(&out, src + stmt, prefix_end - stmt) ||
+                            !bufAddN(&out, src + skipSpace(src, part), k - skipSpace(src, part)) ||
+                            !bufAdd(&out, ";\n"))
+                            goto fail;
+                        part = k + 1;
+                    }
+                }
+
+                copied = i + 1;
+                changed = true;
+            }
+            stmt = i + 1;
+        }
+    }
+
+    if (!changed)
+        return NULL;
+
+    if (!bufAdd(&out, src + copied))
+        goto fail;
+
+    return out.s;
+
+fail:
+    free(out.s);
+    return NULL;
+}
+
 bool mglRewriteGeometryShader(const char *src, GeometryInfo *gi)
 {
     GsScan sc;
@@ -1962,6 +2168,11 @@ bool mglRewriteGeometryShader(const char *src, GeometryInfo *gi)
 
     memset(&sc, 0, sizeof(sc));
     memset(gi, 0, sizeof(*gi));
+
+    char *split = splitDeclarators(src);
+
+    if (split)
+        src = split;
 
     if (!scanGeometry(src, gi, &sc, &stripped))
         goto done;
@@ -2128,7 +2339,7 @@ bool mglRewriteGeometryShader(const char *src, GeometryInfo *gi)
         "  if (mglGsStride == -2) v = (p + i) % mglGsPrims;\n"
         "  if (mglGsStride == -3) v = i == 0 ? 0 : p + i;\n"
         "  if (mglGsStride == -4) v = (p & 1) == 1 && i < 2 ? p + 1 - i : p + i;\n"
-        "  return (mglGsIndexed != 0 ? int(mglGsIdx[v]) : v) + mglGsFirst + mglInstance * mglGsPerInstance;\n}\n\n"
+        "  return (mglGsIndexed != 0 ? int(mglGsIdx[v]) : v) + mglInstance * mglGsPerInstance;\n}\n\n"
         "void mglPut(MglGsOutV v)\n{\n"
         "  if (mglWritten >= mglGsCap) return;\n"
         "  v.mglValid = 1.0;\n"
@@ -2581,6 +2792,7 @@ bool mglRewriteGeometryShader(const char *src, GeometryInfo *gi)
     ok = true;
 
 done:
+    free(split);
     free(stripped.s);
     free(body.s);
     free(out.s);
@@ -3025,10 +3237,10 @@ char *mglAddGeometryCapture(const char *vs_src, const GeometryInfo *gi)
     }
 
     if (capture == NULL ||
-        !bufAdd(&out, "\nuniform int mglGsPerInstanceU;\nint mglCapIdx;\n") ||
+        !bufAdd(&out, "\nuniform int mglGsPerInstanceU;\nuniform int mglGsFirstU;\nint mglCapIdx;\n") ||
         !bufAdd(&out, capture) ||
         !bufAdd(&out, "\nvoid main()\n{\n  mglVsBody();\n"
-                      "  mglCapIdx = gl_VertexID + gl_InstanceID * mglGsPerInstanceU;\n"
+                      "  mglCapIdx = gl_VertexID - mglGsFirstU + gl_InstanceID * mglGsPerInstanceU;\n"
                       "  mglGsCapture();\n}\n"))
     {
         free(capture);

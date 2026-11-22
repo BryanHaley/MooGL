@@ -477,3 +477,93 @@ GPU_TEST(buffer_uniform, an_instance_array_of_one_takes_its_binding)
     glDeleteBuffers(1, &a);
     glDeleteBuffers(1, &b);
 }
+
+// Iris on Minecraft 26: four std140 blocks, one of them read by a global
+// initializer, each bound through glUniformBlockBinding to its own buffer
+GPU_TEST(buffer_uniform, irises_four_blocks_each_read_their_own_buffer)
+{
+    static const char *VS =
+        "#version 330 core\n"
+        "in vec3 pos;\n"
+        "layout(std140) uniform DynT { mat4 ModelViewMat; mat4 TextureMat; vec4 ColorModulator; vec3 ModelOffset; } tr;\n"
+        "layout(std140) uniform Proj { mat4 ProjMat; };\n"
+        "layout(std140) uniform Glob { ivec3 CameraBlockPos; float GlintAlpha; vec3 CameraOffset; float GameTime;\n"
+        "                              vec2 ScreenSize; int MenuBlurRadius; int UseRgss; } glb;\n"
+        "layout(std140) uniform Fog { vec4 FogColor; float FogStart; float FogEnd; float A; float B; float C; float D; } fogP;\n"
+        "struct FogParams { vec4 color; float start; float end; };\n"
+        "FogParams fogI = FogParams(fogP.FogColor, fogP.FogStart, fogP.FogEnd);\n"
+        "flat out vec4 v;\n"
+        "void main() {\n"
+        "    v = vec4(tr.ModelViewMat[3][3], tr.ModelViewMat[0][0], ProjMat[1][1], 2.5) * 0.25;\n"
+        "    gl_Position = vec4(pos, 1.0);\n"
+        "}\n";
+    static const char *FS =
+        "#version 330 core\n"
+        "flat in vec4 v;\n"
+        "out vec4 o;\n"
+        "void main() { o = v; }\n";
+    static const GLfloat tri[9] = { -1, -1, 0, 3, -1, 0, -1, 3, 0 };
+    GLfloat dyn[64 + 64] = { 0 }, proj[16] = { 0 }, glob[16] = { 0 }, fog[16] = { 0 };
+    const char *names[4] = { "DynT", "Proj", "Glob", "Fog" };
+    GLfloat *data[4] = { dyn, proj, glob, fog };
+    GLsizeiptr sizes[4] = { sizeof dyn, sizeof proj, sizeof glob, sizeof fog };
+    GLuint prog, ubo[4], vao, vbo;
+    MGLTestTarget t;
+    unsigned char *px, c[4];
+    char log[2048];
+
+    // the transforms sit at 256 bytes into their buffer, as a ring buffer has them
+    dyn[64 + 0] = 2.0f;  dyn[64 + 5] = 1.0f; dyn[64 + 10] = 1.0f; dyn[64 + 15] = 3.0f;
+    proj[5] = 1.0f;
+    glob[7] = 2.5f;
+    fog[0] = 1.0f;
+
+    prog = mgl_build_program(VS, FS, log, sizeof log);
+    CHECK_MSG(prog != 0, "did not build: %s", log);
+    if (!prog || !mgl_target_create(&t, 1, 1, GL_RGBA8, 0)) return;
+
+    glGenBuffers(4, ubo);
+    for (int i = 0; i < 4; i++)
+    {
+        GLuint index = glGetUniformBlockIndex(prog, names[i]);
+
+        glBindBuffer(GL_UNIFORM_BUFFER, ubo[i]);
+        glBufferData(GL_UNIFORM_BUFFER, sizes[i], data[i], GL_DYNAMIC_DRAW);
+        glUniformBlockBinding(prog, index, (GLuint)(3 - i));
+        if (i == 0)
+            glBindBufferRange(GL_UNIFORM_BUFFER, 3, ubo[0], 256, 64 * 4);
+        else
+            glBindBufferBase(GL_UNIFORM_BUFFER, (GLuint)(3 - i), ubo[i]);
+    }
+
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    glGenBuffers(1, &vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof tri, tri, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, 0);
+    glEnableVertexAttribArray(0);
+    glBindAttribLocation(prog, 0, "pos");
+
+    mgl_target_bind(&t);
+    glViewport(0, 0, 1, 1);
+    glUseProgram(prog);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+
+    px = mgl_read_rgba8(&t);
+    if (px)
+    {
+        mgl_pixel_at(px, &t, 0, 0, c);
+        // [3][3] = 3, [0][0] = 2, proj[1][1] = 1, game time 2.5; each times 0.25
+        CHECK_MSG(c[0] >= 190 && c[0] <= 192 && c[1] >= 127 && c[1] <= 128 && c[2] >= 63 && c[2] <= 64 && c[3] >= 159 && c[3] <= 160,
+                  "read %d %d %d %d, want 191 128 64 159", c[0], c[1], c[2], c[3]);
+        free(px);
+    }
+
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo);
+    glDeleteBuffers(4, ubo);
+    glDeleteProgram(prog);
+    mgl_target_destroy(&t);
+}

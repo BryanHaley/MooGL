@@ -885,3 +885,61 @@ GPU_TEST(perf, many_passes_queue_without_waiting)
     mgl_target_destroy(&a);
     mgl_target_destroy(&b);
 }
+
+// Minecraft 26 copies from a mapped staging buffer into a uniform buffer the
+// last draw still reads, every frame
+GPU_TEST(perf, copies_into_a_busy_buffer_stay_fast)
+{
+    enum { N = 200, SIZE = 256 * 1024 };
+    MGLTestTarget t;
+    char log[1024];
+    GLuint p, vao, vbo, buf[2];
+    unsigned char c[4];
+    struct timespec t0, t1;
+
+    if (!mgl_target_create(&t, W, H, GL_RGBA8, 0)) SKIP("no target");
+    p = mgl_build_program(VS, FS_UBO, log, sizeof log);
+    CHECK(p);
+    vao = mgl_fullscreen_quad(&vbo);
+    mgl_target_bind(&t);
+    glBindVertexArray(vao);
+    glUseProgram(p);
+
+    glGenBuffers(2, buf);
+    glBindBuffer(GL_COPY_READ_BUFFER, buf[0]);
+    glBufferStorage(GL_COPY_READ_BUFFER, SIZE, NULL,
+                    GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT | GL_CLIENT_STORAGE_BIT);
+    float *staging = glMapBufferRange(GL_COPY_READ_BUFFER, 0, SIZE,
+                                      GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT);
+    CHECK(staging);
+    glBindBuffer(GL_UNIFORM_BUFFER, buf[1]);
+    glBufferStorage(GL_UNIFORM_BUFFER, SIZE, NULL, GL_DYNAMIC_STORAGE_BIT);
+    glBindBufferBase(GL_UNIFORM_BUFFER, 0, buf[1]);
+
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int i = 0; i < N; i++)
+    {
+        float g = i == N - 1 ? 1.0f : 0.0f;
+        float colour[4] = { 1.0f - g, g, 0.0f, 1.0f };
+
+        memcpy(staging + (i % 64) * 4, colour, sizeof colour);
+        glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_UNIFORM_BUFFER, (i % 64) * 16, 0, 16);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    glFinish();
+
+    double ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    CHECK_MSG(ms < 100.0, "%d copies and draws took %.1f ms", N, ms);
+
+    pixel(&t, W / 2, H / 2, c);
+    CHECK_MSG(IS(c, 0, 1, 0), "the last copy drew %d,%d,%d, want green", c[0], c[1], c[2]);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+
+    glUnmapBuffer(GL_COPY_READ_BUFFER);
+    glDeleteBuffers(2, buf);
+    glDeleteProgram(p);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo);
+    mgl_target_destroy(&t);
+}

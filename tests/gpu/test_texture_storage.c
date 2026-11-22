@@ -1287,3 +1287,42 @@ GPU_TEST(texture_storage, rgb9_e5_copies_arrive_whole)
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
     glDeleteTextures(2, tex);
 }
+
+// what was drawn into level 0 survives glGenerateMipmap making room for the rest
+GPU_TEST(texture_storage, a_drawn_level_survives_generating_mipmaps)
+{
+    GLuint tex, fbo;
+    GLfloat px[4] = { 0 };
+
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R11F_G11F_B10F, 1708, 960, 0, GL_RGB, GL_UNSIGNED_INT_10F_11F_11F_REV, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    CHECK_EQ_UINT(glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE);
+    glViewport(0, 0, 1708, 960);
+    glClearColor(0.5f, 0.25f, 1.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    glGenerateMipmap(GL_TEXTURE_2D);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+
+    {
+        GLfloat *all = malloc(1708 * 960 * 3 * sizeof(GLfloat));
+
+        glGetTexImage(GL_TEXTURE_2D, 0, GL_RGB, GL_FLOAT, all);
+        CHECK_MSG(all[0] == 0.5f && all[1] == 0.25f && all[2] == 1.0f, "level 0 read %g %g %g", all[0], all[1], all[2]);
+        free(all);
+    }
+    glGetTexImage(GL_TEXTURE_2D, 10, GL_RGB, GL_FLOAT, px);
+    CHECK_MSG(px[0] == 0.5f && px[1] == 0.25f && px[2] == 1.0f, "level 10 read %g %g %g", px[0], px[1], px[2]);
+
+    glDeleteFramebuffers(1, &fbo);
+    glDeleteTextures(1, &tex);
+}

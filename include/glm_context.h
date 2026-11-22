@@ -719,6 +719,14 @@ bool mglBuildSampleRateFragment(struct GLMContextRec_t *ctx, struct Program_t *p
 // buffer. They take the lowest Metal buffer slots; SPIRV-Cross numbers the
 // shader's other buffers after them.
 #define MGL_BINDLESS_FIRST_MSL_SLOT 0
+
+// Metal takes 16 samplers a stage. A stage that samples more textures than
+// that reads them all from one argument buffer instead. IDs start past the
+// slots storage images take, so the two never share a texture param slot.
+#define MGL_TEX_TABLE_MSL_SLOT  0
+#define MGL_TEX_TABLE_SET       7
+#define MGL_TEX_TABLE_FIRST_ID  32
+#define MGL_METAL_SAMPLERS      16
 #define MGL_BINDLESS_MAX_SETS       6
 #define MGL_BINDLESS_TEXTURES       32768
 #define MGL_BINDLESS_SAMPLERS       1024
@@ -1170,6 +1178,8 @@ typedef struct Program_t {
     // over time; sized to cover it rather than to MGL's own shorter list
     SpirvResourceList spirv_resources_list[_MAX_SHADER_TYPES][MAX_SPVC_RESOURCE_TYPES];
     MglBindlessSets bindless[_MAX_SHADER_TYPES];
+    // entries in a stage's texture argument buffer, 0 when it binds directly
+    GLuint tex_table[_MAX_SHADER_TYPES];
     // the uniforms declared inside uniform blocks, which GL lists as active
     // uniforms in their own right
     SpirvResourceList block_uniforms[_MAX_SHADER_TYPES];
@@ -1808,6 +1818,7 @@ struct GLMMetalFuncs {
     void (*mtlBindBuffer)(GLMContext glm_ctx, Buffer *ptr);
     void (*mtlBindTexture)(GLMContext glm_ctx, Texture *ptr);
     void (*mtlSetSwapInterval)(GLMContext glm_ctx, int interval);
+    void (*mtlSetView)(GLMContext glm_ctx, void *view);
     GLuint (*mtlBindlessSampler)(GLMContext glm_ctx, TextureParameter *params, GLenum target);
     // indirect < 0: x, y, z groups; otherwise a command at that offset in the indirect buffer
     void (*mtlDrawMeshTasks)(GLMContext glm_ctx, GLuint x, GLuint y, GLuint z, GLintptr indirect, GLuint draw);
