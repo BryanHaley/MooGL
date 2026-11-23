@@ -10,6 +10,7 @@
 
 #include "mgl_test.h"
 #include "harness.h"
+#include "MGLContext.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -1021,5 +1022,138 @@ GPU_TEST(geometry_shader, a_large_first_vertex_draws)
     glUseProgram(0);
     glDeleteProgram(prog);
     glDeleteVertexArrays(1, &vao);
+    mgl_target_destroy(&t);
+}
+
+static const char *QUAD_VS =
+    "#version 410\n"
+    "layout(location = 0) in vec2 p;\n"
+    "void main() { gl_Position = vec4(p, 0.0, 1.0); }\n";
+
+static const char *QUAD_GS =
+    "#version 410\n"
+    "layout(points) in;\n"
+    "layout(triangle_strip, max_vertices = 4) out;\n"
+    "void main() {\n"
+    "    for (int i = 0; i < 4; i++) {\n"
+    "        gl_Position = gl_in[0].gl_Position + vec4(float(i & 1) * 0.5 - 0.25,\n"
+    "                                                  float(i >> 1) * 0.5 - 0.25, 0.0, 0.0);\n"
+    "        EmitVertex();\n"
+    "    }\n"
+    "}\n";
+
+static const char *GREEN_FS =
+    "#version 410\n"
+    "out vec4 o;\n"
+    "void main() { o = vec4(0.0, 1.0, 0.0, 1.0); }\n";
+
+static GLuint statValue(GLenum which)
+{
+    GLuint v = 0;
+
+    MGLget(NULL, which, &v);
+    return v;
+}
+
+// one quad per quadrant
+static void checkQuadrants(const MGLTestTarget *t)
+{
+    static const int at[4][2] = { { 16, 16 }, { 48, 16 }, { 16, 48 }, { 48, 48 } };
+    unsigned char *px = mgl_read_rgba8(t), c[4];
+
+    CHECK(px != NULL);
+
+    for (int i = 0; px && i < 4; i++)
+    {
+        mgl_pixel_at(px, t, at[i][0], at[i][1], c);
+        CHECK_MSG(c[1] > 200 && c[0] < 60, "quad %d drew %d,%d,%d", i, c[0], c[1], c[2]);
+    }
+
+    free(px);
+}
+
+// Each draw used to clear its output with a blit, which ended the render pass
+GPU_TEST(geometry_shader, separate_draws_break_the_pass_once_each)
+{
+    static const GLfloat pts[8] = { -0.5f, -0.5f, 0.5f, -0.5f, -0.5f, 0.5f, 0.5f, 0.5f };
+    MGLTestTarget t;
+    GLuint prog, vao, vbo, passes;
+    char log[2048];
+
+    prog = linkVGF(QUAD_VS, QUAD_GS, GREEN_FS, log, sizeof log);
+    CHECK_MSG(prog != 0, "geometry program did not link: %s", log);
+
+    if (!prog || !mgl_target_create(&t, 64, 64, GL_RGBA8, 0))
+        return;
+
+    mgl_target_bind(&t);
+    glUseProgram(prog);
+    vao = pointsVAO(pts, sizeof pts, &vbo);
+    glViewport(0, 0, 64, 64);
+    glClearColor(1, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArrays(GL_POINTS, 0, 1);
+
+    passes = statValue(MGL_STAT_RENDER_PASSES);
+    for (int i = 0; i < 4; i++)
+        glDrawArrays(GL_POINTS, i, 1);
+    passes = statValue(MGL_STAT_RENDER_PASSES) - passes;
+
+    CHECK_MSG(passes <= 4, "4 geometry draws started %u render passes", passes);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+    checkQuadrants(&t);
+
+    glUseProgram(0);
+    glDeleteProgram(prog);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo);
+    mgl_target_destroy(&t);
+}
+
+// Sodium draws each region's chunks with one multi-draw
+GPU_TEST(geometry_shader, a_multi_draw_runs_its_geometry_together)
+{
+    static const GLfloat pts[8] = { -0.5f, -0.5f, 0.5f, -0.5f, -0.5f, 0.5f, 0.5f, 0.5f };
+    static const GLuint index = 0;
+    static const GLsizei counts[8] = { 1, 1, 1, 1, 1, 1, 1, 1 };
+    static const GLint bases[8] = { 0, 1, 2, 3, 0, 1, 2, 3 };
+    const void *offsets[8] = { 0 };
+    MGLTestTarget t;
+    GLuint prog, vao, vbo, ebo, passes, lookups;
+    char log[2048];
+
+    prog = linkVGF(QUAD_VS, QUAD_GS, GREEN_FS, log, sizeof log);
+    CHECK_MSG(prog != 0, "geometry program did not link: %s", log);
+
+    if (!prog || !mgl_target_create(&t, 64, 64, GL_RGBA8, 0))
+        return;
+
+    mgl_target_bind(&t);
+    glUseProgram(prog);
+    vao = pointsVAO(pts, sizeof pts, &vbo);
+    glGenBuffers(1, &ebo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof index, &index, GL_STATIC_DRAW);
+    glViewport(0, 0, 64, 64);
+    glClearColor(1, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawElementsBaseVertex(GL_POINTS, 1, GL_UNSIGNED_INT, 0, 0);
+
+    passes = statValue(MGL_STAT_RENDER_PASSES);
+    lookups = statValue(MGL_STAT_PIPELINE_LOOKUPS);
+    glMultiDrawElementsBaseVertex(GL_POINTS, counts, GL_UNSIGNED_INT, offsets, 8, bases);
+    passes = statValue(MGL_STAT_RENDER_PASSES) - passes;
+    lookups = statValue(MGL_STAT_PIPELINE_LOOKUPS) - lookups;
+
+    CHECK_MSG(passes <= 1, "8 geometry draws in one multi-draw started %u render passes", passes);
+    CHECK_MSG(lookups <= 1, "8 geometry draws in one multi-draw looked up %u pipelines", lookups);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+    checkQuadrants(&t);
+
+    glUseProgram(0);
+    glDeleteProgram(prog);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo);
+    glDeleteBuffers(1, &ebo);
     mgl_target_destroy(&t);
 }

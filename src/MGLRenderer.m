@@ -269,6 +269,19 @@ typedef struct {
     struct { uint64_t stride; uint32_t rate; uint16_t step, used; } layout[31];
 } MGLVertexLayout;
 
+// one geometry draw whose capture is done and whose kernel and draw wait
+@interface MGLGsBatchItem : NSObject
+{
+@public
+    id<MTLBuffer> in_buf, out_buf, indices;
+    NSUInteger slots;
+    GLint prims, indexed, first, stride, per_instance;
+}
+@end
+
+@implementation MGLGsBatchItem
+@end
+
 @implementation MGLRenderer
 {
     NSView *_view;
@@ -370,6 +383,11 @@ typedef struct {
     id<MTLComputePipelineState> _gsComputePipeline;
     id<MTLRenderPipelineState>  _gsDrawPipeline;
     NSString *_gsPipelineKey;
+    // the geometry draws of one multi-draw run their kernels in one compute
+    // pass and draw in one render pass, instead of a pass break each
+    bool _gsBatching;
+    bool _gsBatchPipelinesBuilt;
+    NSMutableArray<MGLGsBatchItem *> *_gsBatch;
 
     // one MTLLibrary per distinct MSL source, so the same shader is compiled once
     NSMutableDictionary<NSString *, id<MTLLibrary>> *_libraryCache;
@@ -9823,8 +9841,14 @@ static const char *mgl_gs_capture_msl =
     bool general = tess && program->tess.general;
     GLuint gen_patches = 0;
 
-    if ([self buildGeometryPipelines: program] == false)
-        return true;
+    // GL state cannot change inside one multi-draw
+    if (!(_gsBatching && _gsBatchPipelinesBuilt))
+    {
+        if ([self buildGeometryPipelines: program] == false)
+            return true;
+
+        _gsBatchPipelinesBuilt = _gsBatching;
+    }
 
     // triangles and quads are cut up on the CPU first, which waits for the
     // control stage; nothing this draw takes from the pool may come before it
@@ -9938,20 +9962,16 @@ static const char *mgl_gs_capture_msl =
         return true;
     }
 
-    // a slot the shader never writes has to read as invalid, not as whatever
-    // the recycled buffer happened to hold
+    // the kernel marks its own unused output slots invalid; input slots no
+    // tessellated point lands in are cleared here
+    if (tess)
     {
         id<MTLBlitCommandEncoder> blit = [self newBlitEncoder];
 
         if (blit == nil)
             return true;
 
-        [blit fillBuffer: out_buf range: NSMakeRange(0, out_buf.length) value: 0];
-
-        // the same for input slots no point lands in
-        if (tess)
-            [blit fillBuffer: in_buf range: NSMakeRange(0, in_buf.length) value: 0];
-
+        [blit fillBuffer: in_buf range: NSMakeRange(0, in_buf.length) value: 0];
         [blit endEncoding];
     }
 
@@ -10052,6 +10072,27 @@ static const char *mgl_gs_capture_msl =
                                 instanceCount: (NSUInteger)instances];
     }
 
+    if (_gsBatching && !tess)
+    {
+        MGLGsBatchItem *item = [MGLGsBatchItem new];
+
+        item->in_buf = in_buf;
+        item->out_buf = out_buf;
+        item->indices = gs_indices;
+        item->slots = slots;
+        item->prims = (GLint)prims;
+        item->indexed = gs_indices != nil ? 1 : 0;
+        item->first = first;
+        item->stride = stride;
+        item->per_instance = (GLint)per_instance;
+
+        if (_gsBatch == nil)
+            _gsBatch = [NSMutableArray array];
+
+        [_gsBatch addObject: item];
+        return true;
+    }
+
     // ---- pass two: the geometry stage ----
     id<MTLComputeCommandEncoder> enc = [self liveComputeEncoder];
 
@@ -10101,6 +10142,86 @@ static const char *mgl_gs_capture_msl =
     return true;
 }
 
+
+// The kernels and draws of the geometry draws recorded above, in order
+- (void) flushGeometryBatch
+{
+    NSArray<MGLGsBatchItem *> *batch = _gsBatch;
+    Program *program = ctx->state.program;
+
+    _gsBatch = nil;
+
+    if (batch.count == 0 || program == NULL)
+        return;
+
+    GeometryInfo *gi = &program->geom;
+    id<MTLComputeCommandEncoder> enc = [self liveComputeEncoder];
+
+    if (enc == nil)
+        return;
+
+    [enc setComputePipelineState: _gsComputePipeline];
+    [self bindTexturesForStage: _GEOMETRY_SHADER toCompute: enc];
+
+    for (MGLGsBatchItem *item in batch)
+    {
+        mglWriteProgramUniform(ctx, program, gi->prims_loc, item->prims);
+        mglWriteProgramUniform(ctx, program, gi->indexed_loc, item->indexed);
+        mglWriteProgramUniform(ctx, program, gi->first_loc, item->first);
+        mglWriteProgramUniform(ctx, program, gi->stride_loc, item->stride);
+        mglWriteProgramUniform(ctx, program, gi->per_instance_loc, item->per_instance);
+
+        [self bindTessBuffers: &ctx->state.geometry_buffer_map_list stage: _GEOMETRY_SHADER toComputeEncoder: enc];
+        [enc setBuffer: item->in_buf offset: 0 atIndex: gi->gs_in_slot];
+        [enc setBuffer: item->out_buf offset: 0 atIndex: gi->gs_out_slot];
+
+        if (gi->gs_index_slot >= 0)
+            [enc setBuffer: item->indices ? item->indices : item->in_buf offset: 0 atIndex: gi->gs_index_slot];
+
+        [enc dispatchThreads: MTLSizeMake(item->slots, 1, 1)
+       threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
+    }
+
+    [self endComputeEncoding];
+
+    if (_currentRenderEncoder == nil)
+    {
+        if ([self newRenderEncoder] == false)
+            return;
+
+        [self updateCurrentRenderEncoder];
+    }
+
+    if (!ctx->state.caps.rasterizer_discard)
+    {
+        [_currentRenderEncoder setRenderPipelineState: _gsDrawPipeline];
+        [self bindFragmentBuffersToCurrentRenderEncoder];
+        [self bindTexturesToCurrentRenderEncoder];
+
+        for (MGLGsBatchItem *item in batch)
+        {
+            [_currentRenderEncoder setVertexBuffer: item->out_buf offset: 0 atIndex: gi->pass_out_slot];
+            [_currentRenderEncoder drawPrimitives: gsOutputPrimitive(gi->out_primitive)
+                                      vertexStart: 0
+                                      vertexCount: item->slots * (NSUInteger)gi->slot_capacity];
+        }
+    }
+
+    for (MGLGsBatchItem *item in batch)
+    {
+        [self captureGeometry: program output: item->out_buf slots: item->slots];
+        [self countGeometry: program output: item->out_buf slots: item->slots];
+    }
+}
+
+// transform feedback records in draw order as each draw goes, so it is left out
+- (bool) canBatchGeometry
+{
+    Program *p = ctx->state.program;
+    TransformFeedback *xfb = ctx->state.transform_feedback;
+
+    return p && mglProgramHasGeometry(p) && !p->tess.active && !(xfb && xfb->active);
+}
 
 // ---------------------------------------------------------------------------
 // Cull distance.
@@ -13891,6 +14012,9 @@ void mtlDispatchComputeIndirect(GLMContext glm_ctx, GLintptr indirect)
         return;
     }
 
+    // recorded geometry draws use scratch tied to this command buffer
+    [self flushGeometryBatch];
+
     if (![self processGLState: false]) {
         MGL_NSERR(@"MGL WARNING: processGLState failed in flushCommandBuffer, continuing with cleanup");
         // Don't return - continue with cleanup to prevent resource leaks
@@ -17131,11 +17255,15 @@ void mtlMultiDrawArrays(GLMContext glm_ctx, GLenum mode, const GLint *first, con
 
     if ([self multiDrawOneByOne])
     {
+        _gsBatching = [self canBatchGeometry];
+        _gsBatchPipelinesBuilt = false;
         for (GLsizei i = 0; i < drawcount; i++)
         {
             _multiDrawIndex = (uint32_t)i;
             [self mtlDrawElements: glm_ctx mode: mode count: count[i] type: type indices: indices[i]];
         }
+        _gsBatching = false;
+        [self flushGeometryBatch];
         _multiDrawIndex = 0;
         return;
     }
@@ -17187,12 +17315,16 @@ void mtlMultiDrawElements(GLMContext glm_ctx, GLenum mode, const GLsizei *count,
 
     if ([self multiDrawOneByOne])
     {
+        _gsBatching = [self canBatchGeometry];
+        _gsBatchPipelinesBuilt = false;
         for (GLsizei i = 0; i < drawcount; i++)
         {
             _multiDrawIndex = (uint32_t)i;
             [self mtlDrawElementsBaseVertex: glm_ctx mode: mode count: count[i] type: type indices: indices[i]
                                  basevertex: basevertex ? basevertex[i] : 0];
         }
+        _gsBatching = false;
+        [self flushGeometryBatch];
         _multiDrawIndex = 0;
         return;
     }

@@ -79,6 +79,12 @@
   the nearest of the three.
 
 ### Faster
+- Geometry shaders cost less. The draws of one multi-draw run their geometry stage in one
+  compute pass and draw in one render pass, where each used to break the pass. Each geometry
+  kernel marks its own unused output as empty instead of a blit clearing it first, holds less
+  in registers when building triangle strips, and gets room for as many triangles as its strip
+  can make rather than three times its vertex count. BetterVoxels, which draws its shadows
+  through a geometry shader, went from 5 to 8 FPS.
 - Buffers use cached CPU memory, not write-combined. Copying into a buffer the GPU is still
   using reads the old contents back on the CPU, and from write-combined memory that is very
   slow. Minecraft does this every frame: it went from 177 to about 1,380 FPS with shaders off,

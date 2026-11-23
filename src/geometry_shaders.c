@@ -1402,13 +1402,14 @@ static int locationsFor(const char *type)
     "  mglGsStride = mglGsStrideU;\n" \
     "  mglGsPerInstance = mglGsPerInstanceU;\n" \
     "  int mglId = int(gl_GlobalInvocationID.x);\n" \
+    "  mglBase = mglId * mglGsCap;\n" \
+    "  for (int mglK = 0; mglK < mglGsCap; mglK++) mglGsOut[mglBase + mglK].mglValid = 0.0;\n" \
     "  int mglSlot = mglId / mglGsInvocations;\n" \
     "  mglInstance = mglGsPrims > 0 ? mglSlot / mglGsPrims : 0;\n" \
     "  mglPrimitiveID = mglSlot - mglInstance * mglGsPrims;\n" \
     "  mglInvocationID = mglId - mglSlot * mglGsInvocations;\n" \
     "  if (mglPrimitiveID >= mglGsPrims) return;\n" \
     "  if (mglGsIn[mglFetch(0)].mglPointSize == 0.0) return;\n" \
-    "  mglBase = mglId * mglGsCap;\n" \
     "  mglCur.mglPointSize = mglGsIn[mglFetch(0)].mglPointSize;\n" \
     "  mglCur.mglLayer = 0;\n  mglCur.mglViewportIndex = 0;\n" \
     "  mglWritten = 0;\n  mglStripLen = 0;\n  mglStripFlip = false;\n"
@@ -2186,8 +2187,12 @@ bool mglRewriteGeometryShader(const char *src, GeometryInfo *gi)
     in_verts = inputVertexCount(gi->in_primitive);
     out_verts = outputVertexCount(gi->out_primitive);
 
-    // worst case every emit after the first completes a primitive
-    cap = gi->max_vertices * out_verts;
+    // a strip of n vertices makes at most n - out_verts + 1 primitives; other
+    // streams record each vertex as a point of its own
+    cap = out_verts * (gi->max_vertices - out_verts + 1);
+
+    if (cap < gi->max_vertices)
+        cap = gi->max_vertices;
 
     gi->in_vertices = in_verts;
     gi->out_vertices_per_primitive = out_verts;
@@ -2345,7 +2350,47 @@ bool mglRewriteGeometryShader(const char *src, GeometryInfo *gi)
         "  v.mglValid = 1.0;\n"
         "  mglGsOut[mglBase + mglWritten] = v;\n"
         "  mglWritten++;\n}\n\n"
-        "void mglStructsOut();\n\n"
+        "void mglStructsOut();\n\n"))
+        goto done;
+
+    // Triangles without cull distances are written straight to the output,
+    // keeping only where the strip's last two vertices went. Holding them as
+    // copies spilled big kernels out of registers.
+    if (!bufAdd(&out, out_verts == 3 && !builtinVarying(sc.out, sc.out_count, "gl_CullDistance") ?
+        "int mglS0;\nint mglS1;\n\n"
+        "void mglEmitVertex()\n{\n"
+        "  mglStructsOut();\n"
+        "  mglCur.mglStream = 0;\n"
+        "  if (mglStripLen < 2)\n  {\n"
+        "    if (mglWritten >= mglGsCap) return;\n"
+        "    mglCur.mglValid = 0.0;\n"
+        "    mglGsOut[mglBase + mglWritten] = mglCur;\n"
+        "    if (mglStripLen == 0) mglS0 = mglWritten; else mglS1 = mglWritten;\n"
+        "    mglWritten++;\n    mglStripLen++;\n    return;\n  }\n"
+        "  if (mglStripLen == 2)\n  {\n"
+        "    if (mglWritten >= mglGsCap) return;\n"
+        "    mglCur.mglValid = 1.0;\n"
+        "    mglGsOut[mglBase + mglWritten] = mglCur;\n"
+        "    mglGsOut[mglBase + mglS0].mglValid = 1.0;\n"
+        "    mglGsOut[mglBase + mglS1].mglValid = 1.0;\n"
+        "    mglS0 = mglS1;\n    mglS1 = mglWritten;\n"
+        "    mglWritten++;\n    mglStripLen = 3;\n    mglStripFlip = true;\n    return;\n  }\n"
+        "  if (mglWritten + 3 > mglGsCap) return;\n"
+        "  int a = mglStripFlip ? mglS1 : mglS0;\n"
+        "  int b = mglStripFlip ? mglS0 : mglS1;\n"
+        "  mglGsOut[mglBase + mglWritten] = mglGsOut[mglBase + a];\n"
+        "  mglGsOut[mglBase + mglWritten + 1] = mglGsOut[mglBase + b];\n"
+        "  mglCur.mglValid = 1.0;\n"
+        "  mglGsOut[mglBase + mglWritten + 2] = mglCur;\n"
+        "  mglS0 = mglStripFlip ? mglWritten : mglWritten + 1;\n"
+        "  mglS1 = mglWritten + 2;\n"
+        "  mglWritten += 3;\n"
+        "  mglStripFlip = !mglStripFlip;\n}\n\n"
+        // two lone vertices make no triangle, and later ones go where they were
+        "void mglEndPrimitive()\n{\n"
+        "  if (mglStripLen < 3) mglWritten -= mglStripLen;\n"
+        "  mglStripLen = 0;\n  mglStripFlip = false;\n}\n\n"
+        :
         "void mglEmitVertex()\n{\n"
         "  mglStructsOut();\n"
         "  mglCur.mglStream = 0;\n"
@@ -2359,7 +2404,10 @@ bool mglRewriteGeometryShader(const char *src, GeometryInfo *gi)
         "    else { mglPut(mglStrip[0]); mglPut(mglStrip[1]); mglPut(mglCur); }\n  }\n"
         "  mglStrip[0] = mglStrip[1];\n  mglStrip[1] = mglCur;\n"
         "  mglStripFlip = !mglStripFlip;\n}\n\n"
-        "void mglEndPrimitive()\n{\n  mglStripLen = 0;\n  mglStripFlip = false;\n}\n\n"
+        "void mglEndPrimitive()\n{\n  mglStripLen = 0;\n  mglStripFlip = false;\n}\n\n"))
+        goto done;
+
+    if (!bufAdd(&out,
         // EmitStreamVertex and EndStreamPrimitive name a stream. Only stream
         // zero is rasterised; the others are recorded, and GL has them be
         // points, so each vertex is a primitive of its own.
@@ -2614,7 +2662,13 @@ bool mglRewriteGeometryShader(const char *src, GeometryInfo *gi)
     if (sc.uses_primitive_id && !bufAdd(&pass, "flat out int mglPrimitiveIdOut;\n"))
         goto done;
 
-    if (!bufAdd(&pass, "\nvoid main()\n{\n  MglGsOutV v = mglGsOut[gl_VertexID];\n"))
+    // a slot the geometry shader never wrote is pushed outside the frustum,
+    // where it covers nothing; it returns before reading the rest of the slot
+    if (!bufAdd(&pass, "\nvoid main()\n{\n"
+                       "  if (mglGsOut[gl_VertexID].mglValid < 0.5 || mglGsOut[gl_VertexID].mglStream != 0)\n  {\n"
+                       "    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);\n") ||
+        (gi->out_primitive == GL_POINTS && !bufAdd(&pass, "    gl_PointSize = 1.0;\n")) ||
+        !bufAdd(&pass, "    return;\n  }\n  MglGsOutV v = mglGsOut[gl_VertexID];\n"))
         goto done;
 
     for (int i = 0; i < sc.out_count; i++)
@@ -2679,10 +2733,7 @@ bool mglRewriteGeometryShader(const char *src, GeometryInfo *gi)
             goto done;
     }
 
-    // a slot the geometry shader never wrote is pushed outside the frustum,
-    // where it covers nothing rather than drawing a stray primitive
-    if (!bufAdd(&pass,
-        "  gl_Position = v.mglValid > 0.5 && v.mglStream == 0 ? v.mglPos : vec4(2.0, 2.0, 2.0, 1.0);\n"))
+    if (!bufAdd(&pass, "  gl_Position = v.mglPos;\n"))
         goto done;
 
     // Metal only accepts a point size when drawing points
