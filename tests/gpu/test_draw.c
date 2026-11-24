@@ -1020,3 +1020,65 @@ GPU_TEST(draw, front_facing_follows_front_face_without_culling)
     glDeleteBuffers(1, &vbo);
     mgl_target_destroy(&t);
 }
+
+// DawnCraft's sprint particles: new vertex data, then an unrelated buffer bind
+// before the next draw, which used to keep the previous draw's vertices
+GPU_TEST(draw, new_vertex_data_survives_an_unrelated_buffer_bind)
+{
+    static const GLfloat left[12]  = { -1,-1, 0,-1, 0,1,  -1,-1, 0,1, -1,1 };
+    static const GLfloat right[12] = {  0,-1, 1,-1, 1,1,   0,-1, 1,1,  0,1 };
+    // inline (under 4 KB) and a Metal buffer of its own
+    static const GLsizeiptr sizes[2] = { sizeof left, 8192 };
+    MGLTestTarget t;
+    char log[2048] = { 0 };
+    GLuint prog, vao, vbo, other;
+    GLubyte *data = calloc(1, 8192);
+
+    if (!mgl_target_create(&t, W, H, GL_RGBA8, 0)) SKIP("no target");
+
+    prog = mgl_build_program(VS_PASSTHRU, FS_SOLID, log, sizeof log);
+    CHECK_MSG(prog != 0, "link: %s", log);
+
+    glGenVertexArrays(1, &vao);
+    glGenBuffers(1, &vbo);
+    glGenBuffers(1, &other);
+    glBindVertexArray(vao);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
+    glEnableVertexAttribArray(0);
+    glUseProgram(prog);
+    mgl_target_bind(&t);
+
+    for (int s = 0; s < 2; s++)
+    {
+        unsigned char *px, c[4];
+
+        glBindBuffer(GL_COPY_READ_BUFFER, 0);
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        memcpy(data, left, sizeof left);
+        glBufferData(GL_ARRAY_BUFFER, sizes[s], data, GL_DYNAMIC_DRAW);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+
+        memcpy(data, right, sizeof right);
+        glBufferData(GL_ARRAY_BUFFER, sizes[s], data, GL_DYNAMIC_DRAW);
+        glBindBuffer(GL_COPY_READ_BUFFER, other);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+        CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+
+        px = mgl_read_rgba8(&t);
+        CHECK_MSG(px != NULL, "readback failed");
+        mgl_pixel_at(px, &t, W * 3 / 4, H / 2, c);
+        CHECK_MSG(c[1] > 200, "%ld byte buffer: right half = %d,%d,%d, want green",
+                  (long)sizes[s], c[0], c[1], c[2]);
+        free(px);
+    }
+
+    free(data);
+    glDeleteProgram(prog);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo);
+    glDeleteBuffers(1, &other);
+    mgl_target_destroy(&t);
+}

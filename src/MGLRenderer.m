@@ -13196,6 +13196,11 @@ static bool unitTakesAtomics(GLMContext ctx, int unit)
         }
         else if (ctx->state.dirty_bits & DIRTY_BUFFER)
         {
+            // the update below clears the buffers' own bits, which the check
+            // after this would otherwise rebind on
+            bool vertex_data = [self checkForDirtyBufferData: &ctx->state.vertex_buffer_map_list];
+            bool fragment_data = [self checkForDirtyBufferData: &ctx->state.fragment_buffer_map_list];
+
             // updateDirtyBaseBufferList binds new mtl buffers or updates old ones
             RETURN_FALSE_ON_FAILURE([self updateDirtyBaseBufferList: &ctx->state.vertex_buffer_map_list]);
             RETURN_FALSE_ON_FAILURE([self updateDirtyBaseBufferList: &ctx->state.fragment_buffer_map_list]);
@@ -13207,6 +13212,13 @@ static bool unitTakesAtomics(GLMContext ctx, int unit)
                 RETURN_FALSE_ON_FAILURE([self bindVertexBuffersToCurrentRenderEncoder]);
                 RETURN_FALSE_ON_FAILURE([self bindFragmentBuffersToCurrentRenderEncoder]);
                 RETURN_FALSE_ON_FAILURE([self updateMeshStageBuffers: true mesh: false task: false]);
+            }
+            else if (_currentRenderEncoder != nil)
+            {
+                if (vertex_data)
+                    RETURN_FALSE_ON_FAILURE([self bindVertexBuffersToCurrentRenderEncoder]);
+                if (fragment_data)
+                    RETURN_FALSE_ON_FAILURE([self bindFragmentBuffersToCurrentRenderEncoder]);
             }
 
             ctx->state.dirty_bits &= ~DIRTY_BUFFER;

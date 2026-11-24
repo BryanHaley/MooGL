@@ -143,6 +143,8 @@
     each draw.
 
 ### Fixed
+- A draw after new `glBufferData` and a bind of some other buffer uses the new vertices, not
+  the last draw's. Sprinting in DawnCraft left long black streaks from the particles.
 - `GL_ARB_conservative_depth` is listed, and with it a shader before GLSL 4.20 can redeclare
   `gl_FragDepth` with a depth layout. Create's Flywheel renderer does this, and Minecraft
   1.18.2 with the DawnCraft modpack crashed on entering a world.
