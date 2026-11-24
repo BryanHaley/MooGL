@@ -446,6 +446,49 @@ GPU_TEST(framebuffer_layers, frag_depth_into_a_colour_only_target_still_draws)
     glDeleteTextures(1, &tex);
 }
 
+// Flywheel's block shader (Create mod) redeclares gl_FragDepth this way
+GPU_TEST(framebuffer_layers, conservative_depth_redeclares_frag_depth_before_420)
+{
+    static const char *FS =
+        "#version 150\n"
+        "#extension GL_ARB_conservative_depth : enable\n"
+        "#ifdef GL_ARB_conservative_depth\n"
+        "layout(depth_greater) out float gl_FragDepth;\n"
+        "#endif\n"
+        "out vec4 o;void main(){o=vec4(0,1,0,1);gl_FragDepth=0.3;}\n";
+    char err[1024] = { 0 };
+    GLuint tex = rgba_tex(), fb = fbo_for(), prog, vao;
+    GLint n = 0;
+    int listed = 0;
+    GLubyte px[4 * 4 * 4];
+
+    glGetIntegerv(GL_NUM_EXTENSIONS, &n);
+    for (GLint i = 0; i < n; i++)
+        listed |= !strcmp((const char *)glGetStringi(GL_EXTENSIONS, i), "GL_ARB_conservative_depth");
+    CHECK_MSG(listed, "GL_ARB_conservative_depth not listed");
+
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    prog = mgl_build_program(VS, FS, err, sizeof err);
+    CHECK_MSG(prog != 0, "link: %s", err);
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    glUseProgram(prog);
+    glViewport(0, 0, 4, 4);
+    glClearColor(0, 0, 0, 0);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glReadPixels(0, 0, 4, 4, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    CHECK_MSG(px[1] == 255, "green %d", px[1]);
+    CHECK_EQ_UINT(GL_NO_ERROR, mgl_drain_errors());
+
+    glUseProgram(0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteProgram(prog);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteFramebuffers(1, &fb);
+    glDeleteTextures(1, &tex);
+}
+
 // one pass drawing with and without gl_FragDepth: every draw lands
 GPU_TEST(framebuffer_layers, frag_depth_and_plain_draws_share_a_pass)
 {

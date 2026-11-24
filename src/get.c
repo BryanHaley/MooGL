@@ -1108,6 +1108,7 @@ static const char * const mgl_extensions[] = {
     "GL_ARB_texture_compression_bptc",
     "GL_ARB_depth_texture",
     "GL_ARB_depth_buffer_float",
+    "GL_ARB_conservative_depth",
     "GL_ARB_framebuffer_object",
     "GL_ARB_framebuffer_sRGB",
     "GL_ARB_draw_buffers",

@@ -143,6 +143,9 @@
     each draw.
 
 ### Fixed
+- `GL_ARB_conservative_depth` is listed, and with it a shader before GLSL 4.20 can redeclare
+  `gl_FragDepth` with a depth layout. Create's Flywheel renderer does this, and Minecraft
+  1.18.2 with the DawnCraft modpack crashed on entering a world.
 - GLSL names that are C++ keywords, such as a variable called `new` or `and`, no longer make
   Metal reject the shader. BSL's deferred pass has one.
 - A shared array of `vec3` takes 12 bytes an element, as in GL, instead of Metal's 16, so one

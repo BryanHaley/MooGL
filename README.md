@@ -77,7 +77,11 @@ runs the BetterVoxels shaderpack on an M1 Max.
 4. Start the game and choose the shaderpack under **Options > Video Settings > Shader Packs**.
    The game log says `using drivers: 4.6.0 MooGL`.
 
-Minecraft 26.3 opens its window with SDL3. Versions that use GLFW instead haven't been tried.
+Minecraft 26.3 opens its window with SDL3. Older versions use GLFW: point
+`-Dorg.lwjgl.glfw.libname` at the SDK's `libglfw.dylib` instead of SDL3. The game has to run
+as an Apple silicon app, with LWJGL 3.3.1 or later, as Prism Launcher sets it up. Minecraft
+1.18.2 with Forge runs the DawnCraft modpack this way at about 250 FPS on an M1 Max.
+DawnCraft asks for OpenGL 4.3, so it doesn't start on Apple's OpenGL.
 
 ## Legacy OpenGL
 
