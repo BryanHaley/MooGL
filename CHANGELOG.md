@@ -7,8 +7,8 @@
 - Up to 32 textures in each shader stage, up from 16. A stage that samples more than 16 reads
   them through a Metal argument buffer, since Metal has 16 sampler slots a stage.
 - `MGLsetContextView`, which moves a context's drawing to another `NSView`, as
-  `NSOpenGLContext`'s `setView` does. MooGL's SDL3 uses it, so a context made with one window
-  can be made current with another.
+  `NSOpenGLContext`'s `setView` does. MooGL's SDL2 and SDL3 use it, so a context made with one
+  window can be made current with another.
 - OpenGL ES 3.1 contexts, in a build made with `make OGL_ES=1`; a plain build leaves them out,
   and the SDK has them. GLFW's `GLFW_OPENGL_ES_API` and SDL's `SDL_GL_CONTEXT_PROFILE_ES` make
   one (any request from ES 2.0 to 3.1 gets 3.1), and so does `createGLMContextProfile` with

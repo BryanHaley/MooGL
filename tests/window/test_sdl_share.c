@@ -5,7 +5,8 @@
  * MGL
  *
  * SDL_GL_SHARE_WITH_CURRENT_CONTEXT through MooGL's SDL2: the second context
- * sees the first one's objects.
+ * sees the first one's objects. A context made current on another window draws
+ * there.
  */
 
 #include <GL/glcorearb.h>
@@ -57,6 +58,21 @@ int main(void)
     }
 
     check(glIsTexture(tex), "the texture outlives the second context");
+
+    SDL_Window *other = SDL_CreateWindow("MooGL SDL other window", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                                         128, 32, SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN);
+    check(other && SDL_GL_MakeCurrent(other, first) == 0, "the context is made current on another window");
+    if (other)
+    {
+        GLubyte p[4] = { 0 };
+        glClearColor(1, 0, 0, 1);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glReadPixels(100, 16, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, p);
+        check(p[0] == 255 && p[1] == 0, "it draws at the other window's size");
+        SDL_GL_SwapWindow(other);
+        check(SDL_GL_MakeCurrent(window, first) == 0, "and back on its own window");
+        SDL_DestroyWindow(other);
+    }
     check(glGetError() == GL_NO_ERROR, "no GL errors");
 
     SDL_GL_DeleteContext(first);

@@ -154,12 +154,6 @@ cp "$build/sfml3/_deps/sheenbidi-src/LICENSE" "$out/licenses/SheenBidi.txt"
 # GLU has no licence file; it is the comment at the top of each source
 sed -n '2,/^ \*\//s/^ \*\{0,1\} \{0,1\}//p' submodules/glu/src/libutil/project.c | sed '$d' > "$out/licenses/GLU.txt"
 
-if command -v dotnet >/dev/null; then
-    BUILD_DIR="$build" tools/fsr2_csharp/build.sh
-    mkdir -p "$out/nuget"
-    cp "$build"/nuget/FFX_FSR2.*-macos.nupkg "$out/nuget/"
-fi
-
 cat > "$out/README.md" <<EOF
 # MooGL SDK $version
 
@@ -220,6 +214,13 @@ if [ -n "${MOOGL_SIGN_IDENTITY:-}" ]; then
     codesign --force --timestamp --options runtime --sign "$MOOGL_SIGN_IDENTITY" "$out/sfml2/lib/freetype.framework"
 else
     codesign --force --sign - "$out/sfml2/lib/libsfml-window.2.6.2.dylib"
+fi
+
+# after signing: the package carries its own copies of the libraries
+if command -v dotnet >/dev/null; then
+    BUILD_DIR="$build" NATIVES_DIR="$out/lib" tools/fsr2_csharp/build.sh
+    mkdir -p "$out/nuget"
+    cp "$build"/nuget/FFX_FSR2.*-macos.nupkg "$out/nuget/"
 fi
 
 notary=()

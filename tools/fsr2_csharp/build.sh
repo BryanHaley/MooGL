@@ -10,7 +10,8 @@
 # MooGL's single libffx_fsr2_api in place of AMD's two Windows libraries.
 #
 # Output: $BUILD_DIR/nuget/FFX_FSR2.<version>-macos.nupkg, BUILD_DIR being build/
-# unless set. Needs `make fsr2` first.
+# unless set. Needs `make fsr2` first. NATIVES_DIR picks where the two libraries
+# come from (default BUILD_DIR), such as an SDK's signed lib folder.
 
 set -euo pipefail
 
@@ -19,11 +20,12 @@ here="$mgl/tools/fsr2_csharp"
 build="${BUILD_DIR:-$mgl/build}"
 work="$build/fsr2_csharp"
 out="$build/nuget"
+natives="${NATIVES_DIR:-$build}"
 commit=12c709ba140c70d5e0f4ba8716b119ce78952292    # 1.0.3
 version=1.0.3-macos
 
 for lib in libffx_fsr2_api.dylib libmoogl.dylib; do
-    [ -f "$build/$lib" ] || { echo "$build/$lib is missing; run make fsr2" >&2; exit 1; }
+    [ -f "$natives/$lib" ] || { echo "$natives/$lib is missing; run make fsr2" >&2; exit 1; }
 done
 
 if [ ! -d "$work/src" ]; then
@@ -36,7 +38,7 @@ git -C "$work/src" apply "$here/macos.patch"
 rm -rf "$work/natives"
 mkdir -p "$work/natives" "$out"
 # libmoogl too: the FSR 2 library needs it beside it
-cp "$build/libffx_fsr2_api.dylib" "$build/libmoogl.dylib" "$work/natives/"
+cp "$natives/libffx_fsr2_api.dylib" "$natives/libmoogl.dylib" "$work/natives/"
 
 dotnet pack "$work/src/FidelityFX-FSR2-CSharpBindings/FFX_FSR2.csproj" -c Release \
     -p:DefineConstants=FFX_MACOS -p:Version="$version" -p:MacOSNatives="$work/natives" \

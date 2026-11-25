@@ -4,8 +4,8 @@
  * test_sdl3.c
  * MGL
  *
- * MooGL's SDL3: core, compatibility and ES contexts, sharing, and SDL's
- * opengl and opengles2 renderers.
+ * MooGL's SDL3: core, compatibility and ES contexts, sharing, a context moved
+ * to another window, and SDL's opengl and opengles2 renderers.
  */
 
 #include <GL/glcorearb.h>
@@ -85,6 +85,18 @@ static void contexts(void)
         SDL_GL_DestroyContext(second);
     }
     check(glIsTexture(tex), "the texture outlives the second context");
+
+    SDL_Window *other = SDL_CreateWindow("MooGL SDL3 other window", 128, 32, SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN);
+    check(other && SDL_GL_MakeCurrent(other, core), "the context is made current on another window");
+    if (other)
+    {
+        glClearColor(1, 0, 0, 1);
+        glClear(GL_COLOR_BUFFER_BIT);
+        check(glPixelIs(100, 16, 255, 0, 0), "it draws at the other window's size");
+        SDL_GL_SwapWindow(other);
+        check(SDL_GL_MakeCurrent(window, core), "and back on its own window");
+        SDL_DestroyWindow(other);
+    }
     check(glGetError() == GL_NO_ERROR, "no GL errors in the core context");
 
     SDL_GL_DestroyContext(core);

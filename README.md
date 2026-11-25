@@ -11,18 +11,18 @@
   <a href="LICENSE"><img alt="Apache 2.0" src="https://img.shields.io/badge/license-Apache%202.0-8aa4b8"></a>
 </p>
 
-OpenGL has been deprecated for years on macOS, and was never updated past 4.1. MooGL is a complete OpenGL 4.6 Core implementation (along with the most important legacy features) written on top of Metal, so most OpenGL code (compute shaders, direct state access, SPIR-V, bindless textures, mesh shaders) builds and runs on a Mac. You link it like any other library and open a window with the GLFW, SDL2, SDL3, SFML or raylib it ships with.
+OpenGL has been deprecated for years on macOS and was never updated past 4.1. MooGL is a complete OpenGL 4.6 Core implementation (along with the most important compatibility features) written on top of Metal, so most OpenGL code builds and runs on a Mac such as compute shaders, direct state access, SPIR-V, bindless textures, and mesh shaders. You link it like any other library and open a window with the GLFW, SDL2, SDL3, SFML or raylib it ships with.
 
 It also ships AMD FSR 2's API on top of Apple's MetalFX upscaler so a game that uses FSR 2 on Windows/Linux can be ported to Mac without touching its FSR 2 code.
 
-## Where it stands
+## Conformance status
 
 | Suite | Passed | Failed |
 | --- | ---: | ---: |
-| Khronos KHR-GL46 (the OpenGL 4.6 conformance tests) | 17,987 | **0** |
-| Khronos KHR-Single | 8,836 | **0** |
-| Khronos `texture_swizzle` | 505 | **0** |
-| MooGL's own suite | 1,516 | **0** |
+| Khronos KHR-GL46 (the OpenGL 4.6 conformance tests) | 17,987 | 0 |
+| Khronos KHR-Single | 8,836 | 0 |
+| Khronos `texture_swizzle` | 505 | 0 |
+| MooGL's own suite | 1,516 | 0 |
 
 The 1,728 KHR-GL46 cases MooGL does not run are ones the conformance suite lets a driver decline (mostly optional extensions). These are local runs; MooGL has not been submitted to Khronos and is not an officially conformant product.
 
@@ -34,18 +34,20 @@ The 1,728 KHR-GL46 cases MooGL does not run are ones the conformance suite lets 
 
 [IDKEngine](https://github.com/BoyBaykiller/IDKEngine) has an OpenGL 4.6 renderer written for NVIDIA hardware on Windows. Here it runs through MooGL on an M1 Max MacBook Pro, drawing 1600×900 pixels at about ~50 fps. The frame shows:
 
-- **Sponza, Lucy and the damaged helmet**, about 290,000 triangles, drawn with multi-draw-indirect: one draw call for the whole scene.
-- **Bindless textures**: every material reads its textures through handles stored in buffers, not through texture units.
-- **Coloured point lights with soft shadows**, each light's cube map rendered in one pass by writing `gl_Layer` from the vertex shader (`ARB_shader_viewport_layer_array`).
-- **SSAO, volumetric light and bloom**, all compute shaders, then tone mapping.
-- **FSR 2 upscaling** from half resolution, through MooGL's FSR 2 on MetalFX.
-- The engine's **ImGui** interface, drawn through the same GL context. At the top right it reports `MGL` as the renderer and a resolution scale of 0.5.
+- Sponza, Lucy and the damaged helmet, about 290,000 triangles, drawn with multi-draw-indirect: one draw call for the whole scene.
+- Bindless textures: every material reads its textures through handles stored in buffers, not through texture units.
+- Coloured point lights with soft shadows, each light's cube map rendered in one pass by writing `gl_Layer` from the vertex shader (`ARB_shader_viewport_layer_array`).
+- SSAO, volumetric light and bloom, all compute shaders, then tone mapping.
+- FSR 2 upscaling from half resolution, through MooGL's FSR 2 on MetalFX.
+- The engine's ImGui interface, drawn through the same GL context. At the top right it reports `MGL` as the renderer and a resolution scale of 0.5.
 
-MooGL's build of the engine also turns on its subgroup, SPIR-V, debug-output and mesh shader paths, which stock macOS can't run, and its path tracer works too.
+MooGL's build of the engine also turns on its subgroup, SPIR-V, debug-output and mesh shader paths, which stock macOS can't run; its path tracer works too.
 
 ## Minecraft on MooGL
 
 Some shaderpacks need OpenGL >4.1 and won't run on Apple's OpenGL implementation, or disable some features on macOS; they should work on MooGL.
+
+Some shaderpacks improperly check for macOS and refuse to run or turn off features rather than polling OpenGL features (such as Solas turning off voxel support on macOS); this is a mistake in the shaderpack and can't be worked-around by MooGL itself.
 
 ### Iris Shaderpacks on 26.3
 
@@ -53,7 +55,7 @@ Some shaderpacks need OpenGL >4.1 and won't run on Apple's OpenGL implementation
   <img src="docs/images/minecraft-bettervoxels.webp" alt="Minecraft 26.3 with the BetterVoxels shaderpack on MooGL" width="900">
 </p>
 
-Shown above is Minecraft 26.3 with Fabric, Sodium, and Iris running the BetterVoxels shaderpack (you'll likely need an ~M3 Max or better to get a decent framerate with this shaderpack though; try something like the Complementary Unbound shaderpack for a better framerate).
+Shown above is Minecraft 26.3 with Fabric, Sodium, and Iris running the BetterVoxels shaderpack (you'll likely need an ~M3 Max or better to get a decent framerate with this shaderpack though).
 
 1. Download and extract the MooGL SDK anywhere; in this example we use: `/opt/MooGL-SDK`
 2. Install Iris with its installer, as usual. It adds an Iris profile to the launcher.
@@ -96,8 +98,8 @@ DawnCraft doesn't work on macOS with Apple OpenGL; it closes with "Requested Ope
 Minecraft 1.18.2 opens its window with GLFW, not SDL3. Its stock libraries also lack Apple silicon builds of LWJGL and java-objc-bridge. Prism Launcher fixes both when it sets up the instance, so use Prism rather than the Mojang launcher.
 
 1. Install Prism Launcher and sign in with your Microsoft account.
-2. Add DawnCraft: **Add Instance → CurseForge**, search "DawnCraft", and pick the latest version (2.0.16_hf). Prism installs Forge 40.2.17 and the 305 mods.
-3. Open the instance's **Settings**:
+2. Add Instance → CurseForge, search "DawnCraft", and pick the latest version (2.0.16_hf at time of writing). Prism installs Forge 40.2.17 and the 305 mods.
+3. Open the instance's Settings:
     - **Java**: use Java 17 for Apple silicon (Prism can download it), and set maximum memory to 8 GB.
     - **Java arguments**: add
       ```
@@ -115,23 +117,23 @@ On M1 Max I observed ~250 FPS in DawnCraft.
 
 MooGL also supports the vast majority of legacy OpenGL applications. A program that asks for the compatibility profile, or for no profile at all as old code does, gets a 4.6 context that supports the majority of compatibility features. Here is [Xash3D FWGS](https://github.com/FWGS/xash3d-fwgs), whose renderer is written for OpenGL 1.x, on an M1 Max MacBook Pro. It uses:
 
-- **`glBegin` and `glEnd`** for the world, models and HUD, and **client-side vertex arrays** for the models.
-- **The matrix stacks** and **`glTexEnv`** for texturing and lightmaps.
-- **The alpha test** for see-through textures such as grates and railings, and **blending** for the green beams and sprites.
+- `glBegin` and `glEnd` for the world, models and HUD, and client-side vertex arrays for the models.
+- The matrix stacks and `glTexEnv` for texturing and lightmaps.
+- The alpha test for see-through textures such as grates and railings, and blending for the green beams and sprites.
 
 See [Known limits](#known-limits) for what the compatibility profile covers. Old Mac code works too:
 
-- **GLUT**, as `libglut`: freeglut with a MooGL backend, from `<GLUT/glut.h>` or `<GL/freeglut.h>`.
-- **GLU**, as `libGLU`: Mesa's GLU, NURBS and tessellator included. Mac code keeps including `<OpenGL/glu.h>` and links `libGLU` instead of `OpenGL.framework`.
-- **`<GL/gl.h>` and `<GL/glext.h>`** for code from other systems: Apple's `gl.h` up to GL 2.1, and Khronos's `glext.h` for the rest, with `GL_GLEXT_PROTOTYPES` declaring the calls as on Linux.
-- **CGL and AGL**: `CGLChoosePixelFormat`, `CGLCreateContext`, `aglCreateContext` and the rest make MooGL contexts in a program linked to `libmoogl` instead of `OpenGL.framework`. AGL left the SDK in macOS 10.14, so MooGL ships its own `<AGL/agl.h>`.
-- **Apple's extensions**: `GL_APPLE_client_storage`, `GL_APPLE_texture_range`, `GL_APPLE_ycbcr_422`, `GL_APPLE_packed_pixels` and `GL_EXT_texture_rectangle`.
-- **`SDL_Renderer`'s `opengl` backend**, and any texture border colour, exact even with linear filtering.
-- **SFML 3 and 2.6**: the graphics module, `sf::Shader` and text included, draws through a compatibility context.
+- GLUT, as `libglut`: freeglut with a MooGL backend, from `<GLUT/glut.h>` or `<GL/freeglut.h>`.
+- GLU, as `libGLU`: Mesa's GLU, NURBS and tessellator included. Mac code keeps including `<OpenGL/glu.h>` and links `libGLU` instead of `OpenGL.framework`.
+- `<GL/gl.h>` and `<GL/glext.h>` for code from other systems: Apple's `gl.h` up to GL 2.1, and Khronos's `glext.h` for the rest, with `GL_GLEXT_PROTOTYPES` declaring the calls as on Linux.
+- CGL and AGL: `CGLChoosePixelFormat`, `CGLCreateContext`, `aglCreateContext` and the rest make MooGL contexts in a program linked to `libmoogl` instead of `OpenGL.framework`. AGL left the SDK in macOS 10.14, so MooGL ships its own `<AGL/agl.h>`.
+- Apple's extensions: `GL_APPLE_client_storage`, `GL_APPLE_texture_range`, `GL_APPLE_ycbcr_422`, `GL_APPLE_packed_pixels` and `GL_EXT_texture_rectangle`.
+- `SDL_Renderer`'s `opengl` backend, and any texture border colour, exact even with linear filtering.
+- SFML 3 and 2.6: the graphics module, `sf::Shader` and text included, draws through a compatibility context.
 
 ## Get the SDK
 
-Download `MooGL-SDK-<version>-macos-arm64.tar.gz` from the [releases page](https://github.com/BryanHaley/MooGL/releases) and unpack it anywhere.
+Download `MooGL-SDK-<version>-macos-arm64.tar.gz` from the [releases page](https://github.com/BryanHaley/MooGL/releases) and unpack it anywhere (`/opt/MooGL-SDK` is used as the example in this README).
 
 ```
 MooGL-SDK/
@@ -227,7 +229,6 @@ SFML 3 needs nothing extra: `find_package(SFML 3 COMPONENTS Graphics)` and `SFML
 
 A few things differ from Apple's driver:
 
-- A MooGL context draws into the window it was created for, and can't be made current on another.
 - Contexts can share objects: `SDL_GL_SHARE_WITH_CURRENT_CONTEXT` in SDL2, or a share window in GLFW (`glfwCreateWindow(..., share)`). Shared contexts have buffers, textures, renderbuffers, samplers, shaders, programs and syncs in common; each keeps its own vertex arrays, framebuffers, transform feedback objects, program pipelines and queries. They can be current on different threads at once, for example a loading thread. Order work between them with a fence: `glFenceSync` and `glFlush` in one, `glWaitSync` or `glClientWaitSync` in the other.
 - `SDL_Renderer` uses Metal by default, as on any Mac. Its `opengl` backend works too, through a compatibility context: set `SDL_HINT_RENDER_DRIVER` to `"opengl"`.
 - OpenGL ES 3.1 contexts come from the same library, in a build made with `make OGL_ES=1`; the SDK is built that way. Ask GLFW for `GLFW_OPENGL_ES_API` or SDL for `SDL_GL_CONTEXT_PROFILE_ES`: any request from ES 2.0 to 3.1 gets 3.1, with the ES strings, formats, errors and GLSL ES 1.00, 3.00 and 3.10. SDL's `opengles2` renderer works on one. ES 3.2 isn't offered.
@@ -236,8 +237,8 @@ A few things differ from Apple's driver:
 
 Pick one:
 
-- **Call them directly.** `libmoogl` exports every GL 4.6 function, and MooGL's `GL/glcorearb.h` declares them all. Link `-lmoogl`, as the example does.
-- **Use a loader** such as glad, GLEW or epoxy, passing it `glfwGetProcAddress`. Functions MooGL doesn't have come back as `NULL`, as on any driver. Code that already uses a loader needs no changes.
+- Call them directly. `libmoogl` exports every GL 4.6 function, and MooGL's `GL/glcorearb.h` declares them all. Link `-lmoogl`, as the example does.
+- Use a loader such as glad, GLEW or epoxy, passing it `glfwGetProcAddress`. Functions MooGL doesn't have come back as `NULL`, as on any driver. Code that already uses a loader needs no changes.
 
 **Don't include `<OpenGL/gl3.h>` or link `-framework OpenGL` yourself. That is Apple's 4.1 driver, and GL calls bound to it never reach MooGL.**
 
@@ -288,9 +289,9 @@ Most bindings load GLFW or SDL2 as a dylib and get GL functions through it: Open
 
 Each frame goes the same way in every language:
 
-1. Ask FSR 2 for this frame's **jitter**, a sub-pixel offset in pixels, and shift the scene by it. In the vertex shader: `gl_Position.xy += 2.0 * jitter / renderSize * gl_Position.w`.
-2. Draw the scene at the **render size** into a colour texture, a depth texture and a **motion texture**: for each pixel, where it was last frame minus where it is now, in UV units.
-3. Hand the three textures, the jitter and an output texture at the **display size** to FSR 2. Show or post-process the output.
+1. Ask FSR 2 for this frame's jitter, a sub-pixel offset in pixels, and shift the scene by it. In the vertex shader: `gl_Position.xy += 2.0 * jitter / renderSize * gl_Position.w`.
+2. Draw the scene at the render size into a colour texture, a depth texture and a motion texture: for each pixel, where it was last frame minus where it is now, in UV units.
+3. Hand the three textures, the jitter and an output texture at the display size to FSR 2. Show or post-process the output.
 
 All three examples below make the same `Upscaler`, in Quality mode (1.5× per side), for a GL 4.6 context that is already current.
 
