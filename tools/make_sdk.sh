@@ -233,7 +233,12 @@ if [ -n "${MOOGL_SIGN_IDENTITY:-}" ] && [ ${#notary[@]} -gt 0 ]; then
     rm -f "$build/notarize.zip"
     ditto -c -k --keepParent "$out" "$build/notarize.zip"
     xcrun notarytool submit "$build/notarize.zip" "${notary[@]}" --wait | tee "$build/notarize.log"
-    grep -q "status: Accepted" "$build/notarize.log" || { echo "notarization failed" >&2; exit 1; }
+    if ! grep -q "status: Accepted" "$build/notarize.log"; then
+        id=$(awk '/^ *id: /{print $2; exit}' "$build/notarize.log")
+        [ -n "$id" ] && xcrun notarytool log "$id" "${notary[@]}"
+        echo "notarization failed" >&2
+        exit 1
+    fi
 else
     echo "not signed and notarized: macOS will quarantine these libraries when downloaded"
 fi
