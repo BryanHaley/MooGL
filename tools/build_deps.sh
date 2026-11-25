@@ -3,8 +3,8 @@
 #
 # Fetches and builds what MooGL links against, from a fresh clone:
 #   submodules/SPIRV-Tools, SPIRV-Cross, SPIRV-Headers, glslang, FidelityFX-FSR2-OpenGL, glfw, SDL2, SDL3, SFML,
-#   SFML2, raylib, imgui, freeglut
-#     (SDL, SFML, raylib and freeglut themselves are built by make, after libmoogl)
+#   SFML2, raylib, imgui, freeglut, glu
+#     (SDL, SFML, raylib, freeglut and GLU themselves are built by make, after libmoogl)
 # The CTS and IDKEngine submodules are left alone; they are only for testing.
 #
 # MACOSX_DEPLOYMENT_TARGET sets the oldest macOS the build runs on (default 13.0).
@@ -28,7 +28,7 @@ cmake_build() {
 
 git submodule update --init submodules/SPIRV-Tools submodules/SPIRV-Cross submodules/SPIRV-Headers \
     submodules/glslang submodules/FidelityFX-FSR2-OpenGL submodules/glfw submodules/SDL2 submodules/SDL3 \
-    submodules/SFML submodules/SFML2 submodules/raylib submodules/imgui submodules/freeglut
+    submodules/SFML submodules/SFML2 submodules/raylib submodules/imgui submodules/freeglut submodules/glu
 
 cmake_build submodules/SPIRV-Tools submodules/SPIRV-Tools/build \
     -DSPIRV-Headers_SOURCE_DIR="$root/submodules/SPIRV-Headers" -DSPIRV_SKIP_TESTS=ON -DSPIRV_WERROR=OFF \
