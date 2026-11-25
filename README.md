@@ -55,33 +55,70 @@ drawing 1600×900 pixels at about 130 fps. The frame shows:
 MooGL's build of the engine also turns on its subgroup, SPIR-V, debug-output and mesh shader
 paths, which stock macOS can't run, and its path tracer works too.
 
-## Minecraft shaderpacks on MooGL
+## Minecraft on MooGL
+
+Some shaderpacks need OpenGL >4.1 and won't run on Apple's OpenGL implementation, or disable some features on macOS; they should work on MooGL.
+
+### Iris Shaderpacks on 26.3
 
 <p align="center">
   <img src="docs/images/minecraft-bettervoxels.webp" alt="Minecraft 26.3 with the BetterVoxels shaderpack on MooGL" width="900">
 </p>
 
-Some shaderpacks need OpenGL 4.3 or later and won't run on Apple's 4.1. With MooGL they do,
-and Minecraft itself is not changed. Above, Minecraft 26.3 with Fabric, Sodium and Iris
-runs the BetterVoxels shaderpack on an M1 Max.
+Shown above is Minecraft 26.3 with Fabric, Sodium, and Iris running the BetterVoxels shaderpack (you'll likely need an ~M3 Max or better to get a decent framerate with this shaderpack though; try something like the Complementary Unbound shaderpack for a better framerate).
 
-1. Install Iris with its installer, as usual. It adds an Iris profile to the launcher.
-2. Put the shaderpack in `~/Library/Application Support/minecraft/shaderpacks`.
-3. In the launcher, open **Installations**, edit the Iris profile, open **More options**,
+1. Download and extract the MooGL SDK anywhere; in this example we use: `/opt/MooGL-SDK`
+2. Install Iris with its installer, as usual. It adds an Iris profile to the launcher.
+3. Put the shaderpack in `~/Library/Application Support/minecraft/shaderpacks`.
+4. In the launcher, open **Installations**, edit the Iris profile, open **More options**,
    and add this to the end of **JVM arguments**, with the path to your SDK:
 
    ```
-   -Dorg.lwjgl.sdl.libname=/path/to/MooGL-SDK/lib/libSDL3.0.dylib -Dorg.lwjgl.opengl.libname=/path/to/MooGL-SDK/lib/libmoogl.dylib
+   -Dorg.lwjgl.sdl.libname=/opt/MooGL-SDK/lib/libSDL3.0.dylib -Dorg.lwjgl.opengl.libname=/opt/MooGL-SDK/lib/libmoogl.dylib
    ```
 
-4. Start the game and choose the shaderpack under **Options > Video Settings > Shader Packs**.
-   The game log says `using drivers: 4.6.0 MooGL`.
+5. Start the game and choose the shaderpack under **Options > Video Settings > Shader Packs**. The game log says `using drivers: 4.6.0 MooGL`.
 
-Minecraft 26.3 opens its window with SDL3. Older versions use GLFW: point
-`-Dorg.lwjgl.glfw.libname` at the SDK's `libglfw.dylib` instead of SDL3. The game has to run
-as an Apple silicon app, with LWJGL 3.3.1 or later, as Prism Launcher sets it up. Minecraft
-1.18.2 with Forge runs the DawnCraft modpack this way at about 250 FPS on an M1 Max.
-DawnCraft asks for OpenGL 4.3, so it doesn't start on Apple's OpenGL.
+### Vanilla Minecraft
+
+Vanilla Minecraft benefits from MooGL as well; on M1 Max on a scene similar to the screenshot above I observed ~380 FPS on Apple's OpenGL, and ~1,400 FPS on MooGL.
+
+1. In the Minecraft launcher, open Installations and edit the installation you play, such as Latest release (or your Iris profile).
+2. Open More options, then add this to the end of JVM arguments:
+
+    ```
+    -Dorg.lwjgl.sdl.libname=/opt/MooGL-SDK/lib/libSDL3.0.dylib -Dorg.lwjgl.opengl.libname=/opt/MooGL-SDK/lib/libmoogl.dylib
+    ```
+
+3. Start the game. The log should say using drivers: 4.6.0 MooGL, and the F3 screen shows MooGL as the renderer.
+
+Minecraft 26.3 opens its window with SDL3. Older versions down to 1.19 use GLFW: point `-Dorg.lwjgl.glfw.libname` at the SDK's `libglfw.dylib` instead of SDL3.
+
+```
+-Dorg.lwjgl.glfw.libname=/opt/MooGL-SDK/lib/libglfw.dylib -Dorg.lwjgl.opengl.libname=/opt/MooGL-SDK/lib/libmoogl.dylib
+```
+
+libglfw.dylib / libSDL3.0.dylib and libmoogl.dylib must be in the same folder.
+
+For versions lower than 1.19, see the DawnCraft section.
+
+### DawnCraft (Minecraft 1.18.2, Forge)
+
+DawnCraft doesn't work on macOS with Apple OpenGL; it closes with "Requested OpenGL version 4.3, got version 4.1." With MooGL it works.
+
+Minecraft 1.18.2 opens its window with GLFW, not SDL3. Its stock libraries also lack Apple silicon builds of LWJGL and java-objc-bridge. Prism Launcher fixes both when it sets up the instance, so use Prism rather than the Mojang launcher.
+
+1. Install Prism Launcher and sign in with your Microsoft account.
+2. Add DawnCraft: Add Instance → CurseForge, search "DawnCraft", and pick the latest version (2.0.16_hf). Prism installs Forge 40.2.17 and the 305 mods.
+3. Open the instance's Settings:
+    - Java: use Java 17 for Apple silicon (Prism can download it), and set maximum memory to 8 GB.
+    - Java arguments: add 
+      ```
+      -Dorg.lwjgl.glfw.libname=/opt/MooGL-SDK/lib/libglfw.dylib -Dorg.lwjgl.opengl.libname=/opt/MooGL-SDK/lib/libmoogl.dylib
+      ```
+4. Launch. The log line GPU: MGL (Supports OpenGL 4.6.0 MooGL ...) confirms MooGL is in use.
+
+On M1 Max I observed ~250 FPS in DawnCraft.
 
 ## Legacy OpenGL
 
@@ -160,14 +197,14 @@ cmake --build build
 Or with nothing but clang:
 
 ```bash
-SDK=/path/to/MooGL-SDK
+SDK=/opt/MooGL-SDK
 clang main.c -o triangle -I"$SDK/include" -L"$SDK/lib" -lglfw -lmoogl -Wl,-rpath,"$SDK/lib"
 ```
 
 In your own CMake project:
 
 ```cmake
-find_package(MooGL REQUIRED)                        # with -DCMAKE_PREFIX_PATH=/path/to/MooGL-SDK
+find_package(MooGL REQUIRED)                        # with -DCMAKE_PREFIX_PATH=/opt/MooGL-SDK
 target_link_libraries(my_app PRIVATE MooGL::glfw)   # GLFW and OpenGL
 ```
 
@@ -500,7 +537,7 @@ The SDK's `nuget/` folder holds `FFX_FSR2` version `1.0.3-macos`, a macOS build 
 `libffx_fsr2_api` and `libmoogl` inside. Add it and allow unsafe code:
 
 ```bash
-dotnet add package FFX_FSR2 --version 1.0.3-macos --source /path/to/MooGL-SDK/nuget
+dotnet add package FFX_FSR2 --version 1.0.3-macos --source /opt/MooGL-SDK/nuget
 ```
 
 ```xml
