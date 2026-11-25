@@ -1204,3 +1204,112 @@ GPU_TEST(tessellation, a_struct_output_passes_through_point_mode)
     glDeleteVertexArrays(1, &vao);
     mgl_target_destroy(&t);
 }
+
+// Two vertex inputs in one location through component= share the attribute.
+// The second was moved to a spare attribute as if it aliased the first, which
+// the vertex stage feeding tessellation never filled.
+GPU_TEST(tessellation, component_inputs_share_one_attribute)
+{
+    static const GLfloat attr[] = { -1,-1, 0.25f,0.5f,0.75f,1,  3,-1, 0.25f,0.5f,0.75f,1,  -1,3, 0.25f,0.5f,0.75f,1 };
+    static const char *vs =
+        "#version 450\n"
+        "layout(location = 15) in vec2 p;\n"
+        "layout(location = 0, component = 0) in vec2 lo;\n"
+        "layout(location = 0, component = 2) in vec2 hi;\n"
+        "layout(location = 0) flat out float ok;\n"
+        "void main() { ok = float(lo == vec2(0.25, 0.5) && hi == vec2(0.75, 1.0)); gl_Position = vec4(p, 0.0, 1.0); }\n";
+    static const char *tcs =
+        "#version 450\n"
+        "layout(vertices = 3) out;\n"
+        "layout(location = 0) in float ok[];\n"
+        "layout(location = 0) out float tok[];\n"
+        "void main() {\n"
+        "    tok[gl_InvocationID] = ok[gl_InvocationID];\n"
+        "    gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+        "    gl_TessLevelOuter[0] = 1.0; gl_TessLevelOuter[1] = 1.0; gl_TessLevelOuter[2] = 1.0;\n"
+        "    gl_TessLevelInner[0] = 1.0;\n"
+        "}\n";
+    static const char *tes =
+        "#version 450\n"
+        "layout(triangles, equal_spacing, ccw) in;\n"
+        "layout(location = 0) in float tok[];\n"
+        "layout(location = 0) flat out float eok;\n"
+        "void main() {\n"
+        "    eok = tok[0] * tok[1] * tok[2];\n"
+        "    gl_Position = gl_TessCoord.x * gl_in[0].gl_Position\n"
+        "                + gl_TessCoord.y * gl_in[1].gl_Position\n"
+        "                + gl_TessCoord.z * gl_in[2].gl_Position;\n"
+        "}\n";
+    static const char *gs =
+        "#version 450\n"
+        "layout(triangles) in;\n"
+        "layout(triangle_strip, max_vertices = 3) out;\n"
+        "layout(location = 0) flat in float eok[];\n"
+        "layout(location = 0) flat out float gok;\n"
+        "void main() {\n"
+        "    for (int i = 0; i < 3; i++) { gok = eok[i]; gl_Position = gl_in[i].gl_Position; EmitVertex(); }\n"
+        "}\n";
+    static const char *fs =
+        "#version 450\n"
+        "layout(location = 0) flat in float gok;\n"
+        "out vec4 o;\n"
+        "void main() { o = vec4(0.0, gok, 0.0, 1.0); }\n";
+    const char *src[5] = { vs, tcs, tes, gs, fs };
+    static const GLenum stages[5] = { GL_VERTEX_SHADER, GL_TESS_CONTROL_SHADER, GL_TESS_EVALUATION_SHADER,
+                                      GL_GEOMETRY_SHADER, GL_FRAGMENT_SHADER };
+    MGLTestTarget t;
+    GLuint prog = glCreateProgram(), vao, vbo;
+    GLint ok = 0;
+    int green;
+
+    for (int i = 0; i < 5; i++)
+    {
+        GLuint sh = compileOne(stages[i], src[i]);
+
+        CHECK_MSG(sh != 0, "stage 0x%x did not compile", stages[i]);
+        glAttachShader(prog, sh);
+        glDeleteShader(sh);
+    }
+
+    glLinkProgram(prog);
+    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    CHECK(ok);
+
+    if (!ok)
+        prog = 0;
+
+    if (!prog || !mgl_target_create(&t, 64, 64, GL_RGBA8, 0))
+    {
+        CHECK(0);
+        return;
+    }
+
+    mgl_target_bind(&t);
+    glUseProgram(prog);
+
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    glGenBuffers(1, &vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof attr, attr, GL_STATIC_DRAW);
+    glVertexAttribPointer(15, 2, GL_FLOAT, GL_FALSE, 6 * sizeof(GLfloat), 0);
+    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 6 * sizeof(GLfloat), (void *)(2 * sizeof(GLfloat)));
+    glEnableVertexAttribArray(15);
+    glEnableVertexAttribArray(0);
+
+    glViewport(0, 0, 64, 64);
+    glPatchParameteri(GL_PATCH_VERTICES, 3);
+    glClearColor(1, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArrays(GL_PATCHES, 0, 3);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+
+    green = greenPixels(&t);
+    CHECK_MSG(green == 64 * 64, "%d of 4096 pixels green - an input read from the wrong attribute", green);
+
+    glUseProgram(0);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo);
+    glDeleteProgram(prog);
+    mgl_target_destroy(&t);
+}

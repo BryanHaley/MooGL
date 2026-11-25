@@ -143,6 +143,9 @@
     each draw.
 
 ### Fixed
+- Two vertex inputs that share a location with `component=` read the same attribute. The
+  second was moved to a spare attribute as if it aliased the first, and with a geometry
+  shader it read nothing. 44 KHR-Single enhanced_layouts cases failed on this.
 - A draw after new `glBufferData` and a bind of some other buffer uses the new vertices, not
   the last draw's. Sprinting in DawnCraft left long black streaks from the particles.
 - `GL_ARB_conservative_depth` is listed, and with it a shader before GLSL 4.20 can redeclare

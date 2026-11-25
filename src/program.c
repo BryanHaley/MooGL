@@ -3243,6 +3243,7 @@ static void assignPipeLocations(Program *ptr, spvc_compiler compiler, int stage)
     const spvc_reflected_resource *list = NULL;
     size_t count = 0;
     bool used[256] = { false };
+    GLubyte comps_used[256] = { 0 };
 
     if (sh == NULL || sh->src == NULL)
         return;
@@ -3291,13 +3292,19 @@ static void assignPipeLocations(Program *ptr, spvc_compiler compiler, int stage)
                     want[i] = (GLint)binds[b].location;
         }
 
+        // a component= input only takes part of its location
+        GLuint comp = spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationComponent);
+        GLuint width = t ? spvc_type_get_vector_size(t) * (spvc_type_get_bit_width(t) == 64 ? 2 : 1) : 4;
+        GLubyte mask = (width >= 4 || comp + width > 4) ? (GLubyte)(0xf << comp) & 0xf
+                                                        : (GLubyte)(((1u << width) - 1) << comp);
+
         // a second input bound to a taken attribute moves to a spare one
         if (inputs && want[i] >= 0 && want[i] + slots[i] <= 16)
         {
             bool taken = false;
 
             for (GLuint k = 0; k < slots[i]; k++)
-                taken |= used[want[i] + k];
+                taken |= (comps_used[want[i] + k] & mask) != 0;
 
             for (GLint spare = 16; taken && spare + (GLint)slots[i] <= 31; spare++)
             {
@@ -3319,7 +3326,10 @@ static void assignPipeLocations(Program *ptr, spvc_compiler compiler, int stage)
 
         if (want[i] >= 0)
             for (GLuint k = 0; k < slots[i] && want[i] + k < 256; k++)
+            {
                 used[want[i] + k] = true;
+                comps_used[want[i] + k] |= mask;
+            }
     }
 
     for (size_t i = 0; i < count; i++)
