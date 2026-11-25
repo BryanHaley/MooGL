@@ -576,6 +576,7 @@ All of OpenGL 4.6 core, plus:
 - CGL and AGL contexts draw offscreen, into framebuffer objects. Putting one in a window, which is what `NSOpenGLView` and `NSOpenGLContext` do through Apple's private `CGLSetSurface`, isn't done yet; neither are AGL's Carbon windows, which no longer exist.
 - Apps built for Apple's OpenGL need relinking against MooGL. Drop-in replacement of the system framework is on the roadmap.
 - Mesh shaders with per-primitive `gl_Layer`: IDKEngine's mesh-shader point shadows drop a few triangles, differently from run to run. Seven smaller tests of the same pattern pass, so it looks like a Metal driver issue. The vertex-shader path is not affected.
+- Some Minecraft shaderpacks do an explicit check for macOS and refuse to run when it's detected; this is beyond MooGL's control and the shaderpack must be changed.
 
 ## Build from source
 
