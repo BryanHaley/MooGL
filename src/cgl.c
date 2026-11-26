@@ -686,8 +686,8 @@ CGLError CGLDescribeRenderer(CGLRendererInfoObj rend, GLint rend_num, CGLRendere
         case kCGLRPRegistryIDLow: *value = (GLint)(uint32_t)registry; break;
         case kCGLRPRegistryIDHigh: *value = (GLint)(uint32_t)(registry >> 32); break;
         case kCGLRPOffScreen:
-        case kCGLRPFullScreen:
         case kCGLRPRemovable: *value = 0; break;
+        case kCGLRPFullScreen:
         case kCGLRPAccelerated:
         case kCGLRPOnline:
         case kCGLRPWindow:
