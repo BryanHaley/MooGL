@@ -70,7 +70,7 @@ Shown above is Minecraft 26.3 with Fabric, Sodium, and Iris running the BetterVo
 
 ### Vanilla Minecraft
 
-Vanilla Minecraft benefits from MooGL as well; on M1 Max on a scene similar to the screenshot rendered at ~380 FPS on Apple's OpenGL and ~1,400 FPS on MooGL.
+Vanilla Minecraft benefits from MooGL as well; on M1 Max on a scene similar to the screenshot rendered at ~380 FPS on Apple's OpenGL and ~1,400 FPS on MooGL. In more complex scenes, a much more modest increase of 10-20 FPS can be observed.
 
 1. In the Minecraft launcher, open **Installations** and edit the installation you play, such as **Latest release** (or your Iris profile).
 2. Open **More options**, then add this to the end of **JVM arguments**:
@@ -107,7 +107,7 @@ Minecraft 1.18.2 opens its window with GLFW, not SDL3. Its stock libraries also 
       ```
 4. Launch. The log line `GPU: MGL (Supports OpenGL 4.6.0 MooGL ...)` confirms MooGL is in use.
 
-On M1 Max I observed ~250 FPS in DawnCraft.
+In DawnCraft on M1 Max ~250 FPS can be expected in simple scenes and ~120 FPS in more complex scenes.
 
 ## Legacy OpenGL
 
