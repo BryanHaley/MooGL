@@ -2460,6 +2460,11 @@ static bool isRGB32BufferFormat(GLenum f)
         return NULL;
     }
 
+    // GL leaves these undefined, but Mac drivers hand them out zeroed and
+    // games show whatever is left in them (Half-Life's menu showed magenta)
+    if (tex->target == GL_RENDERBUFFER || wants_multisample)
+        [self zeroNewTarget: texture];
+
     if ((tex->dirty_bits & DIRTY_TEXTURE_DATA) && tex->samples <= 1)
     {
         MGL_NSDEBUG(@"MGL DEBUG: DIRTY_TEXTURE_DATA detected - attempting texture filling");
@@ -3038,18 +3043,6 @@ static bool isRGB32BufferFormat(GLenum f)
                     uint8_t *properData = (uint8_t *)calloc(fillSize, 1);
 
                     if (properData) {
-                        // Initialize with safe texture data (transparent black with alpha = 0)
-                        for (NSUInteger y = 0; y < properRegion.size.height; y++) {
-                            uint8_t *row = properData + (y * properBytesPerRow);
-                            for (NSUInteger x = 0; x < properRegion.size.width; x++) {
-                                uint8_t *pixel = row + (x * pixelSize);
-                                pixel[0] = 0;  // R
-                                pixel[1] = 0;  // G
-                                pixel[2] = 0;  // B
-                                pixel[3] = 255; // A = fully opaque
-                            }
-                        }
-
                         @try {
                             MGL_NSINFO(@"MGL INFO: Performing Metal-compliant texture fill:");
                             MGL_NSDEBUG(@"  - Region: %dx%d", (int)properRegion.size.width, (int)properRegion.size.height);
@@ -4901,6 +4894,45 @@ static bool mtlFormatIsStencil(MTLPixelFormat f)
     return f == MTLPixelFormatStencil8 ||
            f == MTLPixelFormatDepth32Float_Stencil8 ||
            f == MTLPixelFormatX32_Stencil8;
+}
+
+// Its own command buffer, committed now, so it runs before anything queued
+// that draws into the texture.
+- (void) zeroNewTarget: (id<MTLTexture>) t
+{
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+
+    if (mtlFormatIsDepth(t.pixelFormat) || mtlFormatIsStencil(t.pixelFormat))
+    {
+        if (mtlFormatIsDepth(t.pixelFormat))
+        {
+            rp.depthAttachment.texture = t;
+            rp.depthAttachment.loadAction = MTLLoadActionClear;
+            rp.depthAttachment.clearDepth = 0.0;
+            rp.depthAttachment.storeAction = MTLStoreActionStore;
+        }
+        if (mtlFormatIsStencil(t.pixelFormat))
+        {
+            rp.stencilAttachment.texture = t;
+            rp.stencilAttachment.loadAction = MTLLoadActionClear;
+            rp.stencilAttachment.clearStencil = 0;
+            rp.stencilAttachment.storeAction = MTLStoreActionStore;
+        }
+    }
+    else
+    {
+        rp.colorAttachments[0].texture = t;
+        rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+        rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    }
+
+    if (t.arrayLength > 1)
+        rp.renderTargetArrayLength = t.arrayLength;
+
+    id<MTLCommandBuffer> cb = [_commandQueue commandBuffer];
+    [[cb renderCommandEncoderWithDescriptor: rp] endEncoding];
+    [cb commit];
 }
 
 // Metal resolves a multisample texture by ending a render pass on it, so a

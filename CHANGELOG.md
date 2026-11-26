@@ -143,6 +143,10 @@
     each draw.
 
 ### Fixed
+- New renderbuffers and multisample textures start out zeroed, as on Apple's driver. They
+  held whatever memory was there before, and games that don't clear them showed it
+  (Half-Life's menu was magenta). New textures also no longer get an opaque black pixel at
+  (0, 0).
 - Two vertex inputs that share a location with `component=` read the same attribute. The
   second was moved to a spare attribute as if it aliased the first, and with a geometry
   shader it read nothing. 44 KHR-Single enhanced_layouts cases failed on this.
