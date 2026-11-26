@@ -2460,11 +2460,8 @@ static bool isRGB32BufferFormat(GLenum f)
         return NULL;
     }
 
-    // GL leaves these undefined, but Mac drivers hand them out zeroed and
-    // games show whatever is left in them (Half-Life's menu showed magenta)
-    if (tex->target == GL_RENDERBUFFER || wants_multisample)
-        [self zeroNewTarget: texture];
-
+    // GL leaves a texture without data undefined, but Mac drivers hand it out
+    // zeroed and games show whatever is left in it (Half-Life's menu showed magenta)
     if ((tex->dirty_bits & DIRTY_TEXTURE_DATA) && tex->samples <= 1)
     {
         MGL_NSDEBUG(@"MGL DEBUG: DIRTY_TEXTURE_DATA detected - attempting texture filling");
@@ -2877,374 +2874,10 @@ static bool isRGB32BufferFormat(GLenum f)
             [self commitUpload: _uploadBatch];
         _uploadBatch = nil;
     }
-    else
+    else if (!tex->sparse)
     {
-        // PROPER FIX: Enable texture filling with AGX safety and proper memory alignment
-        MGL_NSINFO(@"MGL INFO: PROPER FIX - Processing texture fill (tex=%d, dims=%lux%lu)", tex->name, (unsigned long)texture.width, (unsigned long)texture.height);
-
-        MTLPixelFormat pf = texture.pixelFormat;
-        bool depth_or_stencil = pf == MTLPixelFormatDepth16Unorm || pf == MTLPixelFormatDepth32Float ||
-                                pf == MTLPixelFormatDepth32Float_Stencil8 ||
-                                pf == MTLPixelFormatStencil8;
-
-        // a buffer copied into depth or stencil has to say which plane, and
-        // this fill does not; what it wrote stayed behind the next copy in
-        if (depth_or_stencil) {
-            MGL_NSINFO(@"MGL INFO: no fill for a depth or stencil texture");
-        } else
-        if (texture.width == 0 || texture.height == 0 || texture.width > 16384 || texture.height > 16384) {
-            MGL_NSERR(@"MGL WARNING: Skipping texture fill due to invalid dimensions: %lux%lu", (unsigned long)texture.width, (unsigned long)texture.height);
-        } else {
-            // Determine pixel format size to create appropriate black data
-            NSUInteger bytesPerPixel = 4; // Default to RGBA
-            switch(texture.pixelFormat) {
-                case MTLPixelFormatR8Unorm:
-                case MTLPixelFormatR8Uint:
-                case MTLPixelFormatR8Sint:
-                    bytesPerPixel = 1;
-                    break;
-                case MTLPixelFormatRG8Unorm:
-                case MTLPixelFormatRG8Uint:
-                case MTLPixelFormatRG8Sint:
-                    bytesPerPixel = 2;
-                    break;
-                case MTLPixelFormatRGBA8Unorm:
-                case MTLPixelFormatRGBA8Uint:
-                case MTLPixelFormatRGBA8Sint:
-                    bytesPerPixel = 4;
-                    break;
-                default:
-                    bytesPerPixel = 4; // Default assumption
-                    break;
-            }
-
-            // Calculate dynamic alignment for Metal textures based on pixel format
-            NSUInteger bytesPerRow = texture.width * bytesPerPixel;
-            NSUInteger alignment = [self getOptimalAlignmentForPixelFormat:texture.pixelFormat];
-            if (bytesPerRow % alignment != 0) {
-                bytesPerRow = ((bytesPerRow + alignment - 1) / alignment) * alignment;
-            }
-
-            NSUInteger dataSize = bytesPerRow * texture.height;
-
-            // Validate that dataSize is reasonable (not too large)
-            if (dataSize > 64 * 1024 * 1024) { // 64MB limit per texture level
-                MGL_NSERR(@"MGL WARNING: Skipping texture fill due to excessive size: %lu bytes", (unsigned long)dataSize);
-            } else {
-                // Allocate aligned black data and clear the texture
-                void *blackData = mgl_aligned_alloc(alignment, dataSize);
-                if (blackData) {
-                    // CRITICAL SECURITY FIX: Comprehensive validation to prevent Metal driver crashes
-                    memset(blackData, 0, dataSize); // Clear to black
-
-                    // Multi-layer validation for all parameters
-                    if (!blackData) {
-                        MGL_NSERR(@"MGL SECURITY ERROR: blackData is NULL after memset - CORRUPTION DETECTED");
-                        return texture;
-                    }
-                    if (bytesPerRow == 0) {
-                        MGL_NSERR(@"MGL SECURITY ERROR: Invalid bytesPerRow (0) for texture fill");
-                        free(blackData);
-                        return texture;
-                    }
-                    if (dataSize == 0) {
-                        MGL_NSERR(@"MGL SECURITY ERROR: Invalid dataSize (0) for texture fill");
-                        free(blackData);
-                        return texture;
-                    }
-                    if (!texture) {
-                        MGL_NSERR(@"MGL SECURITY ERROR: Metal texture is NULL");
-                        free(blackData);
-                        return texture;
-                    }
-                    if (texture.width == 0 || texture.height == 0) {
-                        MGL_NSERR(@"MGL SECURITY ERROR: Invalid texture dimensions %lux%lu", (unsigned long)texture.width, (unsigned long)texture.height);
-                        free(blackData);
-                        return texture;
-                    }
-
-                    // Additional validation: verify blackData contains expected zeros (anti-corruption check)
-                    uint8_t *bytes = (uint8_t *)blackData;
-                    bool dataCorrupted = false;
-                    for (NSUInteger i = 0; i < MIN(dataSize, 1024); i++) { // Check first 1KB only for performance
-                        if (bytes[i] != 0) {
-                            dataCorrupted = true;
-                            break;
-                        }
-                    }
-                    if (dataCorrupted) {
-                        MGL_NSERR(@"MGL SECURITY ERROR: blackData corruption detected - memory safety issue");
-                        free(blackData);
-                        return texture;
-                    }
-
-                    MGL_NSINFO(@"MGL INFO: All validations passed for texture fill (size=%lu, bytesPerRow=%lu)", (unsigned long)dataSize, (unsigned long)bytesPerRow);
-
-                    // ULTRA-DEFENSIVE: Final validation immediately before Metal API call
-                    // This prevents race conditions and memory corruption between validation and use
-                    if (!blackData) {
-                        MGL_NSERR(@"MGL CRITICAL ERROR: blackData became NULL before Metal call - RACE CONDITION DETECTED");
-                        free(blackData);
-                        return texture;
-                    }
-                    if (!texture) {
-                        MGL_NSERR(@"MGL CRITICAL ERROR: Metal texture became NULL before Metal call - RACE CONDITION DETECTED");
-                        free(blackData);
-                        return texture;
-                    }
-                    if (bytesPerRow == 0 || dataSize == 0) {
-                        MGL_NSERR(@"MGL CRITICAL ERROR: Parameters became invalid before Metal call - RACE CONDITION DETECTED");
-                        free(blackData);
-                        return texture;
-                    }
-
-                    // Additional verification: Check if Metal texture is still valid
-                    if (texture.width == 0 || texture.height == 0) {
-                        MGL_NSERR(@"MGL CRITICAL ERROR: Metal texture dimensions became invalid before Metal call");
-                        free(blackData);
-                        return texture;
-                    }
-
-                    // Final integrity check: Verify blackData still contains expected zeros
-                    uint8_t *finalCheck = (uint8_t *)blackData;
-                    bool finalCorruption = false;
-                    for (NSUInteger i = 0; i < MIN(dataSize, 256); i++) { // Check first 256 bytes
-                        if (finalCheck[i] != 0) {
-                            finalCorruption = true;
-                            break;
-                        }
-                    }
-                    if (finalCorruption) {
-                        MGL_NSERR(@"MGL CRITICAL ERROR: Memory corruption detected immediately before Metal call");
-                        free(blackData);
-                        return texture;
-                    }
-
-                    MGL_NSINFO(@"MGL INFO: FIXING: Implementing proper texture filling for Apple Metal compatibility");
-
-                    // PROPER FIX: Use Apple Metal-compatible texture filling approach
-                    // The issue was using incorrect bytesPerRow and region parameters
-                    MGL_NSINFO(@"MGL INFO: Implementing Metal-compliant texture fill operations");
-
-                    // Use Metal's standard pattern for texture filling
-                    NSUInteger pixelSize = 4;  // RGBA = 4 bytes per pixel
-                    NSUInteger properBytesPerRow = width * pixelSize;
-
-                    // Ensure proper alignment for Apple Metal driver
-                    if (properBytesPerRow % 64 != 0) {
-                        properBytesPerRow = ((properBytesPerRow + 63) / 64) * 64;
-                    }
-
-                    // Use proper Metal region covering the entire texture for proper initialization
-                    MTLRegion properRegion = MTLRegionMake2D(0, 0, MIN(width, 1), MIN(height, 1));
-
-                    // Create properly aligned texture data buffer
-                    NSUInteger fillSize = properBytesPerRow * properRegion.size.height;
-                    uint8_t *properData = (uint8_t *)calloc(fillSize, 1);
-
-                    if (properData) {
-                        // Initialize with safe texture data (transparent black with alpha = 0)
-                        for (NSUInteger y = 0; y < properRegion.size.height; y++) {
-                            uint8_t *row = properData + (y * properBytesPerRow);
-                            for (NSUInteger x = 0; x < properRegion.size.width; x++) {
-                                uint8_t *pixel = row + (x * pixelSize);
-                                pixel[0] = 0;  // R
-                                pixel[1] = 0;  // G
-                                pixel[2] = 0;  // B
-                                pixel[3] = 255; // A = fully opaque
-                            }
-                        }
-
-                        @try {
-                            MGL_NSINFO(@"MGL INFO: Performing Metal-compliant texture fill:");
-                            MGL_NSDEBUG(@"  - Region: %dx%d", (int)properRegion.size.width, (int)properRegion.size.height);
-                            MGL_NSDEBUG(@"  - bytesPerRow: %lu", (unsigned long)properBytesPerRow);
-                            MGL_NSDEBUG(@"  - dataSize: %lu", (unsigned long)fillSize);
-
-                            // ALTERNATIVE APPROACH: Safe texture filling without replaceRegion
-                            MGL_NSINFO(@"MGL INFO: Using alternative texture filling methods (AGX-safe)");
-
-                            @try {
-                                // ALTERNATIVE 1: Try MTLBuffer-to-texture copy approach
-                                if (properData && dataSize > 0) {
-                                    MGL_NSINFO(@"MGL INFO: Attempting buffer-based texture fill");
-
-                                    // Create a temporary MTLBuffer with the texture data
-                                    // properData only holds fillSize bytes -- handing Metal the
-                                    // whole texture size here read far past the allocation
-                                    id<MTLBuffer> tempBuffer = [_device newBufferWithBytes:properData
-                                                                                    length:fillSize
-                                                                                   options:MTLResourceStorageModeShared];
-
-                                    if (tempBuffer) {
-                                        MGL_NSINFO(@"MGL INFO: Created temporary MTLBuffer for texture data");
-
-                                        // IMMEDIATE APPROACH: Use immediate command buffer for texture filling
-                                    @try {
-                                        MGL_NSINFO(@"MGL INFO: Creating immediate command buffer for texture fill");
-
-                                        // PROPER FIX: Skip expensive texture operations during AGX recovery
-                                        if ([self shouldSkipGPUOperations]) {
-                                            MGL_NSINFO(@"MGL AGX: Skipping texture fill during recovery - texture will be empty");
-                                            // Texture will remain empty but won't cause AGX errors
-                                            goto skip_texture_fill;
-                                        }
-
-                                        // PROPER FIX: Simplified texture fill that avoids AGX issues
-                                        @try {
-                                            // Use the main command buffer instead of creating separate ones
-                                            // This prevents command buffer proliferation that triggers AGX rejections
-                                            if (!_currentCommandBuffer) {
-                                                MGL_NSINFO(@"MGL AGX: No command buffer available for texture fill");
-                                                goto skip_texture_fill;
-                                            }
-
-                                            // CRITICAL FIX: End active render encoder before creating blit encoder
-                                            // A command buffer of its own, committed now, runs ahead of
-                                            // the current one and leaves its render encoder alone: a texture
-                                            // made in the middle of a draw's setup used to end that draw's
-                                            // encoder, and the draw was then dropped.
-                                            id<MTLCommandBuffer> fillBuffer = [_commandQueue commandBuffer];
-
-                                            if (!fillBuffer)
-                                                goto skip_texture_fill;
-
-                                            id<MTLBlitCommandEncoder> blitEncoder = [fillBuffer blitCommandEncoder];
-                                            if (blitEncoder) {
-                                                [blitEncoder copyFromBuffer:tempBuffer
-                                                          sourceOffset:0
-                                                  sourceBytesPerRow:properBytesPerRow
-                                                sourceBytesPerImage:fillSize
-                                                         sourceSize:MTLSizeMake(properRegion.size.width, properRegion.size.height, 1)
-                                                          toTexture:texture
-                                                   destinationSlice:0
-                                                   destinationLevel:0
-                                                  destinationOrigin:MTLOriginMake(0, 0, 0)];
-                                                [blitEncoder endEncoding];
-
-                                                [fillBuffer commit];
-                                            } else {
-                                                MGL_NSERR(@"MGL WARNING: Failed to create blit encoder - texture will be empty");
-                                            }
-                                        } @catch (NSException *exception) {
-                                            MGL_NSERR(@"MGL WARNING: Texture fill failed - continuing with empty texture: %@", exception);
-                                        }
-
-                                        skip_texture_fill:; // Label for early exit
-                                    } @catch (NSException *exception) {
-                                        MGL_NSERR(@"MGL ERROR: Immediate texture fill failed: %@", exception.reason);
-
-                                        // FALLBACK: Try using existing command buffer without immediate execution
-                                        if (_currentCommandBuffer) {
-                                            // CRITICAL FIX: Enhanced command buffer validation for fallback texture creation
-                                            MTLCommandBufferStatus cmdStatus = _currentCommandBuffer.status;
-                                            if (cmdStatus >= MTLCommandBufferStatusCommitted) {
-                                                MGL_NSINFO(@"MGL AGX: Fallback command buffer already committed (status: %ld) - creating new", (long)cmdStatus);
-                                                _currentCommandBuffer = [_commandQueue commandBuffer];
-                                                if (!_currentCommandBuffer) {
-                                                    MGL_NSINFO(@"MGL AGX: Failed to create fallback command buffer");
-                                                    goto cleanup_temp_buffer;
-                                                }
-                                            }
-
-                                            // CRITICAL FIX: End active render encoder before creating blit encoder
-                                            BOOL hadRenderEncoder = (_currentRenderEncoder != nil);
-                                            if (hadRenderEncoder) {
-                                                MGL_NSINFO(@"MGL INFO: Ending render encoder temporarily for fallback texture blit");
-                                                [_currentRenderEncoder endEncoding];
-                                                _currentRenderEncoder = nil;
-                                                [self copyBackImageShadows];
-                                            }
-
-                                            id<MTLBlitCommandEncoder> blitEncoder = [self newBlitEncoder];
-                                            if (blitEncoder) {
-                                                [blitEncoder copyFromBuffer:tempBuffer
-                                                          sourceOffset:0
-                                                  sourceBytesPerRow:properBytesPerRow
-                                                sourceBytesPerImage:fillSize
-                                                         sourceSize:MTLSizeMake(properRegion.size.width, properRegion.size.height, 1)
-                                                          toTexture:texture
-                                                   destinationSlice:0
-                                                   destinationLevel:0
-                                                  destinationOrigin:MTLOriginMake(0, 0, 0)];
-                                                [blitEncoder endEncoding];
-
-                                                MGL_NSERR(@"MGL WARNING: Fallback texture fill enqueued on existing command buffer");
-                                            }
-                                        }
-                                    }
-
-                                    cleanup_temp_buffer:
-                                        // Clean up the temporary buffer
-                                        tempBuffer = nil;
-                                    }
-                                }
-                            } @catch (NSException *exception) {
-                                MGL_NSERR(@"MGL WARNING: Buffer-based texture fill failed - trying alternative");
-
-                                // ALTERNATIVE 2: Simple direct color filling for basic cases
-                                if (width <= 512 && height <= 512 && tex->internalformat == GL_RGBA8) {
-                                    MGL_NSINFO(@"MGL INFO: Attempting simple direct color fill for small RGBA8 texture");
-
-                                    @try {
-                                        // Create a simple pattern that's not magenta
-                                        NSUInteger pixelCount = width * height;
-                                        uint32_t *simpleData = calloc(pixelCount, sizeof(uint32_t));
-
-                                        if (simpleData) {
-                                            // Create a simple gradient pattern instead of magenta
-                                            for (NSUInteger y = 0; y < height; y++) {
-                                                for (NSUInteger x = 0; x < width; x++) {
-                                                    NSUInteger index = y * width + x;
-
-                                                    // Create a simple gradient from blue to green
-                                                    uint8_t r = (uint8_t)(x * 255 / width);
-                                                    uint8_t g = (uint8_t)(y * 255 / height);
-                                                    uint8_t b = 128;
-                                                    uint8_t a = 255;
-
-                                                    simpleData[index] = (a << 24) | (b << 16) | (g << 8) | r;
-                                                }
-                                            }
-
-                                            // Try direct replaceRegion for simple cases
-                                            MTLRegion simpleRegion = MTLRegionMake2D(0, 0, width, height);
-                                            [texture replaceRegion:simpleRegion
-                                                    mipmapLevel:0
-                                                          slice:0
-                                                      withBytes:simpleData
-                                                    bytesPerRow:width * sizeof(uint32_t)
-                                                  bytesPerImage:width * height * sizeof(uint32_t)];
-
-                                            MGL_NSINFO(@"MGL SUCCESS: Simple direct color fill completed");
-                                            free(simpleData);
-                                        }
-                                    } @catch (NSException *exception) {
-                                        MGL_NSERR(@"MGL WARNING: Simple direct fill also failed: %@", exception.reason);
-                                    }
-                                } else {
-                                    MGL_NSINFO(@"MGL INFO: Skipping complex texture - would use deferred initialization");
-                                }
-                            }
-                        } @catch (NSException *exception) {
-                            MGL_NSERR(@"MGL ERROR: Metal texture fill failed - investigating root cause");
-                            MGL_NSERR(@"MGL ERROR: Exception: %@ (Reason: %@)", exception.name, exception.reason);
-                            MGL_NSINFO(@"MGL INFO: This indicates our parameters are still incompatible with AGX driver");
-                        }
-
-                        free(properData);
-                    } else {
-                        MGL_NSERR(@"MGL ERROR: Failed to allocate properly aligned texture data");
-                    }
-
-                    // only the error paths above let go of it, and a render
-                    // target made this way kept its full size for good
-                    free(blackData);
-                } else {
-                    MGL_NSERR(@"MGL ERROR: Failed to allocate aligned memory for texture fill (%lu bytes)", (unsigned long)dataSize);
-                }
-            }
-        }
+        // a sparse texture only has memory where the app commits it
+        [self zeroNewTexture: texture];
     }
 
     tex->dirty_bits = 0;
@@ -4908,42 +4541,107 @@ static bool mtlFormatIsStencil(MTLPixelFormat f)
            f == MTLPixelFormatX32_Stencil8;
 }
 
-// Its own command buffer, committed now, so it runs before anything queued
-// that draws into the texture.
-- (void) zeroNewTarget: (id<MTLTexture>) t
+// Every level and layer, in a command buffer of its own committed now, so it
+// runs before anything queued that uses the texture.
+- (void) zeroNewTexture: (id<MTLTexture>) t
 {
-    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    MTLPixelFormat pf = t.pixelFormat;
+    bool depth = mtlFormatIsDepth(pf), stencil = mtlFormatIsStencil(pf);
+    bool is3D = t.textureType == MTLTextureType3D;
+    bool is1D = t.textureType == MTLTextureType1D || t.textureType == MTLTextureType1DArray;
+    bool cube = t.textureType == MTLTextureTypeCube || t.textureType == MTLTextureTypeCubeArray;
+    NSUInteger slices = t.arrayLength * (cube ? 6 : 1);
+    id<MTLCommandBuffer> cb = [_commandQueue commandBuffer];
 
-    if (mtlFormatIsDepth(t.pixelFormat) || mtlFormatIsStencil(t.pixelFormat))
+    if ((t.usage & MTLTextureUsageRenderTarget) && !is1D)
     {
-        if (mtlFormatIsDepth(t.pixelFormat))
+        for (NSUInteger level = 0; level < t.mipmapLevelCount; level++)
         {
-            rp.depthAttachment.texture = t;
-            rp.depthAttachment.loadAction = MTLLoadActionClear;
-            rp.depthAttachment.clearDepth = 0.0;
-            rp.depthAttachment.storeAction = MTLStoreActionStore;
+            NSUInteger planes = is3D ? MAX(t.depth >> level, 1) : 1;
+
+            for (NSUInteger plane = 0; plane < planes; plane++)
+            {
+                MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+                MTLRenderPassAttachmentDescriptor *a[3] = { nil, nil, nil };
+
+                if (depth)
+                {
+                    rp.depthAttachment.clearDepth = 0.0;
+                    a[0] = rp.depthAttachment;
+                }
+                if (stencil)
+                {
+                    rp.stencilAttachment.clearStencil = 0;
+                    a[1] = rp.stencilAttachment;
+                }
+                if (!depth && !stencil)
+                {
+                    rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+                    a[2] = rp.colorAttachments[0];
+                }
+                for (int i = 0; i < 3; i++)
+                {
+                    if (!a[i])
+                        continue;
+                    a[i].texture = t;
+                    a[i].level = level;
+                    a[i].depthPlane = plane;
+                    a[i].loadAction = MTLLoadActionClear;
+                    a[i].storeAction = MTLStoreActionStore;
+                }
+                if (slices > 1)
+                    rp.renderTargetArrayLength = slices;
+
+                [[cb renderCommandEncoderWithDescriptor: rp] endEncoding];
+            }
         }
-        if (mtlFormatIsStencil(t.pixelFormat))
+    }
+    else if (!depth && !stencil && t.sampleCount == 1)
+    {
+        const MGLFormatDesc *d = mglFormatDescForMetal(pf);
+        NSUInteger bw = d->block_w ? d->block_w : 1, bh = d->block_h ? d->block_h : 1;
+
+        if (d->bytes_per_block == 0)
+            return;
+
+        // rows of zeros copied in bands, so one small buffer does any size
+        const NSUInteger band_bytes = 4 << 20;
+        NSUInteger row_bytes = ((t.width + bw - 1) / bw) * d->bytes_per_block;
+        id<MTLBuffer> zeros = [_device newBufferWithLength: MAX(band_bytes, row_bytes)
+                                                   options: MTLResourceStorageModePrivate];
+        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+
+        [blit fillBuffer: zeros range: NSMakeRange(0, zeros.length) value: 0];
+
+        for (NSUInteger level = 0; level < t.mipmapLevelCount; level++)
         {
-            rp.stencilAttachment.texture = t;
-            rp.stencilAttachment.loadAction = MTLLoadActionClear;
-            rp.stencilAttachment.clearStencil = 0;
-            rp.stencilAttachment.storeAction = MTLStoreActionStore;
+            NSUInteger w = MAX(t.width >> level, 1), h = MAX(t.height >> level, 1);
+            NSUInteger planes = is3D ? MAX(t.depth >> level, 1) : 1;
+            NSUInteger pitch = ((w + bw - 1) / bw) * d->bytes_per_block;
+            NSUInteger band = MAX(zeros.length / pitch, 1) * bh;
+
+            for (NSUInteger slice = 0; slice < slices; slice++)
+                for (NSUInteger plane = 0; plane < planes; plane++)
+                    for (NSUInteger y = 0; y < h; y += band)
+                    {
+                        NSUInteger rows = MIN(band, h - y);
+
+                        [blit copyFromBuffer: zeros
+                                sourceOffset: 0
+                           sourceBytesPerRow: pitch
+                         sourceBytesPerImage: pitch * ((rows + bh - 1) / bh)
+                                  sourceSize: MTLSizeMake(w, rows, 1)
+                                   toTexture: t
+                            destinationSlice: slice
+                            destinationLevel: level
+                           destinationOrigin: MTLOriginMake(0, y, plane)];
+                    }
         }
+        [blit endEncoding];
     }
     else
-    {
-        rp.colorAttachments[0].texture = t;
-        rp.colorAttachments[0].loadAction = MTLLoadActionClear;
-        rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
-        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-    }
+        return;
 
-    if (t.arrayLength > 1)
-        rp.renderTargetArrayLength = t.arrayLength;
-
-    id<MTLCommandBuffer> cb = [_commandQueue commandBuffer];
-    [[cb renderCommandEncoderWithDescriptor: rp] endEncoding];
     [cb commit];
 }
 
@@ -8178,6 +7876,8 @@ static char clearColorKind(MTLPixelFormat f)
     [_currentRenderEncoder setDepthStencilState: [_device newDepthStencilStateWithDescriptor: dsd]];
     [_currentRenderEncoder setStencilReferenceValue: _scissorClearStencil & 0xFF];
     [_currentRenderEncoder setCullMode: MTLCullModeNone];
+    [_currentRenderEncoder setTriangleFillMode: MTLTriangleFillModeFill];
+    [_currentRenderEncoder setDepthBias: 0 slopeScale: 0 clamp: 0];
     {
         // as many viewports as there are scissor boxes, all the whole target
         MTLViewport full[MAX_VIEWPORTS];
@@ -14252,6 +13952,14 @@ void mtlSetView(GLMContext glm_ctx, void *view)
     }
 }
 
+// for CGL: see mtlSetView: sublayer:
+void mtlSetSublayerView(GLMContext glm_ctx, void *view)
+{
+    @autoreleasepool {
+        [(__bridge id) glm_ctx->mtl_funcs.mtlObj mtlSetView: (__bridge NSView *)view sublayer: true];
+    }
+}
+
 #pragma mark C interface to sparse textures
 bool mtlSparseTileSize(GLMContext glm_ctx, GLenum target, GLenum internalformat, GLsizei samples, GLuint size[3])
 {
@@ -14952,7 +14660,9 @@ static const char *presentMSL =
 
         [self endRenderEncoding];
 
-        if (ctx->swap_interval == 0 && _lastDefaultTarget != nil && _layer != nil && [self queueFrameForPresent])
+        // single buffered keeps drawing into what it showed, so it gets a copy
+        if (ctx->swap_interval == 0 && !ctx->present_on_flush && _lastDefaultTarget != nil && _layer != nil &&
+            [self queueFrameForPresent])
             return;
 
         // vsync back on: what the present queue still holds goes first
@@ -15733,10 +15443,10 @@ static bool isCombinedDepthStencil(MTLPixelFormat f)
 
     uint32_t r[4] = { (uint32_t)region.origin.x, (uint32_t)region.origin.y, (uint32_t)w, (uint32_t)h };
 
-    if (_currentCommandBuffer == nil)
-        [self newCommandBuffer];
+    [self endRenderEncoding];
+    [self endComputeEncoding];
 
-    id<MTLComputeCommandEncoder> enc = [_currentCommandBuffer computeCommandEncoder];
+    id<MTLComputeCommandEncoder> enc = [[self liveCommandBuffer] computeCommandEncoder];
 
     [enc setComputePipelineState: pso];
     [enc setTexture: view atIndex: 0];
@@ -17740,6 +17450,13 @@ static CGFloat viewScale(NSView *view)
 // does. Needs the main thread, like any AppKit view change.
 - (void) mtlSetView: (NSView *) view
 {
+    [self mtlSetView: view sublayer: false];
+}
+
+// As a sublayer, the view keeps a layer of its own: an NSOpenGLView will
+// not give up AppKit's, so CGL puts MooGL's on top of it.
+- (void) mtlSetView: (NSView *) view sublayer: (bool) sublayer
+{
     if (view == _view || _layer == nil)
         return;
 
@@ -17752,8 +17469,16 @@ static CGFloat viewScale(NSView *view)
     [CATransaction setDisableActions: YES];
     if (_view.layer == _layer)
         [_view setLayer: nil];
+    [_layer removeFromSuperlayer];
     _view = view;
-    if (view)
+    if (view && sublayer)
+    {
+        [view setWantsLayer: YES];
+        [view.layer addSublayer: _layer];
+        // Apple's GL surfaces are not colour matched: values go to the display as is
+        _layer.colorspace = [[[view window] colorSpace] CGColorSpace];
+    }
+    else if (view)
     {
         [view setLayer: _layer];
         [view setWantsLayer: YES];
@@ -17796,10 +17521,10 @@ static CGFloat viewScale(NSView *view)
 
 // What the GPU can actually do, asked of Metal.
 //
-// getMacOSDefaults fills most of state.var by opening Apple's OpenGL framework
-// and copying its answers. That works for the things both drivers share, but it
-// reports Apple's 4.1 limits -- which say nothing at all about compute, since
-// 4.1 has none. Anything Metal knows for itself is overwritten here.
+// getMacOSDefaults fills most of state.var with what Apple's 4.1 driver
+// answered. That works for the things both drivers share, but 4.1's limits say
+// nothing at all about compute, since 4.1 has none. Anything Metal knows for
+// itself is overwritten here.
 - (void) queryDeviceLimits: (GLMContext) glm_ctx
 {
     if (!_device || !glm_ctx)
@@ -17921,7 +17646,7 @@ static CGFloat viewScale(NSView *view)
 
     MGL_NSINFO(@"MGL INFO: Metal device created: %@", _device);
 
-    // getMacOSDefaults already ran and filled state.var from Apple's GL driver.
+    // getMacOSDefaults already ran and filled state.var with Apple's driver's values.
     // Anything Metal can answer for itself is more accurate, so it wins.
     [self queryDeviceLimits: glm_ctx];
 

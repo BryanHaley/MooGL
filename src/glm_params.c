@@ -25,61 +25,209 @@
 
 GLuint mglNumExtensions(void);
 
-#include <unistd.h>
-#include <dlfcn.h>
-#include <OpenGL/OpenGL.h>
+#include <string.h>
 
 typedef struct GLMContextRec_t *GLMContext;
 
+// What Apple's 4.1 core driver answered for each of the queries below, on
+// macOS 27. Queries it answered with an error are left out, and write nothing.
+static const struct {
+    GLenum pname;
+    char type;      // i integer, f float, d double, b boolean
+    int count;
+    double values[4];
+} apple_values[] = {
+    { GL_POINT_SIZE, 'f', 1, { 1.0 } },
+    { GL_POINT_SIZE_RANGE, 'i', 2, { 1, 64 } },
+    { GL_POINT_SIZE_GRANULARITY, 'i', 1, { 0 } },
+    { GL_LINE_WIDTH, 'f', 1, { 1.0 } },
+    { GL_LINE_WIDTH_RANGE, 'i', 2, { 1, 1 } },
+    { GL_LINE_WIDTH_GRANULARITY, 'i', 1, { 0 } },
+    { GL_POLYGON_MODE, 'i', 2, { 6914, 6914 } },
+    { GL_CULL_FACE_MODE, 'i', 1, { 1029 } },
+    { GL_FRONT_FACE, 'i', 1, { 2305 } },
+    { GL_DEPTH_RANGE, 'd', 2, { 0.0, 1.0 } },
+    { GL_DEPTH_WRITEMASK, 'b', 1, { 1 } },
+    { GL_DEPTH_CLEAR_VALUE, 'd', 1, { 1.0 } },
+    { GL_DEPTH_FUNC, 'i', 1, { 513 } },
+    { GL_STENCIL_CLEAR_VALUE, 'i', 1, { 0 } },
+    { GL_STENCIL_FUNC, 'i', 1, { 519 } },
+    { GL_STENCIL_VALUE_MASK, 'i', 1, { -1 } },
+    { GL_STENCIL_FAIL, 'i', 1, { 7680 } },
+    { GL_STENCIL_PASS_DEPTH_FAIL, 'i', 1, { 7680 } },
+    { GL_STENCIL_PASS_DEPTH_PASS, 'i', 1, { 7680 } },
+    { GL_STENCIL_REF, 'i', 1, { 0 } },
+    { GL_STENCIL_WRITEMASK, 'i', 1, { -1 } },
+    { GL_VIEWPORT, 'f', 4, { 0.0, 0.0, 0.0, 0.0 } },
+    { GL_BLEND_DST, 'i', 1, { 0 } },
+    { GL_BLEND_SRC, 'i', 1, { 1 } },
+    { GL_LOGIC_OP_MODE, 'i', 1, { 5379 } },
+    { GL_DRAW_BUFFER, 'i', 1, { 0 } },
+    { GL_READ_BUFFER, 'i', 1, { 0 } },
+    { GL_SCISSOR_BOX, 'i', 4, { 0, 0, 0, 0 } },
+    { GL_COLOR_CLEAR_VALUE, 'f', 4, { 0.0, 0.0, 0.0, 0.0 } },
+    { GL_COLOR_WRITEMASK, 'b', 4, { 1, 1, 1, 1 } },
+    { GL_MAX_TEXTURE_SIZE, 'i', 1, { 16384 } },
+    { GL_MAX_VIEWPORT_DIMS, 'i', 2, { 16384, 16384 } },
+    { GL_SUBPIXEL_BITS, 'i', 1, { 4 } },
+    { GL_POLYGON_OFFSET_UNITS, 'f', 1, { 0.0 } },
+    { GL_POLYGON_OFFSET_FACTOR, 'f', 1, { 0.0 } },
+    { GL_TEXTURE_BINDING_1D, 'i', 1, { 0 } },
+    { GL_TEXTURE_BINDING_2D, 'i', 1, { 0 } },
+    { GL_TEXTURE_BINDING_3D, 'i', 1, { 0 } },
+    { GL_MAX_3D_TEXTURE_SIZE, 'i', 1, { 2048 } },
+    { GL_MAX_ELEMENTS_VERTICES, 'i', 1, { 1048575 } },
+    { GL_MAX_ELEMENTS_INDICES, 'i', 1, { 150000 } },
+    { GL_SMOOTH_POINT_SIZE_RANGE, 'i', 2, { 1, 64 } },
+    { GL_SMOOTH_POINT_SIZE_GRANULARITY, 'i', 1, { 0 } },
+    { GL_SMOOTH_LINE_WIDTH_RANGE, 'i', 2, { 1, 1 } },
+    { GL_SMOOTH_LINE_WIDTH_GRANULARITY, 'i', 1, { 0 } },
+    { GL_ALIASED_LINE_WIDTH_RANGE, 'i', 2, { 1, 1 } },
+    { GL_SAMPLE_COVERAGE_VALUE, 'f', 1, { 1.0 } },
+    { GL_SAMPLE_COVERAGE_INVERT, 'i', 1, { 0 } },
+    { GL_TEXTURE_BINDING_CUBE_MAP, 'i', 1, { 0 } },
+    { GL_MAX_CUBE_MAP_TEXTURE_SIZE, 'i', 1, { 16384 } },
+    { GL_NUM_COMPRESSED_TEXTURE_FORMATS, 'i', 1, { 3 } },
+    { GL_COMPRESSED_TEXTURE_FORMATS, 'i', 3, { 33776, 33778, 33779 } },
+    { GL_BLEND_DST_RGB, 'i', 1, { 0 } },
+    { GL_BLEND_SRC_RGB, 'i', 1, { 1 } },
+    { GL_BLEND_DST_ALPHA, 'i', 1, { 0 } },
+    { GL_BLEND_SRC_ALPHA, 'i', 1, { 1 } },
+    { GL_MAX_TEXTURE_LOD_BIAS, 'i', 1, { 16 } },
+    { GL_BLEND_COLOR, 'f', 4, { 0.0, 0.0, 0.0, 0.0 } },
+    { GL_ARRAY_BUFFER_BINDING, 'i', 1, { 0 } },
+    { GL_ELEMENT_ARRAY_BUFFER_BINDING, 'i', 1, { 0 } },
+    { GL_BLEND_EQUATION_RGB, 'i', 1, { 32774 } },
+    { GL_STENCIL_BACK_FUNC, 'i', 1, { 519 } },
+    { GL_STENCIL_BACK_FAIL, 'i', 1, { 7680 } },
+    { GL_STENCIL_BACK_PASS_DEPTH_FAIL, 'i', 1, { 7680 } },
+    { GL_STENCIL_BACK_PASS_DEPTH_PASS, 'i', 1, { 7680 } },
+    { GL_MAX_DRAW_BUFFERS, 'i', 1, { 8 } },
+    { GL_BLEND_EQUATION_ALPHA, 'i', 1, { 32774 } },
+    { GL_MAX_VERTEX_ATTRIBS, 'i', 1, { 16 } },
+    { GL_MAX_TEXTURE_IMAGE_UNITS, 'i', 1, { 16 } },
+    { GL_MAX_FRAGMENT_UNIFORM_COMPONENTS, 'i', 1, { 4096 } },
+    { GL_MAX_VERTEX_UNIFORM_COMPONENTS, 'i', 1, { 4096 } },
+    { GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS, 'i', 1, { 16 } },
+    { GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS, 'i', 1, { 80 } },
+    { GL_CURRENT_PROGRAM, 'i', 1, { 0 } },
+    { GL_STENCIL_BACK_REF, 'i', 1, { 0 } },
+    { GL_STENCIL_BACK_VALUE_MASK, 'i', 1, { -1 } },
+    { GL_STENCIL_BACK_WRITEMASK, 'i', 1, { -1 } },
+    { GL_PIXEL_PACK_BUFFER_BINDING, 'i', 1, { 0 } },
+    { GL_PIXEL_UNPACK_BUFFER_BINDING, 'i', 1, { 0 } },
+    { GL_MAX_CLIP_DISTANCES, 'i', 1, { 8 } },
+    { GL_CONTEXT_FLAGS, 'i', 1, { 1 } },
+    { GL_MAX_ARRAY_TEXTURE_LAYERS, 'i', 1, { 2048 } },
+    { GL_MIN_PROGRAM_TEXEL_OFFSET, 'i', 1, { -8 } },
+    { GL_MAX_PROGRAM_TEXEL_OFFSET, 'i', 1, { 7 } },
+    { GL_TEXTURE_BINDING_1D_ARRAY, 'i', 1, { 0 } },
+    { GL_TEXTURE_BINDING_2D_ARRAY, 'i', 1, { 0 } },
+    { GL_MAX_RENDERBUFFER_SIZE, 'i', 1, { 16384 } },
+    { GL_DRAW_FRAMEBUFFER_BINDING, 'i', 1, { 0 } },
+    { GL_RENDERBUFFER_BINDING, 'i', 1, { 0 } },
+    { GL_READ_FRAMEBUFFER_BINDING, 'i', 1, { 0 } },
+    { GL_VERTEX_ARRAY_BINDING, 'i', 1, { 0 } },
+    { GL_MAX_TEXTURE_BUFFER_SIZE, 'i', 1, { 268435456 } },
+    { GL_TEXTURE_BINDING_BUFFER, 'i', 1, { 0 } },
+    { GL_TEXTURE_BINDING_RECTANGLE, 'i', 1, { 0 } },
+    { GL_MAX_RECTANGLE_TEXTURE_SIZE, 'i', 1, { 16384 } },
+    { GL_PRIMITIVE_RESTART_INDEX, 'i', 1, { 0 } },
+    { GL_UNIFORM_BUFFER_BINDING, 'i', 1, { 0 } },
+    { GL_MAX_VERTEX_UNIFORM_BLOCKS, 'i', 1, { 16 } },
+    { GL_MAX_GEOMETRY_UNIFORM_BLOCKS, 'i', 1, { 16 } },
+    { GL_MAX_FRAGMENT_UNIFORM_BLOCKS, 'i', 1, { 16 } },
+    { GL_MAX_COMBINED_UNIFORM_BLOCKS, 'i', 1, { 80 } },
+    { GL_MAX_UNIFORM_BUFFER_BINDINGS, 'i', 1, { 80 } },
+    { GL_MAX_UNIFORM_BLOCK_SIZE, 'i', 1, { 65536 } },
+    { GL_MAX_COMBINED_VERTEX_UNIFORM_COMPONENTS, 'i', 1, { 266240 } },
+    { GL_MAX_COMBINED_GEOMETRY_UNIFORM_COMPONENTS, 'i', 1, { 266240 } },
+    { GL_MAX_COMBINED_FRAGMENT_UNIFORM_COMPONENTS, 'i', 1, { 266240 } },
+    { GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT, 'i', 1, { 256 } },
+    { GL_MAX_GEOMETRY_TEXTURE_IMAGE_UNITS, 'i', 1, { 16 } },
+    { GL_MAX_GEOMETRY_UNIFORM_COMPONENTS, 'i', 1, { 4096 } },
+    { GL_MAX_VERTEX_OUTPUT_COMPONENTS, 'i', 1, { 64 } },
+    { GL_MAX_GEOMETRY_INPUT_COMPONENTS, 'i', 1, { 64 } },
+    { GL_MAX_GEOMETRY_OUTPUT_COMPONENTS, 'i', 1, { 128 } },
+    { GL_MAX_FRAGMENT_INPUT_COMPONENTS, 'i', 1, { 128 } },
+    { GL_CONTEXT_PROFILE_MASK, 'i', 1, { 1 } },
+    { GL_PROVOKING_VERTEX, 'i', 1, { 36430 } },
+    { GL_MAX_SERVER_WAIT_TIMEOUT, 'i', 1, { -1 } },
+    { GL_MAX_SAMPLE_MASK_WORDS, 'i', 1, { 1 } },
+    { GL_TEXTURE_BINDING_2D_MULTISAMPLE, 'i', 1, { 0 } },
+    { GL_TEXTURE_BINDING_2D_MULTISAMPLE_ARRAY, 'i', 1, { 0 } },
+    { GL_MAX_COLOR_TEXTURE_SAMPLES, 'i', 1, { 4 } },
+    { GL_MAX_DEPTH_TEXTURE_SAMPLES, 'i', 1, { 4 } },
+    { GL_MAX_INTEGER_SAMPLES, 'i', 1, { 1 } },
+    { GL_MAX_DUAL_SOURCE_DRAW_BUFFERS, 'i', 1, { 1 } },
+    { GL_SAMPLER_BINDING, 'i', 1, { 0 } },
+    { GL_MAX_TESS_CONTROL_UNIFORM_BLOCKS, 'i', 1, { 16 } },
+    { GL_MAX_TESS_EVALUATION_UNIFORM_BLOCKS, 'i', 1, { 16 } },
+    { GL_SHADER_COMPILER, 'i', 1, { 1 } },
+    { GL_NUM_SHADER_BINARY_FORMATS, 'i', 1, { 0 } },
+    { GL_MAX_VERTEX_UNIFORM_VECTORS, 'i', 1, { 1024 } },
+    { GL_MAX_VARYING_VECTORS, 'i', 1, { 31 } },
+    { GL_MAX_FRAGMENT_UNIFORM_VECTORS, 'i', 1, { 1024 } },
+    { GL_NUM_PROGRAM_BINARY_FORMATS, 'i', 1, { 0 } },
+    { GL_PROGRAM_PIPELINE_BINDING, 'i', 1, { 0 } },
+    { GL_MAX_VIEWPORTS, 'i', 1, { 16 } },
+    { GL_VIEWPORT_SUBPIXEL_BITS, 'i', 1, { 0 } },
+    { GL_VIEWPORT_BOUNDS_RANGE, 'i', 2, { -32768, 32767 } },
+    { GL_LAYER_PROVOKING_VERTEX, 'i', 1, { 33376 } },
+    { GL_VIEWPORT_INDEX_PROVOKING_VERTEX, 'i', 1, { 33376 } },
+    { GL_MAX_COLOR_ATTACHMENTS, 'i', 1, { 8 } },
+};
+
+static const void *appleValue(GLenum pname, char type, int *count)
+{
+    for (size_t i = 0; i < sizeof apple_values / sizeof apple_values[0]; i++)
+        if (apple_values[i].pname == pname && apple_values[i].type == type)
+        {
+            *count = apple_values[i].count;
+            return apple_values[i].values;
+        }
+    return NULL;
+}
+
+static void getIntegerv(GLenum pname, void *params)
+{
+    int n;
+    const double *v = appleValue(pname, 'i', &n);
+    for (int i = 0; v && i < n; i++)
+        ((GLint *)params)[i] = (GLint)v[i];
+}
+
+static void getFloatv(GLenum pname, void *params)
+{
+    int n;
+    const double *v = appleValue(pname, 'f', &n);
+    for (int i = 0; v && i < n; i++)
+        ((GLfloat *)params)[i] = (GLfloat)v[i];
+}
+
+static void getDoublev(GLenum pname, void *params)
+{
+    int n;
+    const double *v = appleValue(pname, 'd', &n);
+    for (int i = 0; v && i < n; i++)
+        ((GLdouble *)params)[i] = v[i];
+}
+
+static void getBooleanv(GLenum pname, void *params)
+{
+    int n;
+    const double *v = appleValue(pname, 'b', &n);
+    for (int i = 0; v && i < n; i++)
+        ((GLboolean *)params)[i] = (GLboolean)v[i];
+}
+
+#define glGetIntegerv getIntegerv
+#define glGetFloatv getFloatv
+#define glGetDoublev getDoublev
+#define glGetBooleanv getBooleanv
 
 void getMacOSDefaults(GLMContext glm_ctx)
 {
-    void *OpenGL, *libGL;
-    const char *OpenGLPath = "/System/Library/Frameworks/OpenGL.framework/OpenGL";
-    const char *libGLPath = "/System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libGL.dylib";
-    CGLError (*CGLChoosePixelFormat)(const CGLPixelFormatAttribute *attribs, CGLPixelFormatObj OPENGL_NULLABLE * OPENGL_NONNULL pix, GLint *npix);
-    CGLError (*CGLDestroyPixelFormat)(CGLPixelFormatObj pix);
-    CGLError (*CGLCreateContext)(CGLPixelFormatObj pix, CGLContextObj OPENGL_NULLABLE share, CGLContextObj OPENGL_NULLABLE * OPENGL_NONNULL ctx);
-    CGLError (*CGLDestroyContext)(CGLContextObj ctx);
-    // libmoogl has its own CGL, so Apple's is looked up by name
-    CGLError (*CGLSetCurrentContext)(CGLContextObj ctx);
-    void (*glGetIntegerv)(GLenum param, GLuint *params);
-    void (*glGetDoublev)(GLenum param, GLdouble *params);
-    void (*glGetFloatv)(GLenum param, GLfloat *params);
-    void (*glGetBooleanv)(GLenum param, GLboolean *params);
-
-    CGLContextObj ctx;
-
-    CGLPixelFormatAttribute attributes[4] = {
-      kCGLPFAAccelerated,   // no software rendering
-      kCGLPFAOpenGLProfile, // core profile with the version stated below
-      (CGLPixelFormatAttribute) kCGLOGLPVersion_GL4_Core,
-      (CGLPixelFormatAttribute) 0
-    };
-
-    OpenGL = dlopen(OpenGLPath, RTLD_LAZY | RTLD_LOCAL); assert(OpenGL);
-    libGL = dlopen(libGLPath, RTLD_LAZY | RTLD_LOCAL); assert(libGL);
-
-    CGLChoosePixelFormat = dlsym(OpenGL, "CGLChoosePixelFormat"); assert(CGLChoosePixelFormat);
-    CGLDestroyPixelFormat = dlsym(OpenGL, "CGLDestroyPixelFormat"); assert(CGLDestroyPixelFormat);
-    CGLCreateContext = dlsym(OpenGL, "CGLCreateContext"); assert(CGLCreateContext);
-    CGLDestroyContext = dlsym(OpenGL, "CGLDestroyContext"); assert(CGLDestroyContext);
-    CGLSetCurrentContext = dlsym(OpenGL, "CGLSetCurrentContext"); assert(CGLSetCurrentContext);
-    glGetIntegerv = dlsym(libGL, "glGetIntegerv"); assert(glGetIntegerv);
-    glGetDoublev = dlsym(libGL, "glGetDoublev"); assert(glGetDoublev);
-    glGetFloatv = dlsym(libGL, "glGetFloatv"); assert(glGetFloatv);
-    glGetBooleanv = dlsym(libGL, "glGetBooleanv"); assert(glGetBooleanv);
-
-    CGLPixelFormatObj pix;
-    CGLError errorCode;
-    GLint num; // stores the number of possible pixel formats
-    errorCode = CGLChoosePixelFormat( attributes, &pix, &num ); assert(errorCode == kCGLNoError);
-    // add error checking here
-    errorCode = CGLCreateContext( pix, NULL, &ctx ); assert(errorCode == kCGLNoError);
-    CGLDestroyPixelFormat( pix );
-
-    errorCode = CGLSetCurrentContext( ctx ); assert(errorCode == kCGLNoError);
-
     glGetFloatv(GL_POINT_SIZE,&glm_ctx->state.var.point_size);
     glGetIntegerv(GL_POINT_SIZE_RANGE,&glm_ctx->state.var.point_size_range);
     glGetIntegerv(GL_POINT_SIZE_GRANULARITY,&glm_ctx->state.var.point_size_granularity);
@@ -305,9 +453,4 @@ void getMacOSDefaults(GLMContext glm_ctx)
     glGetIntegerv(GL_TEXTURE_BINDING_CUBE_MAP,&glm_ctx->state.var.texture_binding_cube_map);
     glGetIntegerv(GL_TEXTURE_BINDING_RECTANGLE,&glm_ctx->state.var.texture_binding_rectangle);
 
-    CGLSetCurrentContext( NULL );
-    CGLDestroyContext( ctx );
-
-    dlclose(OpenGL);
-    dlclose(libGL);
 }

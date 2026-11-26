@@ -17,6 +17,7 @@ void glBegin(GLenum mode);
 void glEnd(void);
 void glVertex2f(GLfloat x, GLfloat y);
 void glVertex3f(GLfloat x, GLfloat y, GLfloat z);
+void glVertex4f(GLfloat x, GLfloat y, GLfloat z, GLfloat w);
 void glVertex2i(GLint x, GLint y);
 void glColor3f(GLfloat r, GLfloat g, GLfloat b);
 void glColor4f(GLfloat r, GLfloat g, GLfloat b, GLfloat a);

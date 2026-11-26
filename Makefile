@@ -46,7 +46,7 @@ CFLAGS += -arch $(shell uname -m)
 LIBS += -arch $(shell uname -m)
 
 LIBS += -F$(SDK_ROOT)/System/Library/Frameworks
-LIBS += -framework Metal -framework OpenGL -framework Foundation
+LIBS += -framework Metal -framework Foundation
 
 CFLAGS += -I$(spirv_cross_include_path)
 CFLAGS += -I$(spirv_cross_config_include_path)
@@ -206,10 +206,11 @@ $(mgl_core_objs) $(mgl_core_arc_objs) $(mgl_core_obj): $(flags_stamp)
 
 FORCE:
 
-$(mgl_lib): $(mgl_core_objs) $(mgl_core_arc_objs) $(mgl_core_obj) $(spirv_cross_archives)
+$(mgl_lib): $(mgl_core_objs) $(mgl_core_arc_objs) $(mgl_core_obj) $(spirv_cross_archives) tools/libmoogl_hidden_symbols.txt
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS_GL_CORE) -dynamiclib -o $@ $(filter %.o,$^) $(LIBS) \
-		-install_name @rpath/libmoogl.dylib -current_version $(moogl_version_number)
+		-install_name @rpath/libmoogl.dylib -current_version $(moogl_version_number) \
+		-Wl,-unexported_symbols_list,tools/libmoogl_hidden_symbols.txt
 	# loading dynamic library requires this
 	ln -fs $(mgl_lib) .
 
@@ -268,13 +269,18 @@ glu_dir := submodules/glu
 glu_lib := $(build_dir)/libGLU.1.dylib
 glu_srcs := $(filter-out %/priorityq-heap.c, $(wildcard $(glu_dir)/src/libutil/*.c $(glu_dir)/src/libtess/*.c)) \
 	$(wildcard $(glu_dir)/src/libnurbs/*/*.cc)
-glu_objs := $(patsubst $(glu_dir)/src/%, $(build_dir)/glu/%.o, $(glu_srcs))
+glu_objs := $(patsubst $(glu_dir)/src/%, $(build_dir)/glu/%.o, $(glu_srcs)) $(build_dir)/glu/apple.c.o
 glu_flags := -O2 -arch arm64 -w -fvisibility=hidden -DLIBRARYBUILD -DNDEBUG \
 	'-DGLAPI=__attribute__((visibility("default"))) extern' -Itools/sdk -Iinclude -I$(glu_dir)/include \
 	-I$(glu_dir)/src/include -I$(glu_dir)/src/libnurbs/internals -I$(glu_dir)/src/libnurbs/interface \
 	-I$(glu_dir)/src/libnurbs/nurbtess
 
 $(build_dir)/glu/%.c.o: $(glu_dir)/src/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(glu_flags) -c $< -o $@
+
+# the calls only Apple's libGLU has
+$(build_dir)/glu/apple.c.o: src/glu/apple.c
 	@mkdir -p $(dir $@)
 	$(CC) $(glu_flags) -c $< -o $@
 
@@ -286,6 +292,44 @@ $(glu_lib): $(glu_objs) $(mgl_lib)
 	$(CXX) -dynamiclib -arch arm64 -o $@ $(glu_objs) -install_name @rpath/libGLU.1.dylib \
 		-compatibility_version 5.0.0 -current_version 5.1.0 -L$(build_dir) -lmoogl -Wl,-rpath,@loader_path
 	ln -sf libGLU.1.dylib $(build_dir)/libGLU.dylib
+
+# MooGL.framework: drops in for OpenGL.framework in an existing app
+# (tools/moogl-dropin). Its binary re-exports libmoogl and libGLU and
+# interposes every call into Apple's framework, AppKit's included.
+fw_dir := $(build_dir)/MooGL.framework
+fw_ver := $(fw_dir)/Versions/A
+fw_bin := $(fw_ver)/MooGL
+fw_interpose := $(build_dir)/framework/interpose.s
+
+$(fw_interpose): tools/framework/gen_interpose.sh tools/framework/opengl_exports.txt
+	@mkdir -p $(dir $@)
+	sh tools/framework/gen_interpose.sh tools/framework/opengl_exports.txt > $@
+
+$(fw_bin): tools/framework/framework.c tools/framework/Info.plist $(fw_interpose) $(mgl_lib) $(glu_lib)
+	rm -rf $(fw_dir)
+	mkdir -p $(fw_ver)/Libraries $(fw_ver)/Resources
+	cp $(mgl_lib) $(fw_ver)/Libraries/libmoogl.dylib
+	cp $(glu_lib) $(fw_ver)/Libraries/libGLU.1.dylib
+	install_name_tool -id @loader_path/Libraries/libmoogl.dylib $(fw_ver)/Libraries/libmoogl.dylib
+	install_name_tool -id @loader_path/Libraries/libGLU.1.dylib -change @rpath/libmoogl.dylib \
+		@loader_path/libmoogl.dylib $(fw_ver)/Libraries/libGLU.1.dylib
+	sed 's/@VERSION@/$(MOOGL_VERSION)/' tools/framework/Info.plist > $(fw_ver)/Resources/Info.plist
+	$(CC) -dynamiclib -arch arm64 -O2 -o $@ tools/framework/framework.c $(fw_interpose) \
+		-install_name @rpath/MooGL.framework/Versions/A/MooGL -current_version $(moogl_version_number) -compatibility_version 1.0.0 \
+		-framework OpenGL -Wl,-reexport_library,$(fw_ver)/Libraries/libmoogl.dylib \
+		-Wl,-reexport_library,$(fw_ver)/Libraries/libGLU.1.dylib
+	# every name Apple's framework exports, or an app bound to the missing one will not launch
+	nm -gU $(fw_ver)/Libraries/libmoogl.dylib $(fw_ver)/Libraries/libGLU.1.dylib | awk '/ [TSD] _/ { print substr($$3, 2) }' | \
+		sort -u | comm -23 <(sort -u tools/framework/opengl_exports.txt) - > $(build_dir)/framework/missing.txt
+	@test ! -s $(build_dir)/framework/missing.txt || { echo "MooGL lacks these OpenGL.framework exports:"; \
+		cat $(build_dir)/framework/missing.txt; rm -rf $(fw_dir); exit 1; }
+	ln -s A $(fw_dir)/Versions/Current
+	ln -s Versions/Current/MooGL $(fw_dir)/MooGL
+	ln -s Versions/Current/Resources $(fw_dir)/Resources
+	codesign -f -s - $(fw_ver)/Libraries/libmoogl.dylib $(fw_ver)/Libraries/libGLU.1.dylib
+	codesign -f -s - $(fw_dir)
+
+framework: $(fw_bin)
 
 # installed into build/sdl2/install for its headers and CMake package
 sdl2_dir := submodules/SDL2
@@ -384,7 +428,7 @@ $(imgui_lib): $(imgui_srcs) $(sdl2_lib)
 	done
 	libtool -static -o $@ $(build_dir)/imgui/*.o
 
-lib: $(mgl_lib) $(build_dir)/libglfw.dylib $(fsr2_lib) $(sdl2_lib) $(sdl3_lib) $(sfml3_lib) $(sfml2_lib) $(raylib_lib) $(imgui_lib) $(glut_lib) $(glu_lib)
+lib: $(mgl_lib) $(fw_bin) $(build_dir)/libglfw.dylib $(fsr2_lib) $(sdl2_lib) $(sdl3_lib) $(sfml3_lib) $(sfml2_lib) $(raylib_lib) $(imgui_lib) $(glut_lib) $(glu_lib)
 
 toolchain: $(mgl_toolchain_lib)
 
@@ -506,7 +550,14 @@ $(build_dir)/test_imgui_viewports: tests/window/test_imgui_viewports.cpp $(imgui
 $(build_dir)/test_imgui_viewports_sdl2: tests/window/test_imgui_viewports.cpp $(imgui_lib) $(mgl_lib) $(sdl2_lib)
 	$(CXX) -std=c++17 -DMGL_TEST_SDL2 -o $@ $< $(imgui_cflags) -L$(build_dir) -limgui -lSDL2-2.0.0 $(window_libs)
 
-window-test: $(build_dir)/test_window $(build_dir)/test_sdl_share $(build_dir)/test_sdl3 $(build_dir)/test_sfml3 $(build_dir)/test_sfml2 $(build_dir)/test_raylib $(build_dir)/test_sdl_renderer $(build_dir)/test_glut $(build_dir)/test_glu $(build_dir)/test_cgl $(build_dir)/test_imgui_viewports $(build_dir)/test_imgui_viewports_sdl2 $(build_dir)/triangle $(build_dir)/sdl2_triangle $(build_dir)/sdl3_triangle $(build_dir)/sfml_shapes $(build_dir)/raylib_shapes
+# built against Apple's OpenGL, then given MooGL.framework
+$(build_dir)/dropin/test_dropin: tests/window/test_dropin.m $(fw_bin) tools/moogl-dropin
+	@mkdir -p $(dir $@)
+	$(CC) -arch arm64 -fobjc-arc -o $@.apple $< -framework AppKit -framework OpenGL
+	rm -f $@
+	tools/moogl-dropin --framework $(fw_dir) $@.apple -o $@
+
+window-test: $(build_dir)/dropin/test_dropin $(build_dir)/test_window $(build_dir)/test_sdl_share $(build_dir)/test_sdl3 $(build_dir)/test_sfml3 $(build_dir)/test_sfml2 $(build_dir)/test_raylib $(build_dir)/test_sdl_renderer $(build_dir)/test_glut $(build_dir)/test_glu $(build_dir)/test_cgl $(build_dir)/test_imgui_viewports $(build_dir)/test_imgui_viewports_sdl2 $(build_dir)/triangle $(build_dir)/sdl2_triangle $(build_dir)/sdl3_triangle $(build_dir)/sfml_shapes $(build_dir)/raylib_shapes
 	$(build_dir)/test_window
 	$(build_dir)/test_sdl_share
 	$(build_dir)/test_sdl_renderer
@@ -518,6 +569,7 @@ window-test: $(build_dir)/test_window $(build_dir)/test_sdl_share $(build_dir)/t
 	$(build_dir)/test_glut
 	$(build_dir)/test_glu
 	$(build_dir)/test_cgl
+	$(build_dir)/dropin/test_dropin
 	$(build_dir)/test_imgui_viewports
 	$(build_dir)/test_imgui_viewports_sdl2
 	$(build_dir)/triangle --frames 60
@@ -626,6 +678,6 @@ clean:
 	rm -f libmoogl.dylib
 	rm -f libglfw.dylib
 
-.PHONY: default test tests cts gears gears-test window-test gles-demo dbg lib fsr2 sdl2 sdl3 sfml raylib clean generate FORCE
+.PHONY: default test tests cts gears gears-test window-test gles-demo dbg lib framework fsr2 sdl2 sdl3 sfml raylib clean generate FORCE
 
 -include $(deps)

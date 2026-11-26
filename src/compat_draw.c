@@ -632,6 +632,7 @@ static void drawOnce(GLMContext ctx, GLenum mode, GLint first, GLsizei count, GL
     Buffer *element_buffer = NULL;
     bool client = hasClientArrays(ctx);
     bool streamed_indices = false;
+    bool split_here = false;
 
     if (isLegacyMode(mode))
     {
@@ -660,6 +661,9 @@ static void drawOnce(GLMContext ctx, GLenum mode, GLint first, GLsizei count, GL
                 expanded[i] += (GLuint)first;
         }
 
+        C->split_mode = mode;
+        C->split_tris = n / 3;
+        split_here = true;
         mode = GL_TRIANGLES;
         type = GL_UNSIGNED_INT;
         indices = expanded;
@@ -817,6 +821,14 @@ done:
         STATE(vao)->element_array.buffer = element_buffer;
 
     free(expanded);
+    if (split_here)
+        C->split_mode = 0;
+}
+
+GLenum mglCompatSplitMode(GLMContext ctx, GLsizei *tris)
+{
+    *tris = C->split_tris;
+    return C->split_mode;
 }
 
 void mglCompatDrawFull(GLMContext ctx, GLenum mode, GLint first, GLsizei count, GLenum type,

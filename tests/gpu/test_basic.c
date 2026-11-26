@@ -346,6 +346,36 @@ GPU_TEST(clear, scissor_limits_the_clear)
     mgl_target_destroy(&t);
 }
 
+GPU_TEST(clear, scissored_clear_ignores_polygon_mode)
+{
+    MGLTestTarget t;
+    unsigned char *px, c[4];
+
+    if (!mgl_target_create(&t, 32, 32, GL_RGBA8, 0)) SKIP("no target");
+
+    mgl_target_bind(&t);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(8, 8, 16, 16);
+    glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDisable(GL_SCISSOR_TEST);
+    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+
+    px = mgl_read_rgba8(&t);
+    if (!px) { mgl_target_destroy(&t); SKIP("readback failed"); }
+
+    mgl_pixel_at(px, &t, 16, 16, c);
+    CHECK_MSG(c[0] > 200, "middle of the scissor box R = %d, want red", c[0]);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+
+    free(px);
+    mgl_target_destroy(&t);
+}
+
 GPU_TEST(readpixels, subrect_matches_full_read)
 {
     MGLTestTarget t;

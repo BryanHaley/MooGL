@@ -1795,7 +1795,11 @@ const GLubyte *mglGetStringi(GLMContext ctx, GLenum name, GLuint index);
 static const GLubyte *cGetString(GLMContext ctx, GLenum name)
 {
     if (name == GL_VERSION)
-        return (const GLubyte *)"4.6.0 Compatibility Profile MooGL " MOOGL_VERSION;
+        return ctx->reported_major == 2 ? (const GLubyte *)"2.1 MooGL " MOOGL_VERSION
+                                        : (const GLubyte *)"4.6.0 Compatibility Profile MooGL " MOOGL_VERSION;
+
+    if (name == GL_SHADING_LANGUAGE_VERSION && ctx->reported_major == 2)
+        return (const GLubyte *)"1.20";
 
     if (name != GL_EXTENSIONS)
         return C->next.get_string(ctx, name);

@@ -277,6 +277,48 @@ GPU_TEST(draw_indirect, arb_base_vertex_still_compiles)
     glDeleteProgram(prog);
 }
 
+// The extension needs only GLSL 1.40, and Blender 3.0 uses it from 3.30.
+// glslang declared its built-ins from 4.40 on.
+GPU_TEST(draw_indirect, arb_draw_parameters_in_glsl_330)
+{
+    static const char *VS =
+        "#version 330\n"
+        "#extension GL_ARB_shader_draw_parameters : enable\n"
+        "layout(location = 0) in vec2 pos;\n"
+        "flat out int bi;\n"
+        "void main() { bi = gl_BaseInstanceARB; gl_Position = vec4(pos, 0.0, 1.0); }\n";
+    static const char *FS =
+        "#version 330\n"
+        "flat in int bi;\n"
+        "out vec4 o;\n"
+        "void main() { o = vec4(float(bi) / 4.0, 0.0, 0.0, 1.0); }\n";
+    MGLTestTarget t;
+    char log[2048] = { 0 };
+    GLuint prog, vao, vbo = 0;
+    unsigned char *px, c[4];
+
+    if (!mgl_target_create(&t, 16, 16, GL_RGBA8, 0)) SKIP("no target");
+
+    prog = mgl_build_program(VS, FS, log, sizeof log);
+    CHECK_MSG(prog != 0, "link: %s", log);
+    if (!prog) { mgl_target_destroy(&t); return; }
+
+    vao = mgl_fullscreen_quad(&vbo);
+    mgl_target_bind(&t);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glUseProgram(prog);
+    glDrawArraysInstancedBaseInstance(GL_TRIANGLES, 0, 6, 1, 3);
+    px = mgl_read_rgba8(&t);
+    mgl_pixel_at(px, &t, 8, 8, c);
+    CHECK_MSG(abs(c[0] - 191) <= 2, "red is %d, want 191 for base instance 3", c[0]);
+    free(px);
+
+    glDeleteProgram(prog);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo);
+    mgl_target_destroy(&t);
+}
+
 static GLuint linkWithGeometry(const char *vs, const char *gs, const char *fs)
 {
     const char *src[3] = { vs, gs, fs };

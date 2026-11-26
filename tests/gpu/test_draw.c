@@ -1082,3 +1082,83 @@ GPU_TEST(draw, new_vertex_data_survives_an_unrelated_buffer_bind)
     glDeleteBuffers(1, &other);
     mgl_target_destroy(&t);
 }
+
+static GLuint shaderOf(GLenum type, const char *src)
+{
+    GLuint s = glCreateShader(type);
+
+    glShaderSource(s, 1, &src, NULL);
+    glCompileShader(s);
+    return s;
+}
+
+// A fragment stage split across two shaders, the helper shared by two
+// programs as TrenchBroom's grid is. glslang merged the helper into the
+// shader with main, so the next link found its functions twice.
+GPU_TEST(draw, fragment_stage_split_across_shaders_links_twice)
+{
+    static const char *FS_HELPER =
+        "#version 460 core\n"
+        "float half_of(float x) { return x * 0.5; }\n"
+        "vec4 tint(float g) { return vec4(0.0, half_of(g) * 2.0, 0.0, 1.0); }\n";
+    static const char *FS_MAIN_A =
+        "#version 460 core\n"
+        "layout(location = 0) out vec4 frag;\n"
+        "vec4 tint(float g);\n"
+        "void main() { frag = tint(1.0); }\n";
+    static const char *FS_MAIN_B =
+        "#version 460 core\n"
+        "layout(location = 0) out vec4 frag;\n"
+        "vec4 tint(float g);\n"
+        "void main() { frag = tint(0.5); }\n";
+    const char *mains[2] = { FS_MAIN_A, FS_MAIN_B };
+    const int want_green[2] = { 255, 128 };
+    MGLTestTarget t;
+    GLuint vs, helper, vao, vbo = 0;
+    unsigned char *px, c[4];
+
+    if (!mgl_target_create(&t, W, H, GL_RGBA8, 0)) SKIP("no target");
+
+    vs = shaderOf(GL_VERTEX_SHADER, VS_PASSTHRU);
+    helper = shaderOf(GL_FRAGMENT_SHADER, FS_HELPER);
+    vao = mgl_fullscreen_quad(&vbo);
+    mgl_target_bind(&t);
+
+    for (int i = 0; i < 2; i++)
+    {
+        GLuint fs = shaderOf(GL_FRAGMENT_SHADER, mains[i]), p = glCreateProgram();
+        GLint ok = 0;
+        char log[1024] = "";
+
+        glAttachShader(p, vs);
+        glAttachShader(p, fs);
+        glAttachShader(p, helper);
+        glLinkProgram(p);
+        glGetProgramiv(p, GL_LINK_STATUS, &ok);
+        glGetProgramInfoLog(p, sizeof log, NULL, log);
+        CHECK_MSG(ok, "program %d did not link: %s", i, log);
+
+        if (ok)
+        {
+            glClear(GL_COLOR_BUFFER_BIT);
+            glUseProgram(p);
+            glBindVertexArray(vao);
+            glDrawArrays(GL_TRIANGLES, 0, 6);
+            px = mgl_read_rgba8(&t);
+            mgl_pixel_at(px, &t, W / 2, H / 2, c);
+            CHECK_MSG(abs(c[1] - want_green[i]) <= 2 && c[0] == 0, "program %d drew %d,%d,%d", i, c[0], c[1], c[2]);
+            free(px);
+        }
+
+        glUseProgram(0);
+        glDeleteProgram(p);
+        glDeleteShader(fs);
+    }
+
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+    glDeleteShader(vs);
+    glDeleteShader(helper);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo);
+    mgl_target_destroy(&t);
+}

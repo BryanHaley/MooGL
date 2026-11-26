@@ -1565,3 +1565,93 @@ GPU_TEST(framebuffer, draws_into_an_rgb9_e5_renderbuffer)
     glDeleteFramebuffers(1, &fbo);
     glDeleteRenderbuffers(1, &rbo);
 }
+
+// fill a renderbuffer, delete it and make another the same size, which Metal
+// tends to give the same memory
+static GLuint leftover_rbo(GLsizei samples, GLuint fbo)
+{
+    GLuint rb = 0;
+
+    for (int pass = 0; pass < 2; pass++)
+    {
+        glGenRenderbuffers(1, &rb);
+        glBindRenderbuffer(GL_RENDERBUFFER, rb);
+        glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, GL_RGBA8, 256, 256);
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, rb);
+        if (pass == 1)
+            break;
+        glViewport(0, 0, 256, 256);
+        glClearColor(1.0f, 0.0f, 1.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glFinish();
+        glDeleteRenderbuffers(1, &rb);
+    }
+    return rb;
+}
+
+static int nonzero_bytes(const unsigned char *px, int n)
+{
+    int count = 0;
+
+    for (int i = 0; i < n; i++)
+        count += px[i] != 0;
+    return count;
+}
+
+// Mac drivers hand out new render targets zeroed, and games show whatever is
+// left in one they never clear (Half-Life's menu showed magenta)
+GPU_TEST(rbo, new_renderbuffer_reads_zero)
+{
+    static unsigned char px[256 * 256 * 4];
+    GLuint fbo = 0;
+
+    glGenFramebuffers(1, &fbo);
+    GLuint rb = leftover_rbo(0, fbo);
+
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, 256, 256, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+    CHECK_MSG(nonzero_bytes(px, sizeof px) == 0, "%d of %d bytes not zero",
+              nonzero_bytes(px, sizeof px), (int)sizeof px);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &fbo);
+    glDeleteRenderbuffers(1, &rb);
+}
+
+GPU_TEST(rbo, new_multisample_renderbuffer_resolves_to_zero)
+{
+    static unsigned char px[256 * 256 * 4];
+    GLuint ms_fbo = 0, fbo = 0, rb = 0;
+
+    glGenFramebuffers(1, &ms_fbo);
+    GLuint ms = leftover_rbo(4, ms_fbo);
+
+    glGenRenderbuffers(1, &rb);
+    glBindRenderbuffer(GL_RENDERBUFFER, rb);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 256, 256);
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, rb);
+    glClearColor(0.0f, 1.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, ms_fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo);
+    glBlitFramebuffer(0, 0, 256, 256, 0, 0, 256, 256, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, 256, 256, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+    CHECK_MSG(nonzero_bytes(px, sizeof px) == 0, "%d of %d bytes not zero",
+              nonzero_bytes(px, sizeof px), (int)sizeof px);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &fbo);
+    glDeleteFramebuffers(1, &ms_fbo);
+    glDeleteRenderbuffers(1, &rb);
+    glDeleteRenderbuffers(1, &ms);
+}
+

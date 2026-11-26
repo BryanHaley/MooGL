@@ -102,6 +102,11 @@ struct MGLCompat_t {
     // which they forward to
     struct GLMDispatchTable next;
 
+    // the quad mode the triangles being drawn were split from, and how many
+    // there are, for wireframes that leave out the edges inside
+    GLenum split_mode;
+    GLsizei split_tris;
+
     // --- transform ---
     GLenum matrix_mode;
     MGLMatrixStack modelview, projection, texture[MGL_COMPAT_UNITS];
@@ -274,6 +279,7 @@ struct Program_t *mglCompatFFProgram(GLMContext ctx, GLenum mode);
 // writes the old built-in uniforms (gl_ModelViewMatrix and the rest) that
 // prog reads, and the fixed-function uniforms when prog is generated
 void mglCompatWriteBuiltins(GLMContext ctx, struct Program_t *prog);
+GLenum mglCompatSplitMode(GLMContext ctx, GLsizei *tris);
 void mglCompatFreeFF(GLMContext ctx);
 
 // compat_immediate.c

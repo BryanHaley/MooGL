@@ -1,0 +1,8 @@
+# Symbols of the libraries linked into libmoogl, kept out of its exports. An
+# app with its own glslang or SPIRV-Cross (SuperTuxKart's shaderc, MoltenVK)
+# would otherwise share their C++ templates with libmoogl's, across versions.
+__Z*
+_glslang_*
+_spvc_*
+_spv*
+_Sh*

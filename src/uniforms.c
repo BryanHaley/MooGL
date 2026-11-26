@@ -1826,7 +1826,10 @@ void programUniformWriteD(GLMContext ctx, Program *pptr, GLint location, const v
     SpirvResource *res = plainUniformByLocation(pptr, location, &element);
 
     if (res && !setterMatches(ctx, res->gl_type))
+    {
+        MGL_DEBUG("MGL: double setter on %s (type 0x%x)\n", res->name ? res->name : "?", res->gl_type);
         ERROR_RETURN(GL_INVALID_OPERATION);
+    }
 
     // the flag goes where the values go, an array's first element, and before
     // the write so it sizes the elements as doubles

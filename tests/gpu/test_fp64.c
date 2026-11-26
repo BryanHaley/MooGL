@@ -126,6 +126,19 @@ GPU_TEST(fp64, division_is_more_exact_than_float)
     CHECK_NEAR(0.0f, r, 1e-3f);
 }
 
+/* With two floats a double (about 48 bits), (1/7)^2 * 49 - 1 comes out near
+   -2^-46, which times 2^50 is about -12. A real double is off by at most a
+   few 2^-53, and three floats by far less. The 1.0 comes from the buffer so
+   nothing folds it. */
+GPU_TEST(fp64, keeps_all_53_bits_by_default)
+{
+    float r = run_scalar("double one = double(r) + 1001.0LF;\n"
+                         "double t = one / 7.0LF;\n"
+                         "r = float((t * t * 49.0LF - one) * 1125899906842624.0LF);");
+
+    CHECK_NEAR(0.0f, r, 1.0f);
+}
+
 /* Runs a shader that already declares its own buffer, and returns the float
    it writes to `r`. The body may use anything the declarations set up. */
 static float run_with_decls(const char *decls, const char *body)

@@ -436,17 +436,11 @@ static void copyUniform(GLMContext ctx, Program *from, GLint src, Program *to, G
     }
 }
 
-// Everything the application set on the stage programs, onto the stand-in.
-static void copyStageState(GLMContext ctx, ProgramPipeline *pp, Program *merged)
+// What the application set on one stage of a program, onto a stand-in for it.
+// pp is the pipeline the stand-in merges, or NULL when names are the same.
+static void copyStage(GLMContext ctx, ProgramPipeline *pp, int s, Program *from, Program *merged)
 {
-    for (unsigned k = 0; k < sizeof(graphics_stages) / sizeof(graphics_stages[0]); k++)
     {
-        int s = graphics_stages[k];
-        Program *from = pp->stage_programs[s];
-
-        if (from == NULL || from == merged)
-            continue;
-
         SpirvResourceList *list = &from->spirv_resources_list[s][SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT];
 
         for (GLuint i = 0; i < list->count; i++)
@@ -459,7 +453,10 @@ static void copyStageState(GLMContext ctx, ProgramPipeline *pp, Program *merged)
 
             char name[300];
 
-            stageName(pp, s, r->name, name, sizeof(name));
+            if (pp)
+                stageName(pp, s, r->name, name, sizeof(name));
+            else
+                snprintf(name, sizeof(name), "%s", r->name);
             to = sameUniform(merged, name);
 
             if (to == NULL)
@@ -487,7 +484,10 @@ static void copyStageState(GLMContext ctx, ProgramPipeline *pp, Program *merged)
                     if (!a->name || !b->name)
                         continue;
 
-                    stageName(pp, s, a->name, name, sizeof(name));
+                    if (pp)
+                        stageName(pp, s, a->name, name, sizeof(name));
+                    else
+                        snprintf(name, sizeof(name), "%s", a->name);
                     if (strcmp(name, b->name))
                         continue;
 
@@ -535,6 +535,25 @@ static void copyStageState(GLMContext ctx, ProgramPipeline *pp, Program *merged)
                     mglShaderStorageBlockBinding(ctx, merged->name, idx, (GLuint)binding);
             }
     }
+}
+
+// Everything the application set on the stage programs, onto the stand-in.
+static void copyStageState(GLMContext ctx, ProgramPipeline *pp, Program *merged)
+{
+    for (unsigned k = 0; k < sizeof(graphics_stages) / sizeof(graphics_stages[0]); k++)
+    {
+        int s = graphics_stages[k];
+        Program *from = pp->stage_programs[s];
+
+        if (from && from != merged)
+            copyStage(ctx, pp, s, from, merged);
+    }
+}
+
+void mglCopyProgramState(GLMContext ctx, Program *from, Program *to)
+{
+    for (unsigned k = 0; k < sizeof(graphics_stages) / sizeof(graphics_stages[0]); k++)
+        copyStage(ctx, NULL, graphics_stages[k], from, to);
 }
 
 // The program a draw with this pipeline runs, or NULL when there is none.
@@ -671,10 +690,16 @@ static void leave(GLMContext ctx)
         int how = enter(ctx, compute);                \
         if (how == SKIP)                              \
             return;                                   \
+        MglWideDraw wide;                             \
+        mglWideLinesEnter(ctx, (compute) ? 0 : DRAW_MODE, &wide); \
         fn args;                                      \
+        mglWideLinesLeave(ctx, &wide);                \
         if (how == RUN_SWAPPED)                       \
             leave(ctx);                               \
     }
+
+// every draw entry names its primitive mode "mode"; compute has none
+#define DRAW_MODE mode
 
 WRAP(mglDrawArrays, (GLMContext ctx, GLenum mode, GLint first, GLsizei count), (ctx, mode, first, count), false)
 WRAP(mglDrawElements, (GLMContext ctx, GLenum mode, GLsizei count, GLenum type, const void *indices), (ctx, mode, count, type, indices), false)
@@ -700,6 +725,8 @@ WRAP(mglMultiDrawArraysIndirect, (GLMContext ctx, GLenum mode, const void *indir
 WRAP(mglMultiDrawElementsIndirect, (GLMContext ctx, GLenum mode, GLenum type, const void *indirect, GLsizei drawcount, GLsizei stride), (ctx, mode, type, indirect, drawcount, stride), false)
 WRAP(mglMultiDrawArraysIndirectCount, (GLMContext ctx, GLenum mode, const void *indirect, GLintptr drawcount, GLsizei maxdrawcount, GLsizei stride), (ctx, mode, indirect, drawcount, maxdrawcount, stride), false)
 WRAP(mglMultiDrawElementsIndirectCount, (GLMContext ctx, GLenum mode, GLenum type, const void *indirect, GLintptr drawcount, GLsizei maxdrawcount, GLsizei stride), (ctx, mode, type, indirect, drawcount, maxdrawcount, stride), false)
+#undef DRAW_MODE
+#define DRAW_MODE 0
 WRAP(mglDispatchCompute, (GLMContext ctx, GLuint num_groups_x, GLuint num_groups_y, GLuint num_groups_z), (ctx, num_groups_x, num_groups_y, num_groups_z), true)
 WRAP(mglDispatchComputeIndirect, (GLMContext ctx, GLintptr indirect), (ctx, indirect), true)
 

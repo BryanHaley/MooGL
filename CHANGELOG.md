@@ -1,6 +1,28 @@
 ## MooGL 0.2.0
 
 ### Added
+- Existing apps built for Apple's OpenGL run on MooGL without being rebuilt. `MooGL.framework`
+  stands in for `OpenGL.framework`, and `tools/moogl-dropin` (`bin/` in the SDK) puts it in an
+  app. It exports every name Apple's framework does, CGL and Apple's GLU calls included, and
+  takes over the calls AppKit and other system code make into Apple's, so `NSOpenGLView` and
+  `NSOpenGLContext` draw with MooGL; so do SDL and GLFW, which open Apple's framework by path.
+  Blender 3.0, TrenchBroom, PrusaSlicer, OrcaSlicer, Mini vMac and SuperTuxKart run this way.
+  - A single-buffered CGL context shows what it drew at `glFlush`, as Apple's did.
+  - A legacy CGL context reports OpenGL 2.1, as Apple's did, so old programs take the paths
+    they were written for.
+- Doubles stay three floats each (about 72 bits) unless MooGL is built with
+  `-DMGL_FP64_MODE=1`, which gives two (about 48 bits) for speed. An app that cannot be rebuilt
+  gets the exact answer.
+- Wide lines in compatibility contexts, up to 16 pixels as on Apple's legacy contexts, for
+  line draws and for polygons drawn with `glPolygonMode(GL_LINE)`. Metal draws lines 1 pixel
+  wide, so a wider one is drawn as the quad GL says it covers. TrenchBroom's edges were too thin.
+- Quads, quad strips and polygons in `glPolygonMode(GL_LINE)` draw their outline only, as GL
+  and Apple's OpenGL do. They are split into triangles to draw, and the diagonals inside them
+  were drawn too.
+- `GL_GENERATE_MIPMAP` in compatibility contexts: an upload to a 2D texture's base level makes
+  its mipmaps again.
+- Plain pixels uploaded to an S3TC format are compressed on the way in, as Apple's driver does.
+  PrusaSlicer's toolbars were missing their backgrounds.
 - Minecraft runs on MooGL without being rebuilt: two JVM arguments in the launcher point
   LWJGL at MooGL's SDL3 and `libmoogl`. Minecraft 26.3 with Fabric, Sodium and Iris runs the
   BetterVoxels shaderpack, which needs OpenGL 4.3 and does not run on Apple's 4.1.
@@ -143,6 +165,23 @@
     each draw.
 
 ### Fixed
+- A glClear inside a scissor box now clears while glPolygonMode is GL_LINE or polygon offset
+  is on. Before, the box was left as it was.
+- libmoogl no longer loads Apple's OpenGL to fill in its starting state; the values it took
+  from Apple's driver are built in.
+- libmoogl keeps the glslang, SPIRV-Cross and SPIRV-Tools inside it to itself. An app with its
+  own copy, as SuperTuxKart has, had the two mixed and crashed compiling a shader.
+- A program whose stage is split across several shaders links, and so does the next program
+  that shares one of them. glslang merged the other units into the shader with `main`, so the
+  second link found their functions twice; TrenchBroom could not open a map.
+- `GL_ARB_shader_draw_parameters` works from GLSL 1.40, as the extension says. Blender 3.0 uses
+  `gl_BaseInstanceARB` from GLSL 3.30 and crashed at startup.
+- Reading a compressed texture back as plain pixels no longer trips a Metal assertion when the
+  command buffer was already sent.
+- New renderbuffers and multisample textures start out zeroed, as on Apple's driver. They
+  held whatever memory was there before, and games that don't clear them showed it
+  (Half-Life's menu was magenta). New textures also no longer get an opaque black pixel at
+  (0, 0).
 - Two vertex inputs that share a location with `component=` read the same attribute. The
   second was moved to a spare attribute as if it aliased the first, and with a geometry
   shader it read nothing. 44 KHR-Single enhanced_layouts cases failed on this.

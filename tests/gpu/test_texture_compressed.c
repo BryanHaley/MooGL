@@ -887,3 +887,53 @@ GPU_TEST(texture_compressed, bptc_compresses_plain_pixels)
     bptcRoundTrip(GL_COMPRESSED_RGB_BPTC_UNSIGNED_FLOAT, GL_RGBA32F, (const GLfloat[3]){ 1.5f, 0.25f, 3.0f }, 0.02f);
     bptcRoundTrip(GL_COMPRESSED_RGB_BPTC_SIGNED_FLOAT, GL_RGBA32F, (const GLfloat[3]){ -1.5f, 0.25f, 3.0f }, 0.04f);
 }
+
+/* Plain pixels into an S3TC format are compressed on the way in, as Apple's
+   driver does; PrusaSlicer's toolbars upload their textures this way. */
+GPU_TEST(texture_compressed, s3tc_compresses_plain_pixels)
+{
+    static const GLenum formats[4] = { GL_COMPRESSED_RGB_S3TC_DXT1_EXT, GL_COMPRESSED_RGBA_S3TC_DXT1_EXT,
+                                       GL_COMPRESSED_RGBA_S3TC_DXT3_EXT, GL_COMPRESSED_RGBA_S3TC_DXT5_EXT };
+    const GLsizei w = 12, h = 7;
+    GLubyte src[12 * 7 * 4], got[12 * 7 * 4];
+
+    for (GLsizei i = 0; i < w * h; i++)
+    {
+        src[i * 4 + 0] = (GLubyte)(i % w * 20);
+        src[i * 4 + 1] = 100;
+        src[i * 4 + 2] = 50;
+        src[i * 4 + 3] = 200;
+    }
+
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+
+    for (int f = 0; f < 4; f++)
+    {
+        GLuint tex = 0;
+        int worst = 0;
+
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        mgl_drain_errors();
+        glTexImage2D(GL_TEXTURE_2D, 0, formats[f], w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, src);
+        CHECK_EQ_UINT(GL_NO_ERROR, glGetError());
+
+        memset(got, 0, sizeof got);
+        glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, got);
+        CHECK_EQ_UINT(GL_NO_ERROR, glGetError());
+
+        /* the colour is kept to 5:6:5 points on a line, the alpha to steps */
+        for (GLsizei i = 0; i < w * h * 4; i++)
+        {
+            int d = abs((int)got[i] - (int)src[i]);
+
+            if (f < 2 && (i & 3) == 3)
+                continue;
+            if (d > worst)
+                worst = d;
+        }
+        CHECK_MSG(worst <= 24, "format 0x%x: worst channel is off by %d", formats[f], worst);
+        glDeleteTextures(1, &tex);
+    }
+}

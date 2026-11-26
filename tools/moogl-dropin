@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+# Copyright (C) The MooGL Project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Point an existing macOS app at MooGL.framework instead of OpenGL.framework.
+
+usage: moogl-dropin [--framework PATH] [-o OUT] APP_OR_BINARY
+
+Works on APP_OR_BINARY in place, or on a copy at OUT. Nothing is recompiled:
+the app gets MooGL.framework, its load commands for Apple's OpenGL are
+repointed, and it is signed again, ad hoc.
+"""
+
+import argparse
+import os
+import plistlib
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+
+APPLE = (
+    "/System/Library/Frameworks/OpenGL.framework/Versions/A/OpenGL",
+    "/System/Library/Frameworks/OpenGL.framework/OpenGL",
+    "/System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libGL.dylib",
+    "/System/Library/Frameworks/OpenGL.framework/Libraries/libGL.dylib",
+    "/System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libGLU.dylib",
+    "/System/Library/Frameworks/OpenGL.framework/Libraries/libGLU.dylib",
+)
+
+MH_MAGIC_64 = 0xFEEDFACF
+FAT_MAGIC = 0xCAFEBABE
+CPU_ARM64 = 0x0100000C
+LC_LOAD_DYLIB = 0xC
+LC_SEGMENT_64 = 0x19
+LC_SOURCE_VERSION = 0x2A
+LC_CODE_SIGNATURE_SIZE = 16
+
+
+def run(*cmd):
+    return subprocess.run(cmd, check=True, capture_output=True, text=True).stdout
+
+
+def macho_archs(path):
+    """The architectures of a Mach-O file, or None if it is not one."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4)
+    except OSError:
+        return None
+    if len(head) < 4:
+        return None
+    magic_be = struct.unpack(">I", head)[0]
+    magic_le = struct.unpack("<I", head)[0]
+    if magic_be == FAT_MAGIC or magic_le == MH_MAGIC_64:
+        return run("lipo", "-archs", path).split()
+    return None
+
+
+def linked_dylibs(path):
+    return [line.split(" (")[0].strip() for line in run("otool", "-arch", "arm64", "-L", path).splitlines()[1:]]
+
+
+def load_size(name):
+    return (24 + len(name) + 1 + 7) & ~7
+
+
+def insert_load_dylib(path, names):
+    """Adds LC_LOAD_DYLIB to a thin arm64 file, in the free space after its load
+    commands, using the first of names that fits."""
+    with open(path, "rb") as f:
+        data = bytearray(f.read())
+
+    magic, cputype, _, _, ncmds, sizeofcmds, _, _ = struct.unpack_from("<IiiIIIII", data, 0)
+    if magic != MH_MAGIC_64 or cputype != CPU_ARM64:
+        sys.exit(f"{path}: not a thin arm64 Mach-O file")
+
+    # the space before the first section's contents is free
+    first_data = len(data)
+    source_version = None
+    off = 32
+    for _ in range(ncmds):
+        cmd, size = struct.unpack_from("<II", data, off)
+        if cmd == LC_SEGMENT_64:
+            nsects = struct.unpack_from("<I", data, off + 64)[0]
+            for s in range(nsects):
+                sect = off + 72 + s * 80
+                offset = struct.unpack_from("<I", data, sect + 48)[0]
+                if offset:
+                    first_data = min(first_data, offset)
+        elif cmd == LC_SOURCE_VERSION:
+            source_version = (off, size)
+        off += size
+
+    # signing adds LC_CODE_SIGNATURE back
+    room = first_data - (32 + sizeofcmds) - LC_CODE_SIGNATURE_SIZE
+    name = next((n for n in names if load_size(n) <= room), None)
+    if name is None and source_version:
+        # only a note of the source version, and the one command safe to drop
+        at, size = source_version
+        data[at:32 + sizeofcmds] = data[at + size:32 + sizeofcmds] + bytes(size)
+        ncmds, sizeofcmds, room = ncmds - 1, sizeofcmds - size, room + size
+        name = next((n for n in names if load_size(n) <= room), None)
+    if name is None:
+        sys.exit(f"{path}: no room for another load command; relink it with -headerpad_max_install_names")
+
+    end = 32 + sizeofcmds
+    cmdsize = load_size(name)
+    cmd = struct.pack("<IIIIII", LC_LOAD_DYLIB, cmdsize, 24, 2, 0x10000, 0x10000) + name.encode()
+    data[end:end + cmdsize] = cmd.ljust(cmdsize, b"\0")
+    struct.pack_into("<II", data, 16, ncmds + 1, sizeofcmds + cmdsize)
+
+    with open(path, "wb") as f:
+        f.write(data)
+
+
+def rpaths(path):
+    lines = run("otool", "-arch", "arm64", "-l", path).splitlines()
+    return [lines[i + 2].split()[1] for i, line in enumerate(lines) if line.strip() == "cmd LC_RPATH"]
+
+
+def short_names(main_exe, fw_dir):
+    """Shorter names for the framework, for an executable with little header room."""
+    here = os.path.dirname(main_exe)
+    names = []
+    if os.path.realpath(os.path.join(here, "..", "Frameworks")) == os.path.realpath(fw_dir):
+        names.append("@executable_path/../Frameworks/MooGL.framework/MooGL")
+    for r in rpaths(main_exe):
+        d = r.replace("@loader_path", here).replace("@executable_path", here)
+        if os.path.realpath(d) == os.path.realpath(fw_dir):
+            names.append("@rpath/MooGL.framework/MooGL")
+    return names
+
+
+def entitlements(path):
+    return subprocess.run(["codesign", "-d", "--entitlements", ":-", path], capture_output=True).stdout.strip()
+
+
+def sign(path, ents=b""):
+    """Ad hoc, keeping the entitlements but not the hardened runtime, which
+    would refuse a framework from no team."""
+    args = ["codesign", "-f", "-s", "-"]
+    if ents:
+        tmp = tempfile.NamedTemporaryFile(suffix=".plist", delete=False)
+        tmp.write(ents)
+        tmp.close()
+        args += ["--entitlements", tmp.name]
+    run(*args, path)
+
+
+def main():
+    here = os.path.dirname(os.path.abspath(__file__))
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("target", help="an .app bundle or a single executable")
+    ap.add_argument("-o", "--output", help="work on a copy here instead of in place")
+    ap.add_argument("--framework", default=None, help="MooGL.framework to use")
+    args = ap.parse_args()
+
+    framework = args.framework
+    if framework is None:
+        for guess in (os.path.join(here, "MooGL.framework"), os.path.join(here, "..", "build", "MooGL.framework"),
+                      os.path.join(here, "..", "lib", "MooGL.framework")):
+            if os.path.isdir(guess):
+                framework = guess
+                break
+    if framework is None or not os.path.isdir(framework):
+        sys.exit("MooGL.framework not found: pass --framework")
+
+    target = os.path.abspath(args.target.rstrip("/"))
+    if args.output:
+        out = os.path.abspath(args.output.rstrip("/"))
+        if os.path.exists(out):
+            sys.exit(f"{out} already exists")
+        if os.path.isdir(target):
+            shutil.copytree(target, out, symlinks=True)
+        else:
+            shutil.copy2(target, out)
+        target = out
+
+    if os.path.isdir(target):
+        info = plistlib.load(open(os.path.join(target, "Contents", "Info.plist"), "rb"))
+        main_exe = os.path.join(target, "Contents", "MacOS", info["CFBundleExecutable"])
+        fw_dir = os.path.join(target, "Contents", "Frameworks")
+        fw_path = "@executable_path/../Frameworks/MooGL.framework/Versions/A/MooGL"
+        files = []
+        for root, dirs, names in os.walk(os.path.join(target, "Contents")):
+            dirs[:] = [d for d in dirs if d != "MooGL.framework"]
+            files += [os.path.join(root, n) for n in names if not os.path.islink(os.path.join(root, n))]
+    else:
+        main_exe = target
+        fw_dir = os.path.dirname(target)
+        fw_path = "@executable_path/MooGL.framework/Versions/A/MooGL"
+        files = [target]
+
+    archs = macho_archs(main_exe)
+    if not archs or "arm64" not in archs:
+        sys.exit(f"{main_exe}: has no arm64 code; MooGL runs arm64 apps only")
+    ents = entitlements(main_exe)
+
+    changed = []
+    for path in files:
+        archs = macho_archs(path)
+        if not archs or "arm64" not in archs:
+            continue
+        apple = [d for d in linked_dylibs(path) if d in APPLE]
+        if not apple and path != main_exe:
+            continue
+        if len(archs) > 1:
+            run("lipo", path, "-thin", "arm64", "-output", path)
+        run("codesign", "--remove-signature", path)
+        for d in apple:
+            run("install_name_tool", "-change", d, fw_path, path)
+        changed.append((path, bool(apple)))
+
+    # nothing links OpenGL by name, as with SDL's dlopen of it: load it anyway
+    has_moogl = any("MooGL.framework" in d for d in linked_dylibs(main_exe))
+    if not any(linked for _, linked in changed) and not has_moogl:
+        insert_load_dylib(main_exe, [fw_path] + short_names(main_exe, fw_dir))
+
+    os.makedirs(fw_dir, exist_ok=True)
+    dest = os.path.join(fw_dir, "MooGL.framework")
+    if os.path.realpath(dest) != os.path.realpath(framework):
+        if os.path.exists(dest):
+            shutil.rmtree(dest)
+        shutil.copytree(framework, dest, symlinks=True)
+
+    for path, _ in changed:
+        if path != main_exe:
+            sign(path)
+    sign(target, ents)
+
+    for path, linked in changed:
+        if linked or not has_moogl:
+            print(("repointed " if linked else "added MooGL to ") + os.path.relpath(path, os.path.dirname(target)))
+    print(f"{target} now uses MooGL.framework")
+    if subprocess.run(["xattr", "-p", "com.apple.quarantine", main_exe], capture_output=True).returncode == 0:
+        print("It came from the internet and is now signed ad hoc, so Gatekeeper will refuse to open it.\n"
+              f"If you trust it: xattr -dr com.apple.quarantine '{target}'")
+
+
+if __name__ == "__main__":
+    main()

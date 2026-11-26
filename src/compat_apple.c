@@ -142,12 +142,43 @@ static bool ycbcrType(GLMContext ctx, GLenum type)
     return false;
 }
 
+// --- GL_GENERATE_MIPMAP --------------------------------------------------------------
+
+#define MGL_GENERATE_MIPMAP 0x8191
+
+// after an upload: a 2D texture asked for it gets its mipmaps made again
+static void autoMipmaps(GLMContext ctx, GLenum target, GLint level)
+{
+    Texture *tex;
+
+    if (target != GL_TEXTURE_2D || (tex = bound(ctx, target)) == NULL)
+        return;
+
+    if (tex->generate_mipmap && level == (GLint)tex->params.base_level && tex->width > 0 && tex->height > 0)
+        C->next.generate_mipmap(ctx, target);
+}
+
+static bool generateMipmapParam(GLMContext ctx, GLenum target, GLint value)
+{
+    Texture *tex = bound(ctx, target);
+
+    if (tex == NULL)
+    {
+        ctx->error_func(ctx, __FUNCTION__, GL_INVALID_ENUM);
+        return true;
+    }
+
+    tex->generate_mipmap = value != 0;
+    return true;
+}
+
 static void cTexImage2D(GLMContext ctx, GLenum target, GLint level, GLint internalformat, GLsizei width,
                         GLsizei height, GLint border, GLenum format, GLenum type, const void *pixels)
 {
     if (format != GL_YCBCR_422_APPLE)
     {
         C->next.tex_image2D(ctx, target, level, internalformat, width, height, border, format, type, pixels);
+        autoMipmaps(ctx, target, level);
         return;
     }
 
@@ -171,6 +202,7 @@ static void cTexImage2D(GLMContext ctx, GLenum target, GLint level, GLint intern
     C->next.tex_image2D(ctx, target, level, internalformat, width, height, border, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
     restoreUnpack(ctx, &saved);
     free(rgba);
+    autoMipmaps(ctx, target, level);
 }
 
 static void cTexSubImage2D(GLMContext ctx, GLenum target, GLint level, GLint xoffset, GLint yoffset,
@@ -179,6 +211,7 @@ static void cTexSubImage2D(GLMContext ctx, GLenum target, GLint level, GLint xof
     if (format != GL_YCBCR_422_APPLE)
     {
         C->next.tex_sub_image2D(ctx, target, level, xoffset, yoffset, width, height, format, type, pixels);
+        autoMipmaps(ctx, target, level);
         return;
     }
 
@@ -195,6 +228,7 @@ static void cTexSubImage2D(GLMContext ctx, GLenum target, GLint level, GLint xof
     C->next.tex_sub_image2D(ctx, target, level, xoffset, yoffset, width, height, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
     restoreUnpack(ctx, &saved);
     free(rgba);
+    autoMipmaps(ctx, target, level);
 }
 
 // --- GL_APPLE_client_storage ---------------------------------------------------------
@@ -251,6 +285,8 @@ static void cTexParameteri(GLMContext ctx, GLenum target, GLenum pname, GLint pa
 {
     if (pname == GL_TEXTURE_STORAGE_HINT_APPLE && storageHint(ctx, target, param))
         return;
+    if (pname == MGL_GENERATE_MIPMAP && generateMipmapParam(ctx, target, param))
+        return;
 
     C->next.tex_parameteri(ctx, target, pname, param);
 }
@@ -258,6 +294,8 @@ static void cTexParameteri(GLMContext ctx, GLenum target, GLenum pname, GLint pa
 static void cTexParameterf(GLMContext ctx, GLenum target, GLenum pname, GLfloat param)
 {
     if (pname == GL_TEXTURE_STORAGE_HINT_APPLE && storageHint(ctx, target, (GLint)param))
+        return;
+    if (pname == MGL_GENERATE_MIPMAP && generateMipmapParam(ctx, target, (GLint)param))
         return;
 
     C->next.tex_parameterf(ctx, target, pname, param);
@@ -267,6 +305,8 @@ static void cTexParameteriv(GLMContext ctx, GLenum target, GLenum pname, const G
 {
     if (pname == GL_TEXTURE_STORAGE_HINT_APPLE && params && storageHint(ctx, target, params[0]))
         return;
+    if (pname == MGL_GENERATE_MIPMAP && params && generateMipmapParam(ctx, target, params[0]))
+        return;
 
     C->next.tex_parameteriv(ctx, target, pname, params);
 }
@@ -275,6 +315,8 @@ static void cTexParameterfv(GLMContext ctx, GLenum target, GLenum pname, const G
 {
     if (pname == GL_TEXTURE_STORAGE_HINT_APPLE && params && storageHint(ctx, target, (GLint)params[0]))
         return;
+    if (pname == MGL_GENERATE_MIPMAP && params && generateMipmapParam(ctx, target, (GLint)params[0]))
+        return;
 
     C->next.tex_parameterfv(ctx, target, pname, params);
 }
@@ -282,7 +324,8 @@ static void cTexParameterfv(GLMContext ctx, GLenum target, GLenum pname, const G
 // what the range queries answer, or false for a name this file does not own
 static bool rangeParam(GLMContext ctx, GLenum target, GLenum pname, GLint *out)
 {
-    if (pname != GL_TEXTURE_STORAGE_HINT_APPLE && pname != GL_TEXTURE_RANGE_LENGTH_APPLE)
+    if (pname != GL_TEXTURE_STORAGE_HINT_APPLE && pname != GL_TEXTURE_RANGE_LENGTH_APPLE &&
+        pname != MGL_GENERATE_MIPMAP)
         return false;
 
     Texture *tex = bound(ctx, target);
@@ -293,7 +336,9 @@ static bool rangeParam(GLMContext ctx, GLenum target, GLenum pname, GLint *out)
         return true;
     }
 
-    if (pname == GL_TEXTURE_RANGE_LENGTH_APPLE)
+    if (pname == MGL_GENERATE_MIPMAP)
+        *out = tex->generate_mipmap;
+    else if (pname == GL_TEXTURE_RANGE_LENGTH_APPLE)
         *out = tex->apple_range_length;
     else
         *out = tex->apple_storage_hint ? (GLint)tex->apple_storage_hint : GL_STORAGE_PRIVATE_APPLE;
