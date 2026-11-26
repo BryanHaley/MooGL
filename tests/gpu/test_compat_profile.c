@@ -1424,3 +1424,218 @@ GPU_TEST(compat_profile, integer_attributes_from_client_memory)
     closeCompat(c, &t);
 }
 
+
+// Metal lines are one pixel; wider ones are drawn as quads
+GPU_TEST(compat_profile, wide_lines_draw_wide)
+{
+    MGLTestTarget t;
+    unsigned char in[4], edge[4], out[4];
+    GLfloat range[2] = { 0, 0 };
+    GLMContext c = openCompat(&t);
+
+    CHECK(c != NULL);
+    if (!c)
+        return;
+
+    glGetFloatv(GL_ALIASED_LINE_WIDTH_RANGE, range);
+    CHECK_MSG(range[1] >= 16.0f, "widest line %f", range[1]);
+
+    // across the middle, five rows from 13 to 17
+    glLineWidth(5.0f);
+    glBegin(GL_LINES);
+    glColor3f(1, 0, 0);
+    glVertex2f(-1, 0);
+    glVertex2f(1, 0);
+    glEnd();
+
+    pixel(&t, W / 2, 13, edge);
+    pixel(&t, W / 2, 17, in);
+    pixel(&t, W / 2, 19, out);
+    CHECK_MSG(IS(edge, 255, 0, 0) && IS(in, 255, 0, 0), "rows 13 and 17: %d %d", edge[0], in[0]);
+    CHECK_MSG(IS(out, 0, 0, 0), "row 19: %d", out[0]);
+
+    // a long line passing beside the eye, one end behind it, stays five pixels across
+    glClear(GL_COLOR_BUFFER_BIT);
+    glMatrixMode(GL_PROJECTION);
+    glFrustum(-1, 1, -1, 1, 1, 100);
+    glBegin(GL_LINES);
+    glColor3f(0, 1, 0);
+    glVertex3f(-50, -0.5f, -50);
+    glVertex3f(50, -0.5f, 10);
+    glEnd();
+    glLoadIdentity();
+
+    unsigned char *px = mgl_read_rgba8(&t);
+    int lit = 0;
+
+    for (int i = 0; px && i < W * H; i++)
+        lit += px[i * 4 + 1] > 128;
+    free(px);
+    // five rows across the target
+    CHECK_MSG(abs(lit - 5 * W) <= W / 2, "%d pixels lit", lit);
+    CHECK_EQ_UINT(glGetError(), GL_NO_ERROR);
+
+    closeCompat(c, &t);
+}
+
+GPU_TEST(compat_profile, wide_lines_keep_a_programs_varyings_and_uniforms)
+{
+    static const char *VS =
+        "#version 120\n"
+        "attribute vec2 pos;\n"
+        "varying vec4 c;\n"
+        "void main() { c = vec4(0.0, 1.0, 0.0, 1.0); gl_Position = vec4(pos, 0.0, 1.0); }\n";
+    static const char *FS =
+        "#version 120\n"
+        "uniform vec4 tint;\n"
+        "varying vec4 c;\n"
+        "void main() { gl_FragColor = c * tint; }\n";
+    static const GLfloat verts[] = { 0, -1, 0, 1 };
+    MGLTestTarget t;
+    unsigned char in[4], out[4];
+    char log[512];
+    GLMContext c = openCompat(&t);
+
+    CHECK(c != NULL);
+    if (!c)
+        return;
+
+    GLuint prog = mgl_build_program(VS, FS, log, sizeof log);
+    CHECK_MSG(prog != 0, "program did not build: %s", log);
+
+    if (prog)
+    {
+        glUseProgram(prog);
+        glUniform4f(glGetUniformLocation(prog, "tint"), 1.0f, 0.5f, 1.0f, 1.0f);
+
+        // lines are never culled, whichever way the quads would face
+        glEnable(GL_CULL_FACE);
+        glFrontFace(GL_CW);
+
+        GLint pos = glGetAttribLocation(prog, "pos");
+        glEnableVertexAttribArray((GLuint)pos);
+        glVertexAttribPointer((GLuint)pos, 2, GL_FLOAT, GL_FALSE, 0, verts);
+        glLineWidth(5.0f);
+        glDrawArrays(GL_LINES, 0, 2);
+
+        pixel(&t, 13, H / 2, in);
+        pixel(&t, 19, H / 2, out);
+        CHECK_MSG(IS(in, 0, 128, 0), "column 13: %d %d %d", in[0], in[1], in[2]);
+        CHECK_MSG(IS(out, 0, 0, 0), "column 19: %d %d %d", out[0], out[1], out[2]);
+        CHECK_EQ_UINT(glGetError(), GL_NO_ERROR);
+
+        GLint face = 0;
+        glGetIntegerv(GL_FRONT_FACE, &face);
+        CHECK_EQ_INT(face, GL_CW);
+
+        glDisableVertexAttribArray((GLuint)pos);
+        glUseProgram(0);
+        glDeleteProgram(prog);
+    }
+
+    closeCompat(c, &t);
+}
+
+GPU_TEST(compat_profile, wide_lines_draw_polygon_mode_edges)
+{
+    MGLTestTarget t;
+    unsigned char a[4], b[4], inside[4], outside[4];
+    GLMContext c = openCompat(&t);
+
+    CHECK(c != NULL);
+    if (!c)
+        return;
+
+    // the left edge sits on column 8; five wide covers 6 to 9
+    glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+    glLineWidth(5.0f);
+    glEnable(GL_CULL_FACE);
+    for (int pass = 0; pass < 2; pass++)
+    {
+        glClear(GL_COLOR_BUFFER_BIT);
+        // the second pass makes the triangle face the back, which is culled
+        glFrontFace(pass ? GL_CW : GL_CCW);
+        glBegin(GL_TRIANGLES);
+        glColor3f(1, 0, 0);
+        glVertex2f(-0.5f, -0.5f);
+        glVertex2f(0.5f, -0.5f);
+        glVertex2f(-0.5f, 0.5f);
+        glEnd();
+
+        pixel(&t, 6, 16, a);
+        pixel(&t, 9, 16, b);
+        pixel(&t, 12, 16, inside);
+        pixel(&t, 3, 16, outside);
+
+        if (pass == 0)
+        {
+            CHECK_MSG(IS(a, 255, 0, 0) && IS(b, 255, 0, 0), "edge: %d %d", a[0], b[0]);
+            CHECK_MSG(IS(inside, 0, 0, 0) && IS(outside, 0, 0, 0), "inside %d, outside %d", inside[0], outside[0]);
+        }
+        else
+            CHECK_MSG(IS(a, 0, 0, 0), "culled triangle drew %d", a[0]);
+    }
+
+    CHECK_EQ_UINT(glGetError(), GL_NO_ERROR);
+    closeCompat(c, &t);
+}
+
+// GL draws a quad's or polygon's outline in line mode, not the diagonals
+// it is split into triangles along
+GPU_TEST(compat_profile, polygon_mode_quads_leave_out_their_diagonals)
+{
+    static const GLfloat strip[] = { -0.5f, -0.5f, 0.5f, -0.5f, -0.5f, 0, 0.5f, 0, -0.5f, 0.5f, 0.5f, 0.5f };
+    MGLTestTarget t;
+    unsigned char edge[4], mid[4], lower[4], upper[4];
+    GLMContext c = openCompat(&t);
+
+    CHECK(c != NULL);
+    if (!c)
+        return;
+
+    glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+    glColor3f(1, 0, 0);
+
+    for (int width = 1; width <= 3; width += 2)
+    {
+        glLineWidth((GLfloat)width);
+
+        for (int m = 0; m < 2; m++)
+        {
+            glClear(GL_COLOR_BUFFER_BIT);
+            glBegin(m ? GL_POLYGON : GL_QUADS);
+            glVertex2f(-0.5f, -0.5f);
+            glVertex2f(0.5f, -0.5f);
+            glVertex2f(0.5f, 0.5f);
+            glVertex2f(-0.5f, 0.5f);
+            glEnd();
+
+            // a 1 pixel edge on a pixel boundary lands on either side of it
+            pixel(&t, 16, 16, mid);
+            pixel(&t, 7, 16, edge);
+            pixel(&t, 8, 16, upper);
+            CHECK_MSG(IS(edge, 255, 0, 0) || IS(upper, 255, 0, 0), "%s width %d: outline %d %d",
+                      m ? "polygon" : "quad", width, edge[0], upper[0]);
+            CHECK_MSG(IS(mid, 0, 0, 0), "%s width %d: diagonal %d", m ? "polygon" : "quad", width, mid[0]);
+        }
+
+        // two quads from client arrays: the edge they share is drawn, their diagonals are not
+        glClear(GL_COLOR_BUFFER_BIT);
+        glEnableClientState(GL_VERTEX_ARRAY);
+        glVertexPointer(2, GL_FLOAT, 0, strip);
+        glDrawArrays(GL_QUAD_STRIP, 0, 6);
+        glDisableClientState(GL_VERTEX_ARRAY);
+
+        pixel(&t, 16, 12, lower);
+        pixel(&t, 16, 20, upper);
+        CHECK_MSG(IS(lower, 0, 0, 0) && IS(upper, 0, 0, 0), "width %d: strip diagonals %d %d", width, lower[0],
+                  upper[0]);
+        pixel(&t, 20, 15, lower);
+        pixel(&t, 20, 16, upper);
+        CHECK_MSG(IS(lower, 255, 0, 0) || IS(upper, 255, 0, 0), "width %d: shared edge %d %d", width, lower[0],
+                  upper[0]);
+    }
+
+    CHECK_EQ_UINT(glGetError(), GL_NO_ERROR);
+    closeCompat(c, &t);
+}

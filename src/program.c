@@ -40,6 +40,12 @@ static void assignPipeLocations(Program *ptr, spvc_compiler compiler, int stage)
 // the descriptor set MGL's own storage blocks live in
 #define MGL_INTERNAL_SET 2
 
+// SPIRV-Cross's FP64Mode: 2 is three floats a double (about 72 bits), 1 is two
+// (about 48). Only a build that asks for it gets the faster, shorter one.
+#ifndef MGL_FP64_MODE
+#define MGL_FP64_MODE 2
+#endif
+
 // in mgl_spirv_opt.cpp -- moves atomic counters into buffer blocks
 extern int mglLowerAtomicCounters(const unsigned int *words, size_t count,
                                   unsigned int **out_words, size_t *out_count,
@@ -312,6 +318,10 @@ void mglFreeProgram(GLMContext ctx, Program *ptr)
         mglReleaseBufferStorage(ctx, buf);
         free(buf);
     }
+
+    mglDropWideTwin(ctx, ptr);
+    free(ptr->wide_line_gs);
+    ptr->wide_line_gs = NULL;
 
     // no pipeline may go on pointing at it
     for (size_t k = 0; k < STATE(program_pipeline_table).size; k++)
@@ -2143,7 +2153,7 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage, Spirv *sp
 
     // Metal has no double. SPIRV-Cross carries every double as three floats
     // that add up to it, which is close enough for GL's fp64 rules.
-    if (spvc_compiler_options_set_uint(options, SPVC_COMPILER_OPTION_MSL_FP64_MODE, 2) != SPVC_SUCCESS) {
+    if (spvc_compiler_options_set_uint(options, SPVC_COMPILER_OPTION_MSL_FP64_MODE, MGL_FP64_MODE) != SPVC_SUCCESS) {
         MGL_ERR("MGL Error: spvc_compiler_options_set_uint(SPVC_COMPILER_OPTION_MSL_FP64_MODE) failed\n");
         { spvc_context_destroy(context); ERROR_RETURN_VALUE(GL_INVALID_OPERATION, NULL); }
     }
@@ -5832,6 +5842,27 @@ static void linkProgram(GLMContext ctx, GLuint program)
                 free(fake);
                 free(gsrc);
             }
+        }
+    }
+
+    // the copy of a program wide lines are drawn with (wide_lines.c)
+    if (pptr->geom_shader == NULL && pptr->wide_line_gs)
+    {
+        Shader *fake = (Shader *)calloc(1, sizeof(Shader));
+        char *gsrc = strdup(pptr->wide_line_gs);
+
+        if (fake && gsrc)
+        {
+            fake->name = pptr->shader_slots[_VERTEX_SHADER] ? pptr->shader_slots[_VERTEX_SHADER]->name : 0;
+            fake->type = GL_GEOMETRY_SHADER;
+            fake->src = gsrc;
+            pptr->synthetic_gs = fake;
+            pptr->geom_shader = fake;
+        }
+        else
+        {
+            free(fake);
+            free(gsrc);
         }
     }
 

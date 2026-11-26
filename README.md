@@ -131,6 +131,18 @@ See [Known limits](#known-limits) for what the compatibility profile covers. Old
 - `SDL_Renderer`'s `opengl` backend, and any texture border colour, exact even with linear filtering.
 - SFML 3 and 2.6: the graphics module, `sf::Shader` and text included, draws through a compatibility context.
 
+## Existing apps, without rebuilding them
+
+`moogl-dropin` gives an app that was built for Apple's OpenGL `MooGL.framework` in place of `OpenGL.framework`. Nothing is recompiled: the app gets a copy of the framework, its links to Apple's OpenGL point at MooGL's, and it is signed again, ad hoc.
+
+```bash
+bin/moogl-dropin /Applications/Blender.app -o ~/Blender-MooGL.app
+```
+
+Without `-o` it changes the app in place. It works on `NSOpenGLView` and `NSOpenGLContext`, CGL, GLUT, SDL and GLFW apps. Tried this way: Blender 3.0, TrenchBroom, PrusaSlicer, OrcaSlicer, Mini vMac and SuperTuxKart, which runs faster on MooGL than on Apple's OpenGL (283 fps against 262 in its benchmark). See [Known limits](#known-limits) for what it will not do.
+
+An app that came from the internet is refused by Gatekeeper once it is signed ad hoc; `moogl-dropin` prints the command that clears it, for an app you trust.
+
 ## Get the SDK
 
 Download `MooGL-SDK-<version>-macos-arm64.tar.gz` from the [releases page](https://github.com/BryanHaley/MooGL/releases) and unpack it anywhere (`/opt/MooGL-SDK` is used as the example in this README).
@@ -574,8 +586,10 @@ All of OpenGL 4.6 core, plus:
 ## Known limits
 
 - The compatibility profile covers what old programs mostly use: `glBegin` and `glEnd`, client-side vertex arrays, quads and polygons, the matrix stacks, fixed-function lighting, `glTexEnv` (including `GL_COMBINE`), texture coordinate generation, fog, point sprites, `glPushAttrib`, front and back polygon modes, display lists, evaluators (`glMap`, `glEvalMesh`), selection with `glRenderMode(GL_SELECT)`, `glRasterPos`, `glDrawPixels`, `glBitmap`, `glCopyPixels`, the luminance and alpha texture formats, and old GLSL (1.10 to 1.30) that reads `gl_ModelViewMatrix` and the other built-ins. Missing: feedback mode (it returns nothing), the accumulation buffer, colour-index mode, and depth or stencil through `glDrawPixels` and `glCopyPixels`. Line and polygon stipple and edge flags are accepted but not drawn. `GL_APPLE_client_storage` copies the texture rather than reading the application's memory, which the extension allows.
-- CGL and AGL contexts draw offscreen, into framebuffer objects. Putting one in a window, which is what `NSOpenGLView` and `NSOpenGLContext` do through Apple's private `CGLSetSurface`, isn't done yet; neither are AGL's Carbon windows, which no longer exist.
-- Apps built for Apple's OpenGL need relinking against MooGL. Drop-in replacement of the system framework is on the roadmap.
+- A CGL or AGL context made directly draws offscreen, into framebuffer objects, until `NSOpenGLContext` puts it in a window. AGL's Carbon windows no longer exist.
+- `moogl-dropin` changes the app, never the system: Apple's `OpenGL.framework` is sealed. It runs arm64 apps only, and makes a universal app arm64 only. An app signed again ad hoc loses its hardened runtime, and entitlements that need a team, such as iCloud or a keychain group, stop working.
+- Wide lines, up to 16 pixels as Apple's legacy contexts drew them, work in compatibility contexts only. A core context draws every line 1 pixel wide, as Apple's core contexts did. Wide lines from programs with a geometry or tessellation stage also stay 1 pixel wide.
+- A CGL pbuffer is kept and described, but a context does not draw into it. Code built with `CGLMacro.h`, which calls into Apple's context structure directly, does not work.
 - Mesh shaders with per-primitive `gl_Layer`: IDKEngine's mesh-shader point shadows drop a few triangles, differently from run to run. Seven smaller tests of the same pattern pass, so it looks like a Metal driver issue. The vertex-shader path is not affected.
 - Some Minecraft shaderpacks do an explicit check for macOS and refuse to run when it's detected; this is beyond MooGL's control and the shaderpack must be changed.
 
@@ -585,7 +599,7 @@ All of OpenGL 4.6 core, plus:
 git clone --recursive https://github.com/BryanHaley/MooGL.git
 cd MooGL
 tools/build_deps.sh      # SPIRV-Cross, SPIRV-Tools, glslang and GLFW, built once
-make -j                  # build/libmoogl.dylib, GLFW, SDL, SFML, raylib and the FSR 2 libraries
+make -j                  # build/libmoogl.dylib, MooGL.framework, GLFW, SDL, SFML, raylib and the FSR 2 libraries
 make -j OGL_ES=1         # the same, with OpenGL ES contexts
 make test                # MooGL's own suite (needs a GPU and a logged-in session)
 make window-test         # GLFW, SDL, SFML, raylib and GLUT in real windows

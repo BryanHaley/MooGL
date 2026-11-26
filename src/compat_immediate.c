@@ -187,6 +187,8 @@ void mglCompatDrawRecords(GLMContext ctx, GLenum mode, const GLfloat *records, G
     if (C->imm_buf == NULL && (C->imm_buf = newBuffer(ctx, GL_ARRAY_BUFFER, 0)) == NULL)
         return;
 
+    GLenum split = mode == GL_TRIANGLE_FAN ? 0 : mode;
+
     // the shapes Metal has no primitive for become a plain triangle list
     if (mode == GL_QUADS || mode == GL_QUAD_STRIP || mode == GL_POLYGON || mode == GL_TRIANGLE_FAN)
     {
@@ -291,7 +293,13 @@ void mglCompatDrawRecords(GLMContext ctx, GLenum mode, const GLfloat *records, G
 
     // glEnd itself was what a list recorded
     C->no_record++;
+    if (split && n > 0 && mode == GL_TRIANGLES)
+    {
+        C->split_mode = split;
+        C->split_tris = n / 3;
+    }
     mglCompatDrawFull(ctx, mode, 0, n, 0, NULL, 1, 0, 0);
+    C->split_mode = 0;
     C->no_record--;
 
     STATE(vao) = was;

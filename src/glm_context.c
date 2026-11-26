@@ -574,6 +574,20 @@ void MGLsetSwapInterval(GLMContext ctx, int interval)
         ctx->mtl_funcs.mtlSetSwapInterval(ctx, interval);
 }
 
+void mglSetPresentOnFlush(GLMContext ctx, bool on)
+{
+    ctx->present_on_flush = on;
+}
+
+// only 2.1 for now, as Apple's legacy contexts reported
+void mglSetReportedVersion(GLMContext ctx, int major, int minor)
+{
+    ctx->reported_major = major;
+    ctx->reported_minor = minor;
+    ctx->state.var.major_version = major;
+    ctx->state.var.minor_version = minor;
+}
+
 void MGLsetContextView(GLMContext ctx, void *view)
 {
     if (ctx == NULL)

@@ -70,6 +70,10 @@ mkdir -p "$out/lib/cmake/MooGL" "$out/include/GL" "$out/include/KHR" "$out/inclu
 for lib in $libs; do
     cp "$build/$lib" "$out/lib/"
 done
+# drops in for OpenGL.framework in an existing app, with bin/moogl-dropin
+cp -a "$build/MooGL.framework" "$out/lib/"
+mkdir -p "$out/bin"
+cp tools/moogl-dropin "$out/bin/"
 # programs built against a stock GLFW or SDL2 ask for them by these names
 cp "$build/libimgui.a" "$out/lib/"
 ln -s libglfw.dylib "$out/lib/libglfw.3.dylib"
@@ -169,6 +173,8 @@ OpenGL 4.6 core on Metal, for Apple silicon Macs on macOS $MACOSX_DEPLOYMENT_TAR
 - \`sfml2/\`: SFML 2.6, with its own \`include/\`, \`lib/\` and CMake package
 - \`examples/\`: \`cmake -B build -DCMAKE_PREFIX_PATH=\$PWD/../.. && cmake --build build\`
 - \`nuget/\`: the FFX_FSR2 C# package for macOS, if present
+- \`bin/moogl-dropin\` and \`lib/MooGL.framework\`: run an existing app on MooGL without rebuilding it,
+  \`bin/moogl-dropin Some.app -o Some-MooGL.app\`
 
 The full guide is at https://github.com/BryanHaley/MGL.
 EOF
@@ -212,6 +218,9 @@ if [ -n "${MOOGL_SIGN_IDENTITY:-}" ]; then
         [ -L "$lib" ] || codesign --force --timestamp --options runtime --sign "$MOOGL_SIGN_IDENTITY" "$lib"
     done
     codesign --force --timestamp --options runtime --sign "$MOOGL_SIGN_IDENTITY" "$out/sfml2/lib/freetype.framework"
+    codesign --force --timestamp --options runtime --sign "$MOOGL_SIGN_IDENTITY" \
+        "$out"/lib/MooGL.framework/Versions/A/Libraries/*.dylib
+    codesign --force --timestamp --options runtime --sign "$MOOGL_SIGN_IDENTITY" "$out/lib/MooGL.framework"
 else
     codesign --force --sign - "$out/sfml2/lib/libsfml-window.2.6.2.dylib"
 fi

@@ -392,7 +392,8 @@ static void mglGet(GLMContext ctx, GLenum pname, GLuint type, void *data)
         case 0x0B12: RET_PAIR(1.0, 511.0); break; // GL_POINT_SIZE_RANGE, what Metal draws
         case 0x0B13: RET_TYPE_VAR(type, point_size_granularity); break; // GL_POINT_SIZE_GRANULARITY
         case 0x0B21: RET_TYPE_VAR(type, line_width); break; // GL_LINE_WIDTH
-        case 0x0B22: RET_PAIR(1.0, 1.0); break; // GL_LINE_WIDTH_RANGE, Metal lines are one pixel
+        // Metal lines are one pixel; compatibility contexts draw wider ones as quads
+        case 0x0B22: RET_PAIR(1.0, ctx->compat ? 16.0 : 1.0); break; // GL_LINE_WIDTH_RANGE
         case 0x0B23: RET_TYPE_VAR(type, line_width_granularity); break; // GL_LINE_WIDTH_GRANULARITY
         case 0x0B40: RET_TYPE_VAR(type, polygon_mode); break; // GL_POLYGON_MODE
         case 0x0B45: RET_TYPE_VAR(type, cull_face_mode); break; // GL_CULL_FACE_MODE
@@ -554,7 +555,7 @@ static void mglGet(GLMContext ctx, GLenum pname, GLuint type, void *data)
         case 0x8073: RET_TYPE_VAR(type, max_3d_texture_size); break; // GL_MAX_3D_TEXTURE_SIZE
         case 0x80E8: RET_TYPE_VAR(type, max_elements_vertices); break; // GL_MAX_ELEMENTS_VERTICES
         case 0x80E9: RET_TYPE_VAR(type, max_elements_indices); break; // GL_MAX_ELEMENTS_INDICES
-        case 0x846E: RET_PAIR(1.0, 1.0); break; // GL_ALIASED_LINE_WIDTH_RANGE
+        case 0x846E: RET_PAIR(1.0, ctx->compat ? 16.0 : 1.0); break; // GL_ALIASED_LINE_WIDTH_RANGE
         case 0x846D: RET_PAIR(1.0, 511.0); break; // GL_ALIASED_POINT_SIZE_RANGE
         // Metal restarts strips, never patches
         case 0x8221:  // GL_PRIMITIVE_RESTART_FOR_PATCHES_SUPPORTED

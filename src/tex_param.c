@@ -23,6 +23,7 @@
 #include "utils.h"
 #include "mgl_format_table.h"
 #include "pixel_utils.h"
+#include "mgl_log.h"
 
 extern GLuint textureIndexFromTarget(GLMContext ctx, GLenum target);
 extern Texture *currentTexture(GLMContext ctx, GLuint index);
@@ -604,6 +605,7 @@ static void setTexParamiv(GLMContext ctx, Texture *tex, GLenum pname, const GLin
         return;
     }
 
+    MGL_DEBUG("MGL: texture parameter 0x%x not known\n", pname);
     ERROR_RETURN(GL_INVALID_ENUM);
 }
 

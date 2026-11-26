@@ -2170,12 +2170,228 @@ static GLboolean compressToBPTC(const void *src, size_t src_row_pitch, GLenum fo
     return GL_TRUE;
 }
 
+/* ---------------------------------------------------------------- */
+/*  S3TC encoding                                                    */
+/* ---------------------------------------------------------------- */
+
+// Each block takes the box of its colours as the line's ends and every texel
+// the nearest of the points along it. Plain, but what any decoder reads.
+
+#define MGL_SRGB_S3TC_DXT1          0x8C4C
+#define MGL_SRGB_ALPHA_S3TC_DXT1    0x8C4D
+#define MGL_SRGB_ALPHA_S3TC_DXT3    0x8C4E
+#define MGL_SRGB_ALPHA_S3TC_DXT5    0x8C4F
+
+// 1 for DXT1 colour only, 2 for DXT1 with 1-bit alpha, 3 for DXT3, 5 for DXT5
+static int s3tcKind(GLenum internalformat)
+{
+    switch (internalformat)
+    {
+        case GL_COMPRESSED_RGB_S3TC_DXT1_EXT: case MGL_SRGB_S3TC_DXT1: return 1;
+        case GL_COMPRESSED_RGBA_S3TC_DXT1_EXT: case MGL_SRGB_ALPHA_S3TC_DXT1: return 2;
+        case GL_COMPRESSED_RGBA_S3TC_DXT3_EXT: case MGL_SRGB_ALPHA_S3TC_DXT3: return 3;
+        case GL_COMPRESSED_RGBA_S3TC_DXT5_EXT: case MGL_SRGB_ALPHA_S3TC_DXT5: return 5;
+        default: return 0;
+    }
+}
+
+static GLushort to565(const float c[3])
+{
+    return (GLushort)(((GLuint)(c[0] * 31.0f / 255.0f + 0.5f) << 11) | ((GLuint)(c[1] * 63.0f / 255.0f + 0.5f) << 5) |
+                      (GLuint)(c[2] * 31.0f / 255.0f + 0.5f));
+}
+
+static void from565(GLushort v, float c[3])
+{
+    c[0] = (float)((v >> 11) & 31) * 255.0f / 31.0f;
+    c[1] = (float)((v >> 5) & 63) * 255.0f / 63.0f;
+    c[2] = (float)(v & 31) * 255.0f / 31.0f;
+}
+
+// texels with alpha under 128 are the transparent index when punch_through
+static void encodeBC1Colour(const float px[16][4], bool punch_through, GLubyte *blk)
+{
+    float lo[3] = { 255, 255, 255 }, hi[3] = { 0, 0, 0 }, pal[4][3];
+    bool any_clear = false;
+    GLuint idx = 0;
+
+    for (int k = 0; k < 16; k++)
+    {
+        if (punch_through && px[k][3] < 128.0f)
+        {
+            any_clear = true;
+            continue;
+        }
+        for (int c = 0; c < 3; c++)
+        {
+            lo[c] = fminf(lo[c], px[k][c]);
+            hi[c] = fmaxf(hi[c], px[k][c]);
+        }
+    }
+
+    GLushort c0 = to565(hi), c1 = to565(lo);
+
+    // c0 > c1 picks four colours, c0 <= c1 three and transparent
+    if (any_clear ? c0 > c1 : c0 < c1)
+    {
+        GLushort t = c0; c0 = c1; c1 = t;
+    }
+    if (!any_clear && c0 == c1)
+    {
+        if (c1 > 0) c1--; else c0++;
+    }
+
+    from565(c0, pal[0]);
+    from565(c1, pal[1]);
+    for (int c = 0; c < 3; c++)
+    {
+        if (c0 > c1)
+        {
+            pal[2][c] = (2.0f * pal[0][c] + pal[1][c]) / 3.0f;
+            pal[3][c] = (pal[0][c] + 2.0f * pal[1][c]) / 3.0f;
+        }
+        else
+        {
+            pal[2][c] = (pal[0][c] + pal[1][c]) / 2.0f;
+            pal[3][c] = 0.0f;
+        }
+    }
+
+    for (int k = 0; k < 16; k++)
+    {
+        GLuint best = 0;
+        float best_d = 1e30f;
+
+        if (c0 <= c1 && punch_through && px[k][3] < 128.0f)
+            best = 3;
+        else
+            for (GLuint i = 0; i < (c0 > c1 ? 4u : 3u); i++)
+            {
+                float d = 0;
+
+                for (int c = 0; c < 3; c++)
+                    d += (px[k][c] - pal[i][c]) * (px[k][c] - pal[i][c]);
+                if (d < best_d)
+                {
+                    best_d = d;
+                    best = i;
+                }
+            }
+        idx |= best << (2 * k);
+    }
+
+    blk[0] = (GLubyte)c0; blk[1] = (GLubyte)(c0 >> 8);
+    blk[2] = (GLubyte)c1; blk[3] = (GLubyte)(c1 >> 8);
+    for (int i = 0; i < 4; i++)
+        blk[4 + i] = (GLubyte)(idx >> (8 * i));
+}
+
+// DXT5's alpha: eight steps between the block's lowest and highest
+static void encodeBC3Alpha(const float px[16][4], GLubyte *blk)
+{
+    float lo = 255, hi = 0, pal[8];
+    unsigned long long bits = 0;
+
+    for (int k = 0; k < 16; k++)
+    {
+        lo = fminf(lo, px[k][3]);
+        hi = fmaxf(hi, px[k][3]);
+    }
+
+    GLubyte a0 = (GLubyte)(hi + 0.5f), a1 = (GLubyte)(lo + 0.5f);
+
+    if (a0 == a1)
+    {
+        if (a1 > 0) a1--; else a0++;
+    }
+
+    pal[0] = a0;
+    pal[1] = a1;
+    for (int i = 1; i < 7; i++)
+        pal[i + 1] = ((7 - i) * (float)a0 + i * (float)a1) / 7.0f;
+
+    for (int k = 0; k < 16; k++)
+    {
+        int best = 0;
+        float best_d = 1e30f;
+
+        for (int i = 0; i < 8; i++)
+            if (fabsf(px[k][3] - pal[i]) < best_d)
+            {
+                best_d = fabsf(px[k][3] - pal[i]);
+                best = i;
+            }
+        bits |= (unsigned long long)best << (3 * k);
+    }
+
+    blk[0] = a0;
+    blk[1] = a1;
+    for (int i = 0; i < 6; i++)
+        blk[2 + i] = (GLubyte)(bits >> (8 * i));
+}
+
+static GLboolean compressToS3TC(const void *src, size_t src_row_pitch, GLenum format, GLenum type,
+                                void *dst, GLenum internalformat, GLsizei width, GLsizei height)
+{
+    int kind = s3tcKind(internalformat);
+    GLubyte *out = (GLubyte *)dst;
+
+    if (!src || !dst || width < 0 || height < 0)
+        return GL_FALSE;
+
+    for (GLsizei by = 0; by < height; by += 4)
+        for (GLsizei bx = 0; bx < width; bx += 4)
+        {
+            float px[16][4];
+
+            // texels past the edge repeat the last one
+            for (int k = 0; k < 16; k++)
+            {
+                GLsizei x = bx + (k & 3), y = by + (k >> 2);
+
+                if (x >= width) x = width - 1;
+                if (y >= height) y = height - 1;
+
+                const GLubyte *p = (const GLubyte *)src + (size_t)y * src_row_pitch
+                                 + (size_t)x * mglPackedPixelSize(format, type);
+                MGLTexel t;
+                GLboolean got = packed_type_size(type) ? decode_packed(p, format, type, &t)
+                                                       : decode_plain(p, format, type, &t);
+
+                if (!got)
+                    return GL_FALSE;
+
+                for (int c = 0; c < 4; c++)
+                    px[k][c] = fminf(fmaxf(t.f[c], 0.0f), 1.0f) * 255.0f;
+            }
+
+            if (kind == 3)
+            {
+                memset(out, 0, 8);
+                for (int k = 0; k < 16; k++)
+                    out[k / 2] |= (GLubyte)(((GLuint)(px[k][3] * 15.0f / 255.0f + 0.5f)) << (4 * (k & 1)));
+                out += 8;
+            }
+            else if (kind == 5)
+            {
+                encodeBC3Alpha(px, out);
+                out += 8;
+            }
+
+            encodeBC1Colour(px, kind == 2, out);
+            out += 8;
+        }
+
+    return GL_TRUE;
+}
+
 GLboolean mglFormatCompressible(GLenum internalformat)
 {
     GLuint channels = 0;
     GLboolean is_signed = GL_FALSE;
 
-    return mglFormatIsRGTC(internalformat, &channels, &is_signed) || formatIsBPTC(internalformat);
+    return mglFormatIsRGTC(internalformat, &channels, &is_signed) || formatIsBPTC(internalformat) ||
+           s3tcKind(internalformat) != 0;
 }
 
 GLboolean mglCompressPixels(const void *src, size_t src_row_pitch, GLenum format, GLenum type,
@@ -2183,6 +2399,9 @@ GLboolean mglCompressPixels(const void *src, size_t src_row_pitch, GLenum format
 {
     if (formatIsBPTC(internalformat))
         return compressToBPTC(src, src_row_pitch, format, type, dst, internalformat, width, height);
+
+    if (s3tcKind(internalformat))
+        return compressToS3TC(src, src_row_pitch, format, type, dst, internalformat, width, height);
 
     return mglCompressToRGTC(src, src_row_pitch, format, type, dst, internalformat, width, height);
 }

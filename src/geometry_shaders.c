@@ -4143,7 +4143,7 @@ static int blockMembers(const char *body, char names[][64], int max)
     return n;
 }
 
-char *mglPassThroughGeometry(const char *tes_src, int input)
+static char *passThrough(const char *tes_src, int input, bool wide)
 {
     Buf out = {0};
     GsVarying outs[MAX_GS_VARYINGS];
@@ -4260,7 +4260,47 @@ char *mglPassThroughGeometry(const char *tes_src, int input)
         "#version 430 core\nlayout(triangles) in;\nlayout(triangle_strip, max_vertices = 3) out;\n",
     };
 
-    if (input < 0 || input > 2 || !bufAdd(&out, heads[input]) || !addStructDefs(&out, tes_src))
+    // GL draws a wide line as the pixels within width/2 of it across its minor
+    // axis. A triangle in line mode draws each edge so, facing as it does.
+    static const char *wide_heads[2] = {
+        "#version 430 core\nlayout(lines) in;\nlayout(triangle_strip, max_vertices = 4) out;\n"
+        "uniform vec4 mglWideLine;\n",
+        "#version 430 core\nlayout(triangles) in;\nlayout(triangle_strip, max_vertices = 12) out;\n"
+        "uniform vec4 mglWideLine;\nuniform ivec2 mglWideShape;\n",
+    };
+    // The edges inside a quad or polygon that was split into triangles, a bit
+    // each, from the order compat_draw.c splits them in. mglWideShape is the
+    // mode they came from (1 quads, 2 quad strip, 3 polygon) and the count.
+    static const char *wide_hidden =
+        "int mglWideHidden()\n{\n"
+        "  int mglI = gl_PrimitiveIDIn, mglN = mglWideShape.y;\n"
+        "  if (mglWideShape.x == 1) return (mglI & 1) == 0 ? 4 : 1;\n"
+        "  if (mglWideShape.x == 2) return (mglI & 1) == 0 ? 1 : 4;\n"
+        "  if (mglWideShape.x == 3) return (mglI > 0 ? 1 : 0) | (mglI < mglN - 1 ? 4 : 0);\n"
+        "  return 0;\n}\n";
+    // every name here starts with mgl, since the rewrite renames the program's varyings
+    static const char *wide_pos =
+        "vec4 mglWideEdge(int mglI, int mglJ, int mglE, float mglTurn)\n{\n"
+        "  vec4 mglA = gl_in[mglI].gl_Position, mglB = gl_in[mglJ].gl_Position;\n"
+        // an end behind the near plane would throw the direction and width off
+        "  float mglDa = mglA.z + mglA.w, mglDb = mglB.z + mglB.w;\n"
+        "  if (mglDa < 0.0 && mglDb >= 0.0) mglA = mix(mglA, mglB, mglDa / (mglDa - mglDb));\n"
+        "  if (mglDb < 0.0 && mglDa >= 0.0) mglB = mix(mglB, mglA, mglDb / (mglDb - mglDa));\n"
+        "  vec4 mglP = mglE < 2 ? mglA : mglB;\n"
+        "  vec2 mglD = (mglB.xy / mglB.w - mglA.xy / mglA.w) * mglWideLine.xy;\n"
+        "  vec2 mglN = abs(mglD.x) >= abs(mglD.y) ? vec2(0.0, 1.0) : vec2(1.0, 0.0);\n"
+        "  float mglSide = ((mglE & 1) == 0 ? -1.0 : 1.0) * (mglN.x * mglD.y - mglN.y * mglD.x < 0.0 ? -1.0 : 1.0) * mglTurn;\n"
+        "  mglP.xy += mglSide * mglN * mglWideLine.z / mglWideLine.xy * mglP.w;\n"
+        "  return mglP;\n}\n"
+        // 1 when the triangle faces the front, which mglWideLine.w says is clockwise
+        "float mglWideTurn()\n{\n"
+        "  vec3 mglA = gl_in[0].gl_Position.xyw, mglB = gl_in[1].gl_Position.xyw, mglC = gl_in[2].gl_Position.xyw;\n"
+        "  bool mglCcw = dot(mglA, cross(mglB, mglC)) > 0.0;\n"
+        "  return mglCcw != (mglWideLine.w > 0.5) ? 1.0 : -1.0;\n}\n";
+
+    if (input < 0 || input > 2 || (wide && input == 0) ||
+        !bufAdd(&out, wide ? wide_heads[input - 1] : heads[input]) ||
+        !addStructDefs(&out, tes_src))
         goto fail;
 
     for (int i = 0; i < count; i++)
@@ -4308,11 +4348,28 @@ char *mglPassThroughGeometry(const char *tes_src, int input)
             goto fail;
     }
 
-    if (!bufAdd(&out, "void main()\n{\n"))
+    if ((wide && !bufAdd(&out, wide_pos)) || (wide && input == 2 && !bufAdd(&out, wide_hidden)) ||
+        !bufAdd(&out, "void main()\n{\n") ||
+        (wide && !bufAdd(&out, input == 2 ? "  float mglTurn = mglWideTurn();\n  int mglHide = mglWideHidden();\n"
+                                          : "  float mglTurn = 1.0;\n  int mglHide = 0;\n")))
         goto fail;
 
-    for (int v = 0; v <= input; v++)
+    // wide: four vertices for each edge, one edge for a line and three for a triangle
+    int emits = wide ? (input == 1 ? 4 : 12) : input + 1;
+
+    for (int q = 0; q < emits; q++)
     {
+        int edge_i = q / 4, edge_j = (edge_i + 1) % (input + 1), corner = q % 4;
+        int v = !wide ? q : corner < 2 ? edge_i : edge_j;
+
+        if (wide && corner == 0)
+        {
+            snprintf(line, sizeof(line), "  if ((mglHide & %d) == 0)\n  {\n", 1 << edge_i);
+
+            if (!bufAdd(&out, line))
+                goto fail;
+        }
+
         for (int b = 0; b < block_count; b++)
         {
             char names[32][64];
@@ -4334,7 +4391,10 @@ char *mglPassThroughGeometry(const char *tes_src, int input)
                 }
         }
 
-        snprintf(line, sizeof(line), "  gl_Position = gl_in[%d].gl_Position;\n", v);
+        if (wide)
+            snprintf(line, sizeof(line), "  gl_Position = mglWideEdge(%d, %d, %d, mglTurn);\n", edge_i, edge_j, corner);
+        else
+            snprintf(line, sizeof(line), "  gl_Position = gl_in[%d].gl_Position;\n", v);
 
         if (!bufAdd(&out, line))
             goto fail;
@@ -4385,7 +4445,7 @@ char *mglPassThroughGeometry(const char *tes_src, int input)
                 goto fail;
         }
 
-        if (!bufAdd(&out, "  EmitVertex();\n"))
+        if (!bufAdd(&out, "  EmitVertex();\n") || (wide && corner == 3 && !bufAdd(&out, "  EndPrimitive();\n  }\n")))
             goto fail;
     }
 
@@ -4397,4 +4457,15 @@ char *mglPassThroughGeometry(const char *tes_src, int input)
 fail:
     free(out.s);
     return NULL;
+}
+
+char *mglPassThroughGeometry(const char *tes_src, int input)
+{
+    return passThrough(tes_src, input, false);
+}
+
+// lines, or triangles drawn as lines, in; each line out as the quad a wide line covers
+char *mglWideLineGeometry(const char *vs_src, bool triangles)
+{
+    return passThrough(vs_src, triangles ? 2 : 1, true);
 }

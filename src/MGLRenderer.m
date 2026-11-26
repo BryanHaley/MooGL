@@ -7876,6 +7876,8 @@ static char clearColorKind(MTLPixelFormat f)
     [_currentRenderEncoder setDepthStencilState: [_device newDepthStencilStateWithDescriptor: dsd]];
     [_currentRenderEncoder setStencilReferenceValue: _scissorClearStencil & 0xFF];
     [_currentRenderEncoder setCullMode: MTLCullModeNone];
+    [_currentRenderEncoder setTriangleFillMode: MTLTriangleFillModeFill];
+    [_currentRenderEncoder setDepthBias: 0 slopeScale: 0 clamp: 0];
     {
         // as many viewports as there are scissor boxes, all the whole target
         MTLViewport full[MAX_VIEWPORTS];
@@ -13950,6 +13952,14 @@ void mtlSetView(GLMContext glm_ctx, void *view)
     }
 }
 
+// for CGL: see mtlSetView: sublayer:
+void mtlSetSublayerView(GLMContext glm_ctx, void *view)
+{
+    @autoreleasepool {
+        [(__bridge id) glm_ctx->mtl_funcs.mtlObj mtlSetView: (__bridge NSView *)view sublayer: true];
+    }
+}
+
 #pragma mark C interface to sparse textures
 bool mtlSparseTileSize(GLMContext glm_ctx, GLenum target, GLenum internalformat, GLsizei samples, GLuint size[3])
 {
@@ -14650,7 +14660,9 @@ static const char *presentMSL =
 
         [self endRenderEncoding];
 
-        if (ctx->swap_interval == 0 && _lastDefaultTarget != nil && _layer != nil && [self queueFrameForPresent])
+        // single buffered keeps drawing into what it showed, so it gets a copy
+        if (ctx->swap_interval == 0 && !ctx->present_on_flush && _lastDefaultTarget != nil && _layer != nil &&
+            [self queueFrameForPresent])
             return;
 
         // vsync back on: what the present queue still holds goes first
@@ -15431,10 +15443,10 @@ static bool isCombinedDepthStencil(MTLPixelFormat f)
 
     uint32_t r[4] = { (uint32_t)region.origin.x, (uint32_t)region.origin.y, (uint32_t)w, (uint32_t)h };
 
-    if (_currentCommandBuffer == nil)
-        [self newCommandBuffer];
+    [self endRenderEncoding];
+    [self endComputeEncoding];
 
-    id<MTLComputeCommandEncoder> enc = [_currentCommandBuffer computeCommandEncoder];
+    id<MTLComputeCommandEncoder> enc = [[self liveCommandBuffer] computeCommandEncoder];
 
     [enc setComputePipelineState: pso];
     [enc setTexture: view atIndex: 0];
@@ -17438,6 +17450,13 @@ static CGFloat viewScale(NSView *view)
 // does. Needs the main thread, like any AppKit view change.
 - (void) mtlSetView: (NSView *) view
 {
+    [self mtlSetView: view sublayer: false];
+}
+
+// As a sublayer, the view keeps a layer of its own: an NSOpenGLView will
+// not give up AppKit's, so CGL puts MooGL's on top of it.
+- (void) mtlSetView: (NSView *) view sublayer: (bool) sublayer
+{
     if (view == _view || _layer == nil)
         return;
 
@@ -17450,8 +17469,16 @@ static CGFloat viewScale(NSView *view)
     [CATransaction setDisableActions: YES];
     if (_view.layer == _layer)
         [_view setLayer: nil];
+    [_layer removeFromSuperlayer];
     _view = view;
-    if (view)
+    if (view && sublayer)
+    {
+        [view setWantsLayer: YES];
+        [view.layer addSublayer: _layer];
+        // Apple's GL surfaces are not colour matched: values go to the display as is
+        _layer.colorspace = [[[view window] colorSpace] CGColorSpace];
+    }
+    else if (view)
     {
         [view setLayer: _layer];
         [view setWantsLayer: YES];
@@ -17494,10 +17521,10 @@ static CGFloat viewScale(NSView *view)
 
 // What the GPU can actually do, asked of Metal.
 //
-// getMacOSDefaults fills most of state.var by opening Apple's OpenGL framework
-// and copying its answers. That works for the things both drivers share, but it
-// reports Apple's 4.1 limits -- which say nothing at all about compute, since
-// 4.1 has none. Anything Metal knows for itself is overwritten here.
+// getMacOSDefaults fills most of state.var with what Apple's 4.1 driver
+// answered. That works for the things both drivers share, but 4.1's limits say
+// nothing at all about compute, since 4.1 has none. Anything Metal knows for
+// itself is overwritten here.
 - (void) queryDeviceLimits: (GLMContext) glm_ctx
 {
     if (!_device || !glm_ctx)
@@ -17619,7 +17646,7 @@ static CGFloat viewScale(NSView *view)
 
     MGL_NSINFO(@"MGL INFO: Metal device created: %@", _device);
 
-    // getMacOSDefaults already ran and filled state.var from Apple's GL driver.
+    // getMacOSDefaults already ran and filled state.var with Apple's driver's values.
     // Anything Metal can answer for itself is more accurate, so it wins.
     [self queryDeviceLimits: glm_ctx];
 

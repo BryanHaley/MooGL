@@ -548,6 +548,9 @@ typedef struct Texture_t {
     void    *apple_range_pointer;
     GLsizei apple_range_length;
     GLenum  apple_storage_hint;
+
+    // GL 1.4's GL_GENERATE_MIPMAP: an upload to the base level remakes the rest
+    GLboolean generate_mipmap;
 } Texture;
 
 #define MGL_MAX_SPARSE_SIZE     16384
@@ -886,6 +889,7 @@ int   mglTesIsolineKind(const char *tes_src);    // 0 none, 1 point_mode, 2 line
 void  mglTesLayout(const char *tes_src, int *domain, int *spacing, bool *cw, bool *points);
 // input 0 points, 1 lines, 2 triangles
 char *mglPassThroughGeometry(const char *tes_src, int input);
+char *mglWideLineGeometry(const char *vs_src, bool triangles);
 char *mglAddGeometryCapture(const char *vs_src, const GeometryInfo *gi);
 void  mglFreeGeometryInfo(GeometryInfo *gi);
 
@@ -1281,7 +1285,27 @@ typedef struct Program_t {
     GLint   uses_draw_id;
     GLint   uses_point_coord;
     GLboolean linked_separable;     // PROGRAM_SEPARABLE as of the last link
+    // this program again with a geometry stage that draws lines wide, made
+    // the first time a wide line is drawn with it (wide_lines.c)
+    struct Program_t *wide_twin;
+    GLuint wide_twin_serial;
+    // the same for triangles drawn in line mode
+    struct Program_t *wide_tri_twin;
+    GLuint wide_tri_twin_serial;
+    // on a twin: the geometry stage it links with, made by MGL
+    char *wide_line_gs;
 } Program;
+
+typedef struct {
+    struct Program_t *was;      // the program the draw was made with, or NULL
+    GLboolean cull, offset_fill;
+    GLenum front_face, polygon_mode;
+} MglWideDraw;
+
+void mglWideLinesEnter(GLMContext ctx, GLenum mode, MglWideDraw *wd);
+void mglWideLinesLeave(GLMContext ctx, MglWideDraw *wd);
+void mglDropWideTwin(GLMContext ctx, Program *p);
+void mglCopyProgramState(GLMContext ctx, Program *from, Program *to);
 
 // True once a program has linked a geometry stage. An application may detach
 // its shaders after linking, so the attachment is not the thing to ask.
@@ -1937,6 +1961,14 @@ typedef struct GLMContextRec_t {
     MglBindless bindless;
 
     int swap_interval;
+
+    // single buffered, as a CGL pixel format without double buffering asks:
+    // glFlush and glFinish show what was drawn
+    bool present_on_flush;
+
+    // the GL version to report, when not 4.6: Apple's legacy CGL contexts
+    // said 2.1, and old apps take the paths that number leads them down
+    int reported_major, reported_minor;
 
     // GL_KHR_parallel_shader_compile; compiles still finish before returning
     GLint max_shader_compiler_threads;

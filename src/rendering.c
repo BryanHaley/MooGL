@@ -231,15 +231,22 @@ void mglClearBufferfi(GLMContext ctx, GLenum buffer, GLint drawbuffer, GLfloat d
     clearNow(ctx);
 }
 
+void MGLswapBuffers(GLMContext ctx);
+
 void mglFinish(GLMContext ctx)
 {
     MGL_INFO("MGL: mglFinish called - flushing and waiting for GPU\n");
+    if (ctx->present_on_flush)
+        MGLswapBuffers(ctx);
     ctx->mtl_funcs.mtlFlush(ctx, true);
 }
 
 void mglFlush(GLMContext ctx)
 {
-    ctx->mtl_funcs.mtlFlush(ctx, false);
+    if (ctx->present_on_flush)
+        MGLswapBuffers(ctx);
+    else
+        ctx->mtl_funcs.mtlFlush(ctx, false);
 }
 
 // A name GL knows as a draw buffer at all. Anything else is GL_INVALID_ENUM.

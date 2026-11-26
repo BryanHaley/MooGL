@@ -94,7 +94,8 @@ static void cgl(void)
 
     const char *version = (const char *)glGetString(GL_VERSION);
     printf("  %s\n", version ? version : "(none)");
-    check(version && strstr(version, "Compatibility"), "it is a compatibility context");
+    // Apple's legacy contexts said 2.1, and old programs choose their paths by it
+    check(version && strncmp(version, "2.1 ", 4) == 0, "it reports 2.1, as Apple's legacy contexts did");
     check(drawsWithBeginEnd(), "glBegin draws in it and glReadPixels reads it back");
     check(CGLFlushDrawable(ctx) == kCGLNoError, "CGLFlushDrawable");
 
