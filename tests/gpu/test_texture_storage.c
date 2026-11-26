@@ -1326,3 +1326,49 @@ GPU_TEST(texture_storage, a_drawn_level_survives_generating_mipmaps)
     glDeleteFramebuffers(1, &fbo);
     glDeleteTextures(1, &tex);
 }
+
+/* ---------- new textures start out zeroed ---------- */
+
+// Mac drivers hand out a texture made without data zeroed, and games show
+// whatever is left in it. A magenta texture is deleted first, so the new one
+// tends to get its memory.
+GPU_TEST(texture_storage, new_texture_without_data_reads_zero)
+{
+    enum { S = 256 };
+    static GLubyte px[S * S * 4];
+    GLuint t = 0;
+    int bad = 0;
+
+    for (int i = 0; i < S * S; i++)
+        memcpy(px + i * 4, (GLubyte[4]){ 255, 0, 255, 255 }, 4);
+
+    for (int pass = 0; pass < 2; pass++)
+    {
+        glGenTextures(1, &t);
+        glBindTexture(GL_TEXTURE_2D, t);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, S, S, 0, GL_RGBA, GL_UNSIGNED_BYTE, pass ? NULL : px);
+        glTexImage2D(GL_TEXTURE_2D, 1, GL_RGBA8, S / 2, S / 2, 0, GL_RGBA, GL_UNSIGNED_BYTE, pass ? NULL : px);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 1);
+        if (pass == 0)
+        {
+            // make the Metal texture before it is deleted
+            glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+            glFinish();
+            glDeleteTextures(1, &t);
+        }
+    }
+
+    for (int level = 0; level < 2; level++)
+    {
+        int n = (S >> level) * (S >> level) * 4;
+
+        memset(px, 0xAB, sizeof px);
+        glGetTexImage(GL_TEXTURE_2D, level, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        for (int i = 0; i < n; i++)
+            bad += px[i] != 0;
+    }
+    CHECK_EQ_UINT(mgl_drain_errors(), GL_NO_ERROR);
+    CHECK_MSG(bad == 0, "%d bytes not zero across levels 0 and 1", bad);
+
+    glDeleteTextures(1, &t);
+}
