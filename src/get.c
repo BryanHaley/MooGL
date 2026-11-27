@@ -1133,6 +1133,7 @@ static const char * const mgl_extensions[] = {
     "GL_ARB_spirv_extensions",
     "GL_ARB_sync",
     "GL_ARB_timer_query",
+    "GL_ARB_occlusion_query",
     "GL_ARB_occlusion_query2",
     "GL_ARB_shader_subroutine",
     "GL_ARB_transform_feedback2",
