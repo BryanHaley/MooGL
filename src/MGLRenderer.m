@@ -483,7 +483,6 @@ typedef struct {
     // One slot per encoder an occlusion query stays live across, summed later.
     id<MTLBuffer> _visibilityBuffer;
     GLuint        _visibilityNextSlot;
-    GLuint        _visibilityHolders;   // queries holding slots not yet read
     id<MTLBuffer> _tessLevelsUsed;      // the factors the last tessellated draw read
     NSUInteger    _stageBaseInstance;   // a base instance the stages MGL runs fetch from
 
@@ -5112,6 +5111,22 @@ static void readableSpan(long s0, long sw, long d0, long dw, long size, long *c0
     }
 }
 
+// A blit carries sRGB bytes over unchanged, as Apple's driver did, unless
+// GL_FRAMEBUFFER_SRGB is on and the destination is sRGB too, where decoding
+// and encoding again come to the same thing.
+- (id<MTLTexture>) blitView: (id<MTLTexture>) t to: (id<MTLTexture>) dst
+{
+    const MGLMetalFormatDesc *dd = mglMetalFormatDesc((uint16_t)dst.pixelFormat);
+    bool dst_srgb = dd && dd->mtl_linear && dd->mtl_linear != dst.pixelFormat;
+    const MGLMetalFormatDesc *md = mglMetalFormatDesc((uint16_t)t.pixelFormat);
+
+    if ((ctx->state.caps.framebuffer_srgb && dst_srgb) || !md || !md->mtl_linear ||
+        md->mtl_linear == t.pixelFormat)
+        return t;
+
+    return [t newTextureViewWithPixelFormat: (MTLPixelFormat)md->mtl_linear];
+}
+
 -(void)mtlBlitFramebuffer:(GLMContext)glm_ctx srcX0:(long)srcX0 srcY0:(long)srcY0 srcX1:(long)srcX1 srcY1:(long)srcY1 dstX0:(long)dstX0 dstY0:(long)dstY0 dstX1:(long)dstX1 dstY1:(long)dstY1 mask:(size_t)mask filter:(GLuint)filter
 {
     Framebuffer *readfbo = ctx->state.readbuffer, *drawfbo = ctx->state.framebuffer;
@@ -5265,7 +5280,8 @@ static void readableSpan(long s0, long sw, long d0, long dw, long size, long *c0
                 [self nearestCopyFrom: readtexid plane: readplane x: srcX0 y: srcY0 w: sw h: sh
                                    to: drawtexid plane: drawplane x: dstX0 y: dstY0 w: dw h: dh];
             }
-            else if ([self shaderBlitFrom: readtexid rect: rect to: drawtexid
+            else if ([self shaderBlitFrom: [self blitView: readtexid to: drawtexid] rect: rect
+                                       to: [self blitView: drawtexid to: drawtexid]
                                    origin: MTLOriginMake(cx0, cy0, 0)
                                      size: MTLSizeMake(cx1 - cx0, cy1 - cy0, 1)
                                    linear: filter == GL_LINEAR && !(sw == dw && sh == dh)] == false)
@@ -11803,8 +11819,9 @@ static int countingQueries(GLMContext ctx, Query **out)
     return n;
 }
 
-// Every query counting takes the new slot, so each one's slots stay in one
-// run. Once no query holds a slot they all go back.
+// Every query counting takes the next slot of a ring, so each one's slots stay
+// in one run (which may wrap). Games keep queries in flight across frames, so
+// slots are reused in order rather than when no query holds one.
 - (void) beginOcclusionCountingOnEncoder
 {
     Query *qs[_MAX_QUERY_TARGETS];
@@ -11813,16 +11830,8 @@ static int countingQueries(GLMContext ctx, Query **out)
     if (n == 0 || _currentRenderEncoder == nil)
         return;
 
-    if (_visibilityHolders == 0)
-        _visibilityNextSlot = 0;
-
-    if (_visibilityNextSlot >= MGL_VISIBILITY_SLOTS)
-    {
-        MGL_NSERR(@"MGL WARNING: out of occlusion counter slots, queries will undercount");
-        return;
-    }
-
-    GLuint slot = _visibilityNextSlot++;
+    GLuint slot = _visibilityNextSlot;
+    _visibilityNextSlot = (_visibilityNextSlot + 1) % MGL_VISIBILITY_SLOTS;
 
     ((uint64_t *)[self visibilityBuffer].contents)[slot] = 0;
 
@@ -11831,12 +11840,9 @@ static int countingQueries(GLMContext ctx, Query **out)
         Query *q = qs[i];
 
         if (q->visibility_offset < 0)
-        {
             q->visibility_offset = (GLint)slot;
-            _visibilityHolders++;
-        }
 
-        q->visibility_slots = (GLint)slot - q->visibility_offset + 1;
+        q->visibility_slots = ((GLint)slot - q->visibility_offset + MGL_VISIBILITY_SLOTS) % MGL_VISIBILITY_SLOTS + 1;
     }
 
     [_currentRenderEncoder setVisibilityResultMode: MTLVisibilityResultModeCounting
@@ -11869,13 +11875,10 @@ static int countingQueries(GLMContext ctx, Query **out)
     const uint64_t *counts = (const uint64_t *)_visibilityBuffer.contents;
 
     for (GLint i = 0; i < q->visibility_slots; i++)
-        q->result += counts[q->visibility_offset + i];
+        q->result += counts[(q->visibility_offset + i) % MGL_VISIBILITY_SLOTS];
 
     q->visibility_offset = -1;
     q->visibility_slots = 0;
-
-    if (_visibilityHolders > 0)
-        _visibilityHolders--;
 }
 
 #pragma mark sparse textures
