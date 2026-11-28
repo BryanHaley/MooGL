@@ -457,9 +457,12 @@ $(test_build_dir)/%.o: $(test_dir)/%.c
 
 $(test_build_dir)/gpu/test_fsr2.o: TEST_CFLAGS += -DFFX_GCC -I$(fsr2_api_dir)
 
-$(test_exe): $(test_objs) $(mgl_lib) $(fsr2_lib)
+# The bundle id gives the suite a Metal shader cache of its own. Without one it
+# shares the cache of every program that has none, which grows past a gigabyte
+# and takes most of a minute to open.
+$(test_exe): $(test_objs) $(mgl_lib) $(fsr2_lib) $(test_dir)/Info.plist
 	@mkdir -p $(dir $@)
-	$(CC) -arch $(shell uname -m) -o $@ $(test_objs) \
+	$(CC) -arch $(shell uname -m) -o $@ $(test_objs) -Wl,-sectcreate,__TEXT,__info_plist,$(test_dir)/Info.plist \
 	  -L$(build_dir) -lmoogl -lffx_fsr2_api -Wl,-rpath,@executable_path -Wl,-rpath,$(CURDIR)/$(build_dir) \
 	  -framework Foundation -framework Metal -framework Cocoa -framework QuartzCore
 

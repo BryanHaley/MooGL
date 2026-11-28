@@ -715,6 +715,9 @@ bool mglBuildSampleRateFragment(struct GLMContextRec_t *ctx, struct Program_t *p
 
 // Cull distance needs a pass of its own before the draw, and five buffers.
 #define MGL_CULL_FIRST_BINDING  20
+
+// a compatibility context's line width, for a geometry stage's lines
+#define MGL_GS_WIDE_BINDING 25
 #define MGL_CULL_FIRST_MSL_SLOT 24
 
 // Bindless handles are slots in one table of Metal texture IDs and one of
@@ -836,6 +839,7 @@ typedef struct GeometryInfo_t {
     GLint  vs_in_slot;
     GLint  gs_in_slot, gs_out_slot, gs_index_slot;
     GLint  pass_out_slot;
+    GLint  pass_wide_slot;          // MglGsWideB, -1 unless the output is lines
     GLint  tes_gen_slot;            // the CPU tessellator's coordinates
     // the three numbers the compute pass is told about this draw
     GLint  prims_loc, indexed_loc, first_loc, stride_loc;
@@ -979,6 +983,9 @@ typedef struct Shader_t {
     // distance rewrite needs to see through the application's own macros
     char *pp_src;
     glslang_shader_t *compiled_glsl_shader;
+    // the preprocessed text, when the compile came from the shader cache and
+    // made no tree; mglShaderTree makes one from it if something asks
+    char *pp_text;
     const char *entry_point;
     char *log;
     int refcount;
@@ -1174,6 +1181,10 @@ typedef struct Program_t {
     glslang_shader_t *kept_glsl[_MAX_SHADER_TYPES][1 + MGL_STAGE_EXTRA_UNITS];
     // a link has succeeded at least once, so there is something to run
     GLboolean executable;
+    GLuint links_made;              // stages linked, from glslang or the shader cache
+    // the shader cache has all this link needs, so glslang is not run (program.c)
+    GLboolean link_from_cache;
+    char cache_key[65];             // the link's key in the shader cache, empty when it has none
     // the geometry stage takes a different primitive than tessellation makes:
     // it links, but GL refuses to draw with it
     GLboolean tess_geom_mismatch;
@@ -1296,10 +1307,16 @@ typedef struct Program_t {
     char *wide_line_gs;
 } Program;
 
+// the storage buffer binding a wireframe's edge masks are read from, the last
+#define MGL_WIDE_HIDE_BINDING 95
+_Static_assert(MGL_WIDE_HIDE_BINDING == MAX_SHADER_STORAGE_BUFFER_BINDINGS - 1, "keep the wide-line binding last");
+
 typedef struct {
     struct Program_t *was;      // the program the draw was made with, or NULL
     GLboolean cull, offset_fill;
     GLenum front_face, polygon_mode;
+    GLboolean triangles;
+    BufferBaseTarget hide;      // what MGL_WIDE_HIDE_BINDING held
 } MglWideDraw;
 
 void mglWideLinesEnter(GLMContext ctx, GLenum mode, MglWideDraw *wd);

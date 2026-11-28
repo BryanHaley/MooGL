@@ -382,6 +382,8 @@ typedef struct {
     id<MTLRenderPipelineState>  _gsCapturePipeline;
     id<MTLComputePipelineState> _gsComputePipeline;
     id<MTLRenderPipelineState>  _gsDrawPipeline;
+    // the same for lines wider than a pixel, drawn as triangles; nil unless the output is lines
+    id<MTLRenderPipelineState>  _gsDrawWidePipeline;
     NSString *_gsPipelineKey;
     // the geometry draws of one multi-draw run their kernels in one compute
     // pass and draw in one render pass, instead of a pass break each
@@ -6482,7 +6484,10 @@ static MTLCompileOptions *shaderCompileOptions(const char *msl)
     if (library)
         return library;
 
+    unsigned long long start = mglBuildTimeStart();
+
     library = [_device newLibraryWithSource: source options: opts error: &error];
+    mglBuildTimeAdd(MGL_BUILD_METAL_COMPILE, start);
     if(!library) {
         MGL_NSERR(@"MGL ERROR: Failed to compile shader: %@ ", [error localizedDescription] );
         MGL_NSERR(@"MGL ERROR: Shader source: %s", str);
@@ -9057,6 +9062,8 @@ static MTLTessellationPartitionMode mtlPartitionForSpv(GLuint mode);
         cap.tessellationOutputWindingOrder = mtlWindingFor(program);
     }
 
+    unsigned long long start = mglBuildTimeStart();
+
     _gsCapturePipeline = [_device newRenderPipelineStateWithDescriptor: cap error: &err];
 
     if (_gsCapturePipeline == nil)
@@ -9075,6 +9082,14 @@ static MTLTessellationPartitionMode mtlPartitionForSpv(GLuint mode);
     }
 
     _gsDrawPipeline = [_device newRenderPipelineStateWithDescriptor: draw error: &err];
+    _gsDrawWidePipeline = nil;
+
+    if (program->geom.out_primitive == GL_LINE_STRIP && program->geom.pass_wide_slot >= 0)
+    {
+        draw.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+        _gsDrawWidePipeline = [_device newRenderPipelineStateWithDescriptor: draw error: &err];
+    }
+    mglBuildTimeAdd(MGL_BUILD_PIPELINE, start);
 
     if (_gsDrawPipeline == nil)
     {
@@ -9874,10 +9889,7 @@ static const char *mgl_gs_capture_msl =
         [_currentRenderEncoder setRenderPipelineState: _gsDrawPipeline];
         [self bindFragmentBuffersToCurrentRenderEncoder];
         [self bindTexturesToCurrentRenderEncoder];
-        [_currentRenderEncoder setVertexBuffer: out_buf offset: 0 atIndex: gi->pass_out_slot];
-        [_currentRenderEncoder drawPrimitives: gsOutputPrimitive(gi->out_primitive)
-                                  vertexStart: 0
-                                  vertexCount: slots * (NSUInteger)gi->slot_capacity];
+        [self drawGeometryOutput: out_buf slots: slots program: program];
     }
 
     [self captureGeometry: program output: out_buf slots: slots];
@@ -9886,6 +9898,50 @@ static const char *mgl_gs_capture_msl =
     return true;
 }
 
+
+// Draws what the geometry stage wrote. In a compatibility context a line
+// wider than a pixel is two triangles, which are never culled, filled in
+// whatever the polygon mode, and not offset.
+- (void) drawGeometryOutput: (id<MTLBuffer>) out slots: (NSUInteger) slots program: (Program *) program
+{
+    GeometryInfo *gi = &program->geom;
+    float width = 1.0f;
+
+#ifdef MGL_COMPAT_CONTEXTS
+    if (ctx->compat)
+        width = fminf(roundf(ctx->state.var.line_width), 16.0f);
+#endif
+
+    bool wide = width > 1.0f && _gsDrawWidePipeline && gi->pass_wide_slot >= 0;
+
+    [_currentRenderEncoder setVertexBuffer: out offset: 0 atIndex: gi->pass_out_slot];
+
+    if (gi->pass_wide_slot >= 0)
+    {
+        ViewportRect *vp = &ctx->state.viewport[0];
+        float w[4] = { vp->w > 0 ? vp->w : 1, vp->h > 0 ? vp->h : 1, wide ? width : 1.0f, 0 };
+
+        [_currentRenderEncoder setVertexBytes: w length: sizeof w atIndex: gi->pass_wide_slot];
+    }
+
+    if (!wide)
+    {
+        [_currentRenderEncoder drawPrimitives: gsOutputPrimitive(gi->out_primitive)
+                                  vertexStart: 0
+                                  vertexCount: slots * (NSUInteger)gi->slot_capacity];
+        return;
+    }
+
+    [_currentRenderEncoder setRenderPipelineState: _gsDrawWidePipeline];
+    [_currentRenderEncoder setCullMode: MTLCullModeNone];
+    [_currentRenderEncoder setTriangleFillMode: MTLTriangleFillModeFill];
+    [_currentRenderEncoder setDepthBias: 0 slopeScale: 0 clamp: 0];
+    [_currentRenderEncoder drawPrimitives: MTLPrimitiveTypeTriangle
+                              vertexStart: 0
+                              vertexCount: slots * (NSUInteger)gi->slot_capacity * 3];
+    [_currentRenderEncoder setRenderPipelineState: _gsDrawPipeline];
+    ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
+}
 
 // The kernels and draws of the geometry draws recorded above, in order
 - (void) flushGeometryBatch
@@ -9943,12 +9999,7 @@ static const char *mgl_gs_capture_msl =
         [self bindTexturesToCurrentRenderEncoder];
 
         for (MGLGsBatchItem *item in batch)
-        {
-            [_currentRenderEncoder setVertexBuffer: item->out_buf offset: 0 atIndex: gi->pass_out_slot];
-            [_currentRenderEncoder drawPrimitives: gsOutputPrimitive(gi->out_primitive)
-                                      vertexStart: 0
-                                      vertexCount: item->slots * (NSUInteger)gi->slot_capacity];
-        }
+            [self drawGeometryOutput: item->out_buf slots: item->slots program: program];
     }
 
     for (MGLGsBatchItem *item in batch)
@@ -10996,8 +11047,12 @@ static MTLWinding mtlWindingFor(const Program *p)
     ctx->stats.pipelines_built++;
     if (layout)
         d.vertexDescriptor = [self vertexDescriptorFrom: layout];
+
+    unsigned long long start = mglBuildTimeStart();
+
     pipeline = mesh ? [self meshPipelineFrom: d error: error]
                     : [_device newRenderPipelineStateWithDescriptor: d error: error];
+    mglBuildTimeAdd(MGL_BUILD_PIPELINE, start);
 
     if (pipeline)
     {
@@ -13499,8 +13554,11 @@ static void allowFormatViews(GLMContext glm_ctx, Texture *tex, MTLPixelFormat at
         // the work group GL promised, and Metal drops the dispatch
         desc.computeFunction = func;
         desc.maxTotalThreadsPerThreadgroup = threads;
+        unsigned long long start = mglBuildTimeStart();
+
         computePipelineState = [_device newComputePipelineStateWithDescriptor: desc options: MTLPipelineOptionNone
                                                                    reflection: nil error: &errors];
+        mglBuildTimeAdd(MGL_BUILD_PIPELINE, start);
         if (computePipelineState == nil)
         {
             MGL_NSERR(@"MGL ERROR: program %u's compute pipeline for %lu threads: %@", program->name,

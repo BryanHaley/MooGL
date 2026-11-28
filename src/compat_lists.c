@@ -587,7 +587,7 @@ static void replay(GLMContext ctx, MGLDisplayList *l)
                 break;
             case SIG_RECORDS:
                 if (c->blob)
-                    mglCompatDrawRecords(ctx, c->a.u[0], (const GLfloat *)c->blob, (GLsizei)c->a.u[1]);
+                    mglCompatDrawRecords(ctx, c->a.u[0], (const GLfloat *)c->blob, NULL, (GLsizei)c->a.u[1]);
                 break;
             case SIG_RASTER:
             case SIG_WINDOW:
