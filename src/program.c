@@ -62,6 +62,7 @@ extern int mglMergeAliasedInputs(const unsigned int *words, size_t count, const 
 #include "buffers.h"
 #include "mgl_log.h"
 #include "mgl.h"
+#include "shader_cache.h"
 
 // A block declared in two stages is one block to GL. Shared with uniforms.c's
 // enumeration so a member's block index matches the block queries.
@@ -678,6 +679,10 @@ static_assert(_FRAGMENT_SHADER == GLSLANG_STAGE_FRAGMENT, "_FRAGMENT_SHADER == G
 static_assert(_COMPUTE_SHADER == GLSLANG_STAGE_COMPUTE, "_COMPUTE_SHADER == GLSLANG_STAGE_COMPUTE failed");
 
 glslang_shader_t *mglCopyShaderForLink(GLMContext ctx, Shader *ptr);
+glslang_shader_t *mglShaderTree(GLMContext ctx, Shader *sh);
+const char *mglShaderPreprocessed(Shader *sh);
+bool mglShaderCompiled(Shader *sh);
+extern __thread GLMContext _ctx;
 
 // The tree a stage's unit k links from: this link's copy, else the copy the
 // kept program was built from, else the shader object's own
@@ -691,7 +696,7 @@ static glslang_shader_t *stageGlsl(Program *pptr, int s, int k)
     if (pptr->kept_glsl[s][k])
         return pptr->kept_glsl[s][k];
 
-    return sh ? sh->compiled_glsl_shader : NULL;
+    return mglShaderTree(_ctx, sh);
 }
 
 static void freeGlslCopies(glslang_shader_t *copies[_MAX_SHADER_TYPES][1 + MGL_STAGE_EXTRA_UNITS])
@@ -717,7 +722,7 @@ static void copyShadersForLink(GLMContext ctx, Program *pptr)
         {
             Shader *sh = k == 0 ? pptr->shader_slots[s] : pptr->also_attached[s][k - 1];
 
-            if (sh && sh->compiled_glsl_shader && sh->log == NULL)
+            if (mglShaderCompiled(sh))
                 pptr->link_glsl[s][k] = mglCopyShaderForLink(ctx, sh);
         }
     }
@@ -1873,8 +1878,313 @@ static void declareTessInterface(spvc_compiler compiler_msl, Program *pptr, int 
 // it is ptr->spirv[stage] for a stage the application wrote, and somewhere else
 // for one MGL generated. `entry_override` names a generated stage, which has no
 // shader object to take a name from.
+static char *spirvToMetal(GLMContext ctx, Program *ptr, int stage, Spirv *sp, const char *entry_override);
+
+// --- the SPIRV-Cross step in the shader cache ---------------------------------------
+
+// Adding a field to SpirvResource means adding it to putResource and getResource.
+_Static_assert(sizeof(SpirvResource) == 144, "SpirvResource changed; update the shader cache");
+
+#define RES_FIELDS(X) \
+    X(_id) X(base_type_id) X(type_id) X(set) X(binding) X(location) X(explicit_location) \
+    X(msl_index) X(msl_guess) X(msl_sampler_index) X(gl_type) X(array_size) X(dims) X(dim_count) \
+    X(tex_unit) X(block_size) X(member_count) X(block_index) X(offset) X(array_stride) \
+    X(matrix_stride) X(is_row_major) X(cube_as_array) X(atomic) X(atomic_buffer) X(precision) \
+    X(flat) X(is_array) X(has_binding)
+
+static void putList(MglBlob *b, const SpirvResourceList *l)
+{
+    GLuint count = l->list ? l->count : 0;
+
+    mglBlobPutU32(b, count);
+
+    for (GLuint i = 0; i < count; i++)
+    {
+        const SpirvResource *r = &l->list[i];
+        GLuint eb = r->element_binding ? (GLuint)(r->array_size > 0 ? r->array_size : 1) : 0;
+        GLuint eu = r->element_unit ? (GLuint)r->array_size : 0;
+
+#define PUT(f) mglBlobPut(b, &r->f, sizeof r->f);
+        RES_FIELDS(PUT)
+#undef PUT
+        mglBlobPutStr(b, r->name);
+        mglBlobPutU32(b, eb);
+        mglBlobPut(b, r->element_binding, eb * sizeof(GLuint));
+        mglBlobPutU32(b, eu);
+        mglBlobPut(b, r->element_unit, eu * sizeof(GLint));
+    }
+}
+
+static bool getList(MglBlob *b, SpirvResourceList *l)
+{
+    GLuint count = mglBlobGetU32(b);
+
+    freeResourceList(l);
+
+    if (count > 65536)
+        return false;
+
+    l->list = (SpirvResource *)calloc(count ? count : 1, sizeof(SpirvResource));
+
+    if (l->list == NULL)
+        return false;
+
+    for (GLuint i = 0; i < count && !b->bad; i++)
+    {
+        SpirvResource *r = &l->list[i];
+
+#define GET(f) mglBlobGet(b, &r->f, sizeof r->f);
+        RES_FIELDS(GET)
+#undef GET
+        r->name = mglBlobGetStr(b);
+        l->count = i + 1;
+
+        GLuint eb = mglBlobGetU32(b);
+
+        if (eb && eb < 65536 && (r->element_binding = (GLuint *)calloc(eb, sizeof(GLuint))))
+            mglBlobGet(b, r->element_binding, eb * sizeof(GLuint));
+        else if (eb)
+            b->bad = true;
+
+        GLuint eu = mglBlobGetU32(b);
+
+        if (eu && eu < 65536 && (r->element_unit = (GLint *)calloc(eu, sizeof(GLint))))
+            mglBlobGet(b, r->element_unit, eu * sizeof(GLint));
+        else if (eu)
+            b->bad = true;
+    }
+
+    return !b->bad;
+}
+
+static void hashWords(MglHash *h, const Spirv *sp)
+{
+    mglHashBytes(h, sp->ir, sp->ir ? sp->size * sizeof(unsigned int) : 0);
+}
+
+// Everything the step reads: the SPIR-V, the program's shaders, bindings and
+// state as it stands, and the context's limits.
+static bool mslCacheKey(GLMContext ctx, Program *ptr, int stage, Spirv *sp, const char *entry_override,
+                        char hex[65])
+{
+    MglHash h;
+    MglBlob lists = { 0 };
+
+    if (!mglShaderCacheOn() || ptr == NULL)
+        return false;
+
+    mglHashBegin(&h, "msl");
+    mglHashU32(&h, (uint32_t)stage);
+    mglHashStr(&h, entry_override);
+    hashWords(&h, sp);
+
+#ifdef MGL_OGL_ES
+    mglHashU32(&h, ctx->es != NULL);
+#endif
+#ifdef MGL_COMPAT_CONTEXTS
+    mglHashU32(&h, ctx->compat != NULL);
+#endif
+    {
+        GLuint limits[] = {
+            STATE_VAR(max_vertex_atomic_counters), STATE_VAR(max_vertex_atomic_counter_buffers),
+            STATE_VAR(max_tess_control_atomic_counters), STATE_VAR(max_tess_control_atomic_counter_buffers),
+            STATE_VAR(max_tess_evaluation_atomic_counters), STATE_VAR(max_tess_evaluation_atomic_counter_buffers),
+            STATE_VAR(max_geometry_atomic_counters), STATE_VAR(max_geometry_atomic_counter_buffers),
+            STATE_VAR(max_fragment_atomic_counters), STATE_VAR(max_fragment_atomic_counter_buffers),
+            STATE_VAR(max_compute_atomic_counters), STATE_VAR(max_compute_atomic_counter_buffers),
+        };
+
+        mglHashBytes(&h, limits, sizeof limits);
+    }
+
+    mglHashU32(&h, ptr->building_vs_raster);
+    mglHashU32(&h, ptr->building_vs_noraster);
+    mglHashU32(&h, ptr->building_fs_sample_rate);
+    mglHashU32(&h, (uint32_t)ptr->cull.building);
+    mglHashU32(&h, (uint32_t)ptr->cull.count);
+    mglHashBytes(&h, &ptr->tess, sizeof ptr->tess);
+
+    mglHashU32(&h, ptr->geom_shader != NULL);
+    if (ptr->geom_shader)
+    {
+        mglHashStr(&h, ptr->geom_shader->src);
+        mglHashU32(&h, ptr->geom.in_primitive);
+        mglHashU32(&h, ptr->geom.out_primitive);
+        mglHashU32(&h, (uint32_t)ptr->geom.max_vertices);
+        mglHashU32(&h, (uint32_t)ptr->geom.invocations);
+        mglHashU32(&h, ptr->geom.writes_primitive_id);
+    }
+
+    for (int s = 0; s < _MAX_SHADER_TYPES; s++)
+    {
+        hashWords(&h, &ptr->spirv[s]);
+
+        for (int k = 0; k < 1 + MGL_STAGE_EXTRA_UNITS; k++)
+        {
+            Shader *sh = k == 0 ? ptr->shader_slots[s] : ptr->also_attached[s][k - 1];
+
+            mglHashU32(&h, sh != NULL);
+            if (sh == NULL)
+                continue;
+
+            mglHashU32(&h, sh->type);
+            mglHashStr(&h, sh->src);
+            mglHashStr(&h, sh->pp_src);
+            mglHashStr(&h, mglShaderPreprocessed(sh));
+        }
+
+        for (int t = 0; t < MAX_SPVC_RESOURCE_TYPES; t++)
+            putList(&lists, &ptr->spirv_resources_list[s][t]);
+        putList(&lists, &ptr->block_uniforms[s]);
+        mglBlobPutU32(&lists, (uint32_t)ptr->bindless[s].count);
+        mglBlobPut(&lists, ptr->bindless[s].slot, sizeof ptr->bindless[s].slot);
+        mglBlobPut(&lists, ptr->bindless[s].is_sampler, sizeof ptr->bindless[s].is_sampler);
+        mglBlobPutU32(&lists, ptr->tex_table[s]);
+    }
+
+    if (lists.bad)
+    {
+        mglBlobFree(&lists);
+        return false;
+    }
+
+    mglHashBytes(&h, lists.data, lists.len);
+    mglBlobFree(&lists);
+
+    for (GLint b = 0; b < 32; b++)
+    {
+        mglHashStr(&h, b < ptr->attrib_bind_count ? ptr->attrib_binds[b].name : NULL);
+        mglHashU32(&h, b < ptr->attrib_bind_count ? ptr->attrib_binds[b].location : 0);
+        mglHashStr(&h, b < ptr->frag_bind_count ? ptr->frag_binds[b].name : NULL);
+        mglHashU32(&h, b < ptr->frag_bind_count ? ptr->frag_binds[b].location : 0);
+        mglHashU32(&h, b < ptr->frag_bind_count ? ptr->frag_binds[b].index : 0);
+    }
+
+    mglHashBytes(&h, ptr->attrib_alias, sizeof ptr->attrib_alias);
+    mglHashBytes(&h, &ptr->local_workgroup_size, sizeof ptr->local_workgroup_size);
+
+    mglHashEnd(&h, hex);
+    return true;
+}
+
+// what the step leaves behind, besides the MSL
+static void putMslResult(MglBlob *b, Program *ptr, int stage, Spirv *sp, const char *msl)
+{
+    mglBlobPutStr(b, msl);
+    mglBlobPutStr(b, sp->entry_point);
+    mglBlobPutU32(b, sp->plain_table);
+    mglBlobPutU32(b, sp->needs_sizes);
+    mglBlobPutU32(b, sp->raster_off);
+
+    for (int t = 0; t < MAX_SPVC_RESOURCE_TYPES; t++)
+        putList(b, &ptr->spirv_resources_list[stage][t]);
+    putList(b, &ptr->block_uniforms[stage]);
+
+    mglBlobPutU32(b, (uint32_t)ptr->bindless[stage].count);
+    mglBlobPut(b, ptr->bindless[stage].slot, sizeof ptr->bindless[stage].slot);
+    mglBlobPut(b, ptr->bindless[stage].is_sampler, sizeof ptr->bindless[stage].is_sampler);
+    mglBlobPutU32(b, ptr->tex_table[stage]);
+    mglBlobPut(b, ptr->attrib_alias, sizeof ptr->attrib_alias);
+    mglBlobPutU32(b, ptr->local_workgroup_size.x);
+    mglBlobPutU32(b, ptr->local_workgroup_size.y);
+    mglBlobPutU32(b, ptr->local_workgroup_size.z);
+    mglBlobPut(b, &ptr->tess, sizeof ptr->tess);
+}
+
+static char *getMslResult(MglBlob *b, Program *ptr, int stage, Spirv *sp, const char *entry_override)
+{
+    char *msl = mglBlobGetStr(b);
+    char *entry = mglBlobGetStr(b);
+    GLboolean plain = (GLboolean)mglBlobGetU32(b);
+    GLboolean sizes = (GLboolean)mglBlobGetU32(b);
+    GLboolean raster_off = (GLboolean)mglBlobGetU32(b);
+
+    if (msl == NULL || entry == NULL || b->bad)
+    {
+        free(msl);
+        free(entry);
+        return NULL;
+    }
+
+    for (int t = 0; t < MAX_SPVC_RESOURCE_TYPES; t++)
+        getList(b, &ptr->spirv_resources_list[stage][t]);
+    getList(b, &ptr->block_uniforms[stage]);
+
+    ptr->bindless[stage].count = (int)mglBlobGetU32(b);
+    mglBlobGet(b, ptr->bindless[stage].slot, sizeof ptr->bindless[stage].slot);
+    mglBlobGet(b, ptr->bindless[stage].is_sampler, sizeof ptr->bindless[stage].is_sampler);
+    ptr->tex_table[stage] = mglBlobGetU32(b);
+    mglBlobGet(b, ptr->attrib_alias, sizeof ptr->attrib_alias);
+    ptr->local_workgroup_size.x = mglBlobGetU32(b);
+    ptr->local_workgroup_size.y = mglBlobGetU32(b);
+    ptr->local_workgroup_size.z = mglBlobGetU32(b);
+    mglBlobGet(b, &ptr->tess, sizeof ptr->tess);
+
+    if (b->bad)
+    {
+        free(msl);
+        free(entry);
+        return NULL;
+    }
+
+    sp->plain_table = plain;
+    sp->needs_sizes = sizes;
+    sp->raster_off = raster_off;
+    free(sp->entry_point);
+    sp->entry_point = entry;
+
+    if (entry_override == NULL && ptr->shader_slots[stage])
+    {
+        free((void *)ptr->shader_slots[stage]->entry_point);
+        ptr->shader_slots[stage]->entry_point = strdup(entry);
+    }
+
+    return msl;
+}
+
 char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage, Spirv *sp,
                               const char *entry_override)
+{
+    unsigned long long start = mglBuildTimeStart();
+    Spirv *in = sp ? sp : (ptr ? &ptr->spirv[stage] : NULL);
+    char key[65];
+    bool keyed = in && in->ir && in->size && mslCacheKey(ctx, ptr, stage, in, entry_override, key);
+    MglBlob cached = { 0 };
+    bool hit = keyed && mglShaderCacheGet("msl", key, &cached);
+    char *msl = NULL;
+
+    // a damaged entry leaves state half written, which the real step then replaces
+    if (hit && !mglShaderCacheVerify())
+        msl = getMslResult(&cached, ptr, stage, in, entry_override);
+
+    if (msl == NULL)
+    {
+        msl = spirvToMetal(ctx, ptr, stage, sp, entry_override);
+
+        if (msl && keyed)
+        {
+            MglBlob b = { 0 };
+
+            putMslResult(&b, ptr, stage, in, msl);
+
+            if (hit && mglShaderCacheVerify())
+            {
+                if (b.len != cached.len - cached.at || memcmp(b.data, cached.data + cached.at, b.len))
+                    MGL_ERR("MGL: shader cache: stage %d of program %u translated differently\n", stage, ptr->name);
+            }
+            else
+                mglShaderCachePut("msl", key, &b);
+
+            mglBlobFree(&b);
+        }
+    }
+
+    mglBlobFree(&cached);
+    mglBuildTimeAdd(MGL_BUILD_SPIRV_CROSS, start);
+    return msl;
+}
+
+static char *spirvToMetal(GLMContext ctx, Program *ptr, int stage, Spirv *sp, const char *entry_override)
 {
     const SpvId *spirv;
     size_t word_count;
@@ -2572,18 +2882,17 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage, Spirv *sp
     }
     else
     {
-        GLuint name = ptr->shader_slots[stage]->name;
-
+        // the same name every run, so the Metal source is too and Metal's cache finds it
         switch(stage)
         {
-            case _VERTEX_SHADER: snprintf(entry_point, sizeof(entry_point), "vertex_%d_main",name); break;
-            case _TESS_CONTROL_SHADER: snprintf(entry_point, sizeof(entry_point), "tess_control_%d_main",name); break;
-            case _TESS_EVALUATION_SHADER: snprintf(entry_point, sizeof(entry_point), "tess_evaluation_%d_main",name); break;
-            case _GEOMETRY_SHADER: snprintf(entry_point, sizeof(entry_point), "geometry_%d",name); break;
-            case _FRAGMENT_SHADER: snprintf(entry_point, sizeof(entry_point), "fragment_%d",name); break;
-            case _COMPUTE_SHADER: snprintf(entry_point, sizeof(entry_point), "compute_%d",name); break;
-            case _TASK_SHADER: snprintf(entry_point, sizeof(entry_point), "task_%d",name); break;
-            case _MESH_SHADER: snprintf(entry_point, sizeof(entry_point), "mesh_%d",name); break;
+            case _VERTEX_SHADER: snprintf(entry_point, sizeof(entry_point), "mgl_vertex_main"); break;
+            case _TESS_CONTROL_SHADER: snprintf(entry_point, sizeof(entry_point), "mgl_tess_control_main"); break;
+            case _TESS_EVALUATION_SHADER: snprintf(entry_point, sizeof(entry_point), "mgl_tess_evaluation_main"); break;
+            case _GEOMETRY_SHADER: snprintf(entry_point, sizeof(entry_point), "mgl_geometry_main"); break;
+            case _FRAGMENT_SHADER: snprintf(entry_point, sizeof(entry_point), "mgl_fragment_main"); break;
+            case _COMPUTE_SHADER: snprintf(entry_point, sizeof(entry_point), "mgl_compute_main"); break;
+            case _TASK_SHADER: snprintf(entry_point, sizeof(entry_point), "mgl_task_main"); break;
+            case _MESH_SHADER: snprintf(entry_point, sizeof(entry_point), "mgl_mesh_main"); break;
             default: // CRITICAL FIX: Handle error gracefully instead of crashing
             MGL_ERR("MGL ERROR: Critical error in program.c at line %d\n", __LINE__);
             STATE(error) = GL_INVALID_OPERATION;
@@ -2794,8 +3103,7 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage, Spirv *sp
 
                     // the preprocessed text, so a binding given through a
                     // #define reads as the number it expands to
-                    const char *text = sh && sh->compiled_glsl_shader
-                        ? glslang_shader_get_preprocessed_code(sh->compiled_glsl_shader) : NULL;
+                    const char *text = mglShaderPreprocessed(sh);
 
                     if (text == NULL && sh)
                         text = sh->src;
@@ -3948,15 +4256,75 @@ static glslang_shader_t *companionShader(GLMContext ctx, GLenum gl_type, const c
 static void scanMsl(Spirv *sp);
 
 
+// A generated stage's SPIR-V depends only on its source, the stage it is
+// linked against, and how glslang is set up for them.
+static bool generatedCacheKey(GLMContext ctx, GLenum gl_type, const char *src, GLenum companion_type,
+                              const char *companion_src, char hex[65])
+{
+    glslang_input_t in;
+    MglHash h;
+
+    if (!mglShaderCacheOn())
+        return false;
+
+    mglHashBegin(&h, "generated");
+    mglHashU32(&h, gl_type);
+    mglHashStr(&h, src);
+    mglHashU32(&h, companion_type);
+    mglHashStr(&h, companion_src);
+
+    initGLSLInput(ctx, gl_type, src, &in);
+    mglHashU32(&h, in.stage);
+    mglHashU32(&h, in.client_version);
+    mglHashU32(&h, in.target_language_version);
+    mglHashU32(&h, (uint32_t)in.default_version);
+    mglHashU32(&h, in.default_profile);
+    mglHashU32(&h, in.messages);
+    mglHashResource(&h, in.resource);
+    mglHashEnd(&h, hex);
+    return true;
+}
+
 static bool buildGeneratedStageInto(GLMContext ctx, Program *pptr, GLenum gl_type,
                                     int spirv_slot, Spirv *dest, const char *src, const char *entry,
                                     GLenum companion_type, const char *companion_src)
 {
     glslang_input_t input;
-    glslang_shader_t *shader;
-    glslang_shader_t *companion = companionShader(ctx, companion_type, companion_src);
-    glslang_program_t *prog;
+    glslang_shader_t *shader = NULL;
+    glslang_shader_t *companion = NULL;
+    glslang_program_t *prog = NULL;
     glslang_stage_t stage;
+    Spirv *sp = dest ? dest : (spirv_slot >= 0 ? &pptr->spirv[spirv_slot] : &pptr->gs_passthrough);
+    char key[65];
+    bool keyed = generatedCacheKey(ctx, gl_type, src, companion_type, companion_src, key);
+    MglBlob cached = { 0 };
+    bool hit = keyed && mglShaderCacheGet("generated", key, &cached);
+
+    if (hit && !mglShaderCacheVerify())
+    {
+        uint32_t kind = mglBlobGetU32(&cached), n = mglBlobGetU32(&cached);
+        unsigned int *words = n ? (unsigned int *)malloc(n * sizeof(unsigned int)) : NULL;
+
+        if (words && mglBlobGet(&cached, words, n * sizeof(unsigned int)))
+        {
+            free(sp->ir);
+            free(sp->msl_str);
+            free(sp->entry_point);
+            sp->msl_str = NULL;
+            sp->entry_point = NULL;
+            sp->stage = kind;
+            sp->ir = words;
+            sp->size = n;
+            mglBlobFree(&cached);
+            goto translate;
+        }
+
+        free(words);
+        mglBlobFree(&cached);
+        hit = false;
+    }
+
+    companion = companionShader(ctx, companion_type, companion_src);
 
     initGLSLInput(ctx, gl_type, src, &input);
     stage = input.stage;
@@ -4014,13 +4382,13 @@ static bool buildGeneratedStageInto(GLMContext ctx, Program *pptr, GLenum gl_typ
         glslang_program_delete(prog);
         glslang_shader_delete(shader);
         glslang_shader_delete(companion);
+        mglBlobFree(&cached);
 
+        // what the retry makes is kept under its own key
         return retry && buildGeneratedStageInto(ctx, pptr, gl_type, spirv_slot, dest, src, entry, 0, NULL);
     }
 
     glslang_program_SPIRV_generate(prog, stage);
-
-    Spirv *sp = dest ? dest : (spirv_slot >= 0 ? &pptr->spirv[spirv_slot] : &pptr->gs_passthrough);
 
     free(sp->ir);
     free(sp->msl_str);
@@ -4059,6 +4427,28 @@ static bool buildGeneratedStageInto(GLMContext ctx, Program *pptr, GLenum gl_typ
         }
     }
 
+    if (keyed)
+    {
+        MglBlob b = { 0 };
+
+        mglBlobPutU32(&b, sp->stage);
+        mglBlobPutU32(&b, (uint32_t)sp->size);
+        mglBlobPut(&b, sp->ir, sp->size * sizeof(unsigned int));
+
+        if (hit)
+        {
+            if (b.len != cached.len - cached.at || memcmp(b.data, cached.data + cached.at, b.len))
+                MGL_ERR("MGL: shader cache: a generated stage of program %u made different SPIR-V\n", pptr->name);
+        }
+        else
+            mglShaderCachePut("generated", key, &b);
+
+        mglBlobFree(&b);
+    }
+
+    mglBlobFree(&cached);
+
+translate:
     // parseSPIRVShaderToMetal reads the shader slot for its entry point name,
     // which a generated stage does not have, so it is compiled here instead
 
@@ -4111,7 +4501,10 @@ static void noteShaderCapture(Program *pptr)
         if (sh == NULL)
             continue;
 
-        int n = mglXfbLayout(stageGlsl(pptr, order[i], 0), items, 64, strides, MGL_XFB_MAX_BUFFERS);
+        // without an xfb_ qualifier there is nothing to find, and no tree to make
+        const char *text = mglShaderPreprocessed(sh);
+        int n = text && !strstr(text, "xfb_") ? 0
+              : mglXfbLayout(stageGlsl(pptr, order[i], 0), items, 64, strides, MGL_XFB_MAX_BUFFERS);
 
         for (int b = 0; n > 0 && b < MGL_XFB_MAX_BUFFERS; b++)
             pptr->xfb_shader_strides[b] = strides[b];
@@ -4152,7 +4545,7 @@ static void linkTransformCapture(GLMContext ctx, Program *pptr)
                                   &pptr->xfb))
         return;
 
-    snprintf(entry, sizeof(entry), "vertex_%d_main", vs->name);
+    snprintf(entry, sizeof(entry), "mgl_vertex_main");
 
     if (!buildGeneratedStage(ctx, pptr, GL_VERTEX_SHADER, _VERTEX_SHADER,
                              pptr->xfb.rewritten_src, entry))
@@ -4281,7 +4674,7 @@ static void linkGeometryCapture(Program *pptr)
 
     glslang_shader_t *gs_glsl = pptr->synthetic_gs ? stageGlsl(pptr, _TESS_EVALUATION_SHADER, 0)
                               : gs == pptr->shader_slots[_GEOMETRY_SHADER] ? stageGlsl(pptr, _GEOMETRY_SHADER, 0)
-                              : gs->compiled_glsl_shader;
+                              : mglShaderTree(_ctx, gs);
 
     n = mglTransformCaptureItems(gs->pp_src ? gs->pp_src : gs->src, gs_glsl,
                                  pptr->xfb_varyings, pptr->xfb_varying_count, pptr->xfb_buffer_mode,
@@ -4389,7 +4782,7 @@ static bool linkStageToMetal(GLMContext ctx, Program *pptr, int stage)
             char entry[128];
             bool ok;
 
-            snprintf(entry, sizeof(entry), tcs ? "tess_control_%d_main" : "tess_evaluation_%d_main", sh->name);
+            snprintf(entry, sizeof(entry), "%s", tcs ? "mgl_tess_control_main" : "mgl_tess_evaluation_main");
             ok = buildGeneratedStageInto(ctx, pptr, tcs ? GL_TESS_CONTROL_SHADER : GL_TESS_EVALUATION_SHADER,
                                          stage, NULL, touched, entry,
                                          from_control ? GL_TESS_CONTROL_SHADER : GL_VERTEX_SHADER, wsrc);
@@ -4442,7 +4835,7 @@ static bool linkTessGeometryProgram(GLMContext ctx, Program *pptr)
             linkStageToMetal(ctx, pptr, _TESS_CONTROL_SHADER);
 
         linkStageToMetal(ctx, pptr, _TESS_EVALUATION_SHADER);
-        snprintf(e, sizeof e, "geometry_%d", pptr->geom_shader->name);
+        snprintf(e, sizeof e, "mgl_geometry_main");
         buildGeneratedStage(ctx, pptr, GL_COMPUTE_SHADER, _GEOMETRY_SHADER, pptr->geom.compute_src, e);
         return true;
     }
@@ -4485,7 +4878,7 @@ static bool linkTessGeometryProgram(GLMContext ctx, Program *pptr)
     pptr->tess.patch_kind = SpvExecutionModeQuads;
     pptr->tess.quad_isolines = !general;
 
-    snprintf(entry, sizeof(entry), "tess_evaluation_%d_main", tes->name);
+    snprintf(entry, sizeof(entry), "mgl_tess_evaluation_main");
     {
         Shader *before = pptr->tess.has_control ? pptr->shader_slots[_TESS_CONTROL_SHADER]
                                                 : pptr->shader_slots[_VERTEX_SHADER];
@@ -4508,7 +4901,7 @@ static bool linkTessGeometryProgram(GLMContext ctx, Program *pptr)
     if (pptr->tess.has_control && !linkStageToMetal(ctx, pptr, _TESS_CONTROL_SHADER))
         return false;
 
-    snprintf(entry, sizeof(entry), "geometry_%d", pptr->geom_shader->name);
+    snprintf(entry, sizeof(entry), "mgl_geometry_main");
 
     if (!buildGeneratedStage(ctx, pptr, GL_COMPUTE_SHADER, _GEOMETRY_SHADER,
                              pptr->geom.compute_src, entry))
@@ -4526,6 +4919,7 @@ static bool linkTessGeometryProgram(GLMContext ctx, Program *pptr)
     pptr->geom.gs_out_slot    = mslSlotForName(pptr, _GEOMETRY_SHADER, "MglGsOutB");
     pptr->geom.gs_index_slot  = mslSlotForName(pptr, _GEOMETRY_SHADER, "MglGsIdxB");
     pptr->geom.pass_out_slot  = mslSlotForName(pptr, _COMPUTE_SHADER, "MglGsOutB");
+    pptr->geom.pass_wide_slot = mslSlotForName(pptr, _COMPUTE_SHADER, "MglGsWideB");
 
     linkGeometryCapture(pptr);
 
@@ -4573,14 +4967,14 @@ static bool linkGeometryProgram(GLMContext ctx, Program *pptr)
     if (captured == NULL)
         return false;
 
-    snprintf(entry, sizeof(entry), "vertex_%d_main", vs->name);
+    snprintf(entry, sizeof(entry), "mgl_vertex_main");
     ok = buildGeneratedStage(ctx, pptr, GL_VERTEX_SHADER, _VERTEX_SHADER, captured, entry);
     free(captured);
 
     if (!ok)
         return false;
 
-    snprintf(entry, sizeof(entry), "geometry_%d", gs->name);
+    snprintf(entry, sizeof(entry), "mgl_geometry_main");
 
     if (!buildGeneratedStage(ctx, pptr, GL_COMPUTE_SHADER, _GEOMETRY_SHADER,
                              pptr->geom.compute_src, entry))
@@ -4598,6 +4992,7 @@ static bool linkGeometryProgram(GLMContext ctx, Program *pptr)
     pptr->geom.gs_out_slot    = mslSlotForName(pptr, _GEOMETRY_SHADER, "MglGsOutB");
     pptr->geom.gs_index_slot  = mslSlotForName(pptr, _GEOMETRY_SHADER, "MglGsIdxB");
     pptr->geom.pass_out_slot  = mslSlotForName(pptr, _COMPUTE_SHADER, "MglGsOutB");
+    pptr->geom.pass_wide_slot = mslSlotForName(pptr, _COMPUTE_SHADER, "MglGsWideB");
 
     linkGeometryCapture(pptr);
 
@@ -4768,6 +5163,182 @@ static void scanMeshModes(Program *pptr)
     pptr->mesh.payload_size = (GLuint)spirvPayloadSize(pptr->spirv[_TASK_SHADER].ir, pptr->spirv[_TASK_SHADER].size);
 }
 
+// What glslang parses for each unit a stage links, and how, which is all the
+// SPIR-V it makes depends on. False when a unit is missing, for the link to report.
+static bool spirvCacheKey(GLMContext ctx, Program *pptr, int stage, char hex[65])
+{
+    MglHash h;
+    // without copies, a link from the cache reads the text a copy would be made from
+    bool copies = !pptr->link_from_cache;
+
+    if (!mglShaderCacheOn())
+        return false;
+
+    mglHashBegin(&h, "spirv");
+    mglHashU32(&h, (uint32_t)stage);
+    mglHashU32(&h, stage == _FRAGMENT_SHADER && pptr->geom_shader && pptr->geom.writes_primitive_id);
+
+    for (int s = 0; s < _MAX_SHADER_TYPES; s++)
+    {
+        for (int k = 0; k < 1 + MGL_STAGE_EXTRA_UNITS; k++)
+        {
+            Shader *sh = k == 0 ? pptr->shader_slots[s] : pptr->also_attached[s][k - 1];
+
+            if (sh == NULL)
+                break;
+
+            glslang_shader_t *g = copies ? stageGlsl(pptr, s, k) : NULL;
+            const char *text = copies ? (g ? glslang_shader_get_preprocessed_code(g) : NULL) : mglShaderPreprocessed(sh);
+            glslang_input_t in;
+
+            if (sh->log || text == NULL)
+                return false;
+
+            initGLSLInput(ctx, sh->type, text, &in);
+
+            mglHashU32(&h, (uint32_t)(s * 16 + k));
+            mglHashU32(&h, sh->type);
+            mglHashU32(&h, !copies || g == pptr->link_glsl[s][k] ? 1 : g == pptr->kept_glsl[s][k] ? 2 : 3);
+            mglHashStr(&h, text);
+            mglHashU32(&h, in.stage);
+            mglHashU32(&h, in.client_version);
+            mglHashU32(&h, in.target_language_version);
+            mglHashU32(&h, (uint32_t)in.default_version);
+            mglHashU32(&h, in.default_profile);
+            mglHashU32(&h, (uint32_t)in.force_default_version_and_profile);
+            mglHashU32(&h, (uint32_t)in.forward_compatible);
+            mglHashU32(&h, in.messages);
+            mglHashResource(&h, in.resource);
+        }
+    }
+
+    mglHashEnd(&h, hex);
+    return true;
+}
+
+// --- a whole link from the shader cache ------------------------------------------
+
+// MglResource is its name, then plain ints up to num_active, then active.
+_Static_assert(offsetof(MglResource, num_active) - offsetof(MglResource, type) == 19 * sizeof(GLint),
+               "MglResource changed; update putTable and getTable");
+
+static void putTable(MglBlob *b, const MglResourceTable *t)
+{
+    for (int k = 0; k < MGL_RES_KINDS; k++)
+    {
+        mglBlobPutU32(b, (uint32_t)t->count[k]);
+
+        for (GLint i = 0; i < t->count[k]; i++)
+        {
+            const MglResource *r = &t->list[k][i];
+            GLint n = r->active ? r->num_active : 0;
+
+            mglBlobPutStr(b, r->name);
+            mglBlobPut(b, &r->type, offsetof(MglResource, num_active) - offsetof(MglResource, type) + sizeof(GLint));
+            mglBlobPutU32(b, (uint32_t)n);
+            mglBlobPut(b, r->active, (size_t)n * sizeof(GLint));
+        }
+    }
+}
+
+static bool getTable(MglBlob *b, MglResourceTable *t)
+{
+    memset(t, 0, sizeof *t);
+
+    for (int k = 0; k < MGL_RES_KINDS && !b->bad; k++)
+    {
+        GLint count = (GLint)mglBlobGetU32(b);
+
+        if (count < 0 || count > 65536 || (t->list[k] = (MglResource *)calloc(count ? count : 1, sizeof(MglResource))) == NULL)
+            return false;
+
+        for (GLint i = 0; i < count && !b->bad; i++)
+        {
+            MglResource *r = &t->list[k][i];
+
+            t->count[k] = i + 1;
+            r->name = mglBlobGetStr(b);
+            mglBlobGet(b, &r->type, offsetof(MglResource, num_active) - offsetof(MglResource, type) + sizeof(GLint));
+
+            uint32_t n = mglBlobGetU32(b);
+
+            r->active = NULL;
+            if (n && n < 65536 && (r->active = (GLint *)malloc(n * sizeof(GLint))))
+                mglBlobGet(b, r->active, n * sizeof(GLint));
+            else if (n)
+                b->bad = true;
+        }
+    }
+
+    return !b->bad;
+}
+
+// A program of one vertex and one fragment shader that linked before with
+// the same text needs nothing from glslang: the SPIR-V of both stages and what
+// reflection found are in the shader cache. The key is kept for the link to
+// store them under when they are not.
+static bool linkFromCache(GLMContext ctx, Program *pptr)
+{
+    Shader *pair[2] = { pptr->shader_slots[_VERTEX_SHADER], pptr->shader_slots[_FRAGMENT_SHADER] };
+    MglBlob b = { 0 };
+    MglHash h;
+    char key[65];
+    bool ok = true;
+
+    pptr->cache_key[0] = 0;
+
+    if (!mglShaderCacheOn() || pptr->xfb_varying_count > 0)
+        return false;
+
+    for (int s = 0; s < _MAX_SHADER_TYPES; s++)
+        if ((s != _VERTEX_SHADER && s != _FRAGMENT_SHADER && pptr->shader_slots[s]) || pptr->also_attached[s][0])
+            return false;
+
+    mglHashBegin(&h, "program");
+
+    for (int i = 0; i < 2; i++)
+    {
+        Shader *sh = pair[i];
+        glslang_input_t in;
+
+        if (!mglShaderCompiled(sh) || sh->spirv_binary || strstr(sh->src, "xfb_") ||
+            strstr(mglShaderPreprocessed(sh), "xfb_"))
+            return false;
+
+        initGLSLInput(ctx, sh->type, mglShaderPreprocessed(sh), &in);
+        mglHashU32(&h, sh->type);
+        mglHashStr(&h, mglShaderPreprocessed(sh));
+        mglHashStr(&h, sh->src);
+        mglHashStr(&h, sh->pp_src);
+        mglHashU32(&h, in.client_version);
+        mglHashU32(&h, (uint32_t)in.default_version);
+        mglHashU32(&h, in.default_profile);
+        mglHashResource(&h, in.resource);
+    }
+
+    mglHashEnd(&h, pptr->cache_key);
+
+    if (mglShaderCacheVerify())
+        return false;
+
+    pptr->link_from_cache = GL_TRUE;
+
+    for (int stage = _VERTEX_SHADER; stage <= _FRAGMENT_SHADER && ok; stage++)
+    {
+        if (pptr->shader_slots[stage] == NULL)
+            continue;
+
+        ok = spirvCacheKey(ctx, pptr, stage, key) && mglShaderCacheGet("spirv", key, &b);
+        mglBlobFree(&b);
+    }
+
+    ok = ok && mglShaderCacheGet("reflect", pptr->cache_key, &b);
+    mglBlobFree(&b);
+    pptr->link_from_cache = GL_FALSE;
+
+    return ok;
+}
+
 bool linkAndCompileProgramToMetal(GLMContext ctx, Program *pptr, int stage, bool modes_only)
 {
     glslang_program_t *glsl_program;
@@ -4802,6 +5373,39 @@ bool linkAndCompileProgramToMetal(GLMContext ctx, Program *pptr, int stage, bool
     if (pptr->spirv[stage].mtl_library) {
         CFRelease(pptr->spirv[stage].mtl_library);
         pptr->spirv[stage].mtl_library = NULL;
+    }
+
+    unsigned long long link_start = mglBuildTimeStart();
+    char spirv_key[65];
+    MglBlob cached = { 0 };
+    bool keyed, hit;
+
+    glsl_program = NULL;
+
+    if (pptr->link_from_cache)
+    {
+        uint32_t n = 0;
+        unsigned int *words = NULL;
+
+        if (spirvCacheKey(ctx, pptr, stage, spirv_key) && mglShaderCacheGet("spirv", spirv_key, &cached))
+        {
+            n = mglBlobGetU32(&cached);
+            words = n ? (unsigned int *)malloc(n * sizeof(unsigned int)) : NULL;
+        }
+
+        if (words && mglBlobGet(&cached, words, n * sizeof(unsigned int)))
+        {
+            free(pptr->spirv[stage].ir);
+            pptr->spirv[stage].ir = words;
+            pptr->spirv[stage].size = n;
+            mglBlobFree(&cached);
+            goto have_spirv;
+        }
+
+        // checked before the link started, so only a damaged entry gets here
+        free(words);
+        mglBlobFree(&cached);
+        ERROR_RETURN_VALUE(GL_INVALID_OPERATION, false);
     }
 
     MGL_INFO("MGL DEBUG: Creating glslang program for stage %d\n", stage);
@@ -4844,6 +5448,30 @@ bool linkAndCompileProgramToMetal(GLMContext ctx, Program *pptr, int stage, bool
         MGL_ERR("MGL Error: glslang_program_get_info_log:\n%s\n", glslang_program_get_info_log(glsl_program));
 
         LINK_FAIL(GL_INVALID_OPERATION);
+    }
+
+    // The link and mapping still run on a cache hit: they write locations into
+    // the shader copies, which reflection and later links read.
+    keyed = spirvCacheKey(ctx, pptr, stage, spirv_key);
+    hit = keyed && mglShaderCacheGet("spirv", spirv_key, &cached);
+
+    if (hit && !mglShaderCacheVerify())
+    {
+        uint32_t n = mglBlobGetU32(&cached);
+        unsigned int *words = n ? (unsigned int *)malloc(n * sizeof(unsigned int)) : NULL;
+
+        if (words && mglBlobGet(&cached, words, n * sizeof(unsigned int)))
+        {
+            free(pptr->spirv[stage].ir);
+            pptr->spirv[stage].ir = words;
+            pptr->spirv[stage].size = n;
+            mglBlobFree(&cached);
+            goto have_spirv;
+        }
+
+        free(words);
+        mglBlobFree(&cached);
+        hit = false;
     }
 
     // generate SPIVR
@@ -4898,6 +5526,30 @@ bool linkAndCompileProgramToMetal(GLMContext ctx, Program *pptr, int stage, bool
             pptr->spirv[stage].size = n;
         }
     }
+
+    if (hit)
+    {
+        uint32_t n = mglBlobGetU32(&cached);
+        size_t bytes = pptr->spirv[stage].size * sizeof(unsigned int);
+
+        if (n != pptr->spirv[stage].size || cached.len - cached.at != bytes ||
+            memcmp(cached.data + cached.at, pptr->spirv[stage].ir, bytes))
+            MGL_ERR("MGL: shader cache: stage %d of program %u made different SPIR-V\n", stage, pptr->name);
+    }
+    else if (keyed)
+    {
+        MglBlob b = { 0 };
+
+        mglBlobPutU32(&b, (uint32_t)pptr->spirv[stage].size);
+        mglBlobPut(&b, pptr->spirv[stage].ir, pptr->spirv[stage].size * sizeof(unsigned int));
+        mglShaderCachePut("spirv", spirv_key, &b);
+        mglBlobFree(&b);
+    }
+
+    mglBlobFree(&cached);
+
+have_spirv:
+    mglBuildTimeAdd(MGL_BUILD_GLSL_LINK, link_start);
 
     if (modes_only)
     {
@@ -4961,10 +5613,16 @@ bool linkAndCompileProgramToMetal(GLMContext ctx, Program *pptr, int stage, bool
 
     // The program owns this now; mglFreeProgram deletes it. Every stage makes
     // one, and each links all the shaders, so the last one made is kept.
-    if (pptr->linked_glsl_program && pptr->linked_glsl_program != glsl_program)
-        glslang_program_delete(pptr->linked_glsl_program);
+    // a stage from the cache has no glslang program
+    if (glsl_program)
+    {
+        if (pptr->linked_glsl_program && pptr->linked_glsl_program != glsl_program)
+            glslang_program_delete(pptr->linked_glsl_program);
 
-    pptr->linked_glsl_program = glsl_program;
+        pptr->linked_glsl_program = glsl_program;
+    }
+
+    pptr->links_made++;
     pptr->executable = GL_TRUE;
     pptr->dirty_bits |= DIRTY_PROGRAM;
 
@@ -5062,6 +5720,82 @@ static void setUniformInitializer(GLMContext ctx, Program *pptr, const MglUnifor
 }
 
 // Uniforms declared with a value start with it after every successful link.
+// The values a stage's uniforms start with, from the shader cache when it has them.
+// They depend on the source and on the version and profile its tree was parsed with.
+static int uniformInitializers(GLMContext ctx, Program *pptr, int stage, Shader *sh, MglUniformInit *out, int max)
+{
+    const char *src = sh->pp_src ? sh->pp_src : sh->src;
+    // the tree's text decides its version and profile; on a link from the
+    // cache the tree is made only on a miss
+    glslang_shader_t *tree = pptr->link_from_cache ? NULL : stageGlsl(pptr, stage, 0);
+    const char *text = tree ? glslang_shader_get_preprocessed_code(tree) : mglShaderPreprocessed(sh);
+    const void *resource = mglGlslangResource(ctx);
+    char key[65];
+    MglBlob cached = { 0 };
+    MglHash h;
+    int n;
+
+    if (!mglShaderCacheOn() || text == NULL)
+        return mglUniformInitializers(tree ? tree : stageGlsl(pptr, stage, 0), src, resource, out, max);
+
+    mglHashBegin(&h, "uniform-init");
+    mglHashU32(&h, sh->type);
+    mglHashStr(&h, src);
+    mglHashStr(&h, text);
+    mglHashResource(&h, resource);
+    mglHashU32(&h, (uint32_t)max);
+    mglHashEnd(&h, key);
+
+    if (mglShaderCacheGet("uniform-init", key, &cached) && !mglShaderCacheVerify())
+    {
+        n = (int)mglBlobGetU32(&cached);
+
+        for (int i = 0; i < n && i < max && !cached.bad; i++)
+        {
+            char *name = mglBlobGetStr(&cached);
+
+            snprintf(out[i].name, sizeof out[i].name, "%s", name ? name : "");
+            free(name);
+            out[i].kind = (char)mglBlobGetU32(&cached);
+            out[i].cols = (GLint)mglBlobGetU32(&cached);
+            out[i].rows = (GLint)mglBlobGetU32(&cached);
+            mglBlobGet(&cached, out[i].values, sizeof out[i].values);
+        }
+
+        bool ok = !cached.bad && n <= max;
+
+        mglBlobFree(&cached);
+        if (ok)
+            return n;
+    }
+
+    n = mglUniformInitializers(tree ? tree : stageGlsl(pptr, stage, 0), src, resource, out, max);
+
+    MglBlob b = { 0 };
+
+    mglBlobPutU32(&b, (uint32_t)(n > 0 ? n : 0));
+    for (int i = 0; i < n; i++)
+    {
+        mglBlobPutStr(&b, out[i].name);
+        mglBlobPutU32(&b, (uint32_t)(unsigned char)out[i].kind);
+        mglBlobPutU32(&b, (uint32_t)out[i].cols);
+        mglBlobPutU32(&b, (uint32_t)out[i].rows);
+        mglBlobPut(&b, out[i].values, sizeof out[i].values);
+    }
+
+    if (cached.data)
+    {
+        if (b.len != cached.len - cached.at || memcmp(b.data, cached.data + cached.at, b.len))
+            MGL_ERR("MGL: shader cache: shader %u found other uniform initializers\n", sh->name);
+    }
+    else
+        mglShaderCachePut("uniform-init", key, &b);
+
+    mglBlobFree(&b);
+    mglBlobFree(&cached);
+    return n;
+}
+
 static void applyUniformInitializers(GLMContext ctx, Program *pptr)
 {
     MglUniformInit *inits;
@@ -5079,11 +5813,10 @@ static void applyUniformInitializers(GLMContext ctx, Program *pptr)
         Shader *sh = pptr->shader_slots[s];
         int n;
 
-        if (sh == NULL || stageGlsl(pptr, s, 0) == NULL || sh->spirv_binary)
+        if (sh == NULL || sh->spirv_binary || (pptr->link_from_cache ? !mglShaderCompiled(sh) : stageGlsl(pptr, s, 0) == NULL))
             continue;
 
-        n = mglUniformInitializers(stageGlsl(pptr, s, 0), sh->pp_src ? sh->pp_src : sh->src,
-                                   mglGlslangResource(ctx), inits, 256);
+        n = uniformInitializers(ctx, pptr, s, sh, inits, 256);
 
         for (int k = 0; k < n; k++)
             setUniformInitializer(ctx, pptr, &inits[k]);
@@ -5267,18 +6000,43 @@ static void reflectProgram(GLMContext ctx, Program *pptr)
     if (pptr->link_status != GL_TRUE)
         return;
 
-    for (int s = 0; s < _MAX_SHADER_TYPES; s++)
-    {
-        Shader *sh = pptr->shader_slots[s];
+    MglBlob cached = { 0 };
 
-        if (sh && stageGlsl(pptr, s, 0) && sh->spirv_binary == NULL)
+    if (pptr->link_from_cache && mglShaderCacheGet("reflect", pptr->cache_key, &cached) &&
+        getTable(&cached, &pptr->resources))
+    {
+        // taken from the cache
+    }
+    else
+    {
+        if (pptr->link_from_cache)
+            MGL_ERR("MGL: shader cache: program %u's reflection could not be read\n", pptr->name);
+
+        for (int s = 0; s < _MAX_SHADER_TYPES; s++)
         {
-            shaders[s] = stageGlsl(pptr, s, 0);
-            sources[s] = sh->pp_src ? sh->pp_src : sh->src;
+            Shader *sh = pptr->shader_slots[s];
+
+            if (sh && stageGlsl(pptr, s, 0) && sh->spirv_binary == NULL)
+            {
+                shaders[s] = stageGlsl(pptr, s, 0);
+                sources[s] = sh->pp_src ? sh->pp_src : sh->src;
+            }
+        }
+
+        mglFreeResourceTable(&pptr->resources);
+        mglReflectProgram(shaders, sources, _MAX_SHADER_TYPES, &pptr->resources);
+
+        if (pptr->cache_key[0] && !pptr->link_from_cache)
+        {
+            MglBlob b = { 0 };
+
+            putTable(&b, &pptr->resources);
+            mglShaderCachePut("reflect", pptr->cache_key, &b);
+            mglBlobFree(&b);
         }
     }
 
-    mglReflectProgram(shaders, sources, _MAX_SHADER_TYPES, &pptr->resources);
+    mglBlobFree(&cached);
     markBlockElementUse(pptr, MGL_RES_UNIFORM_BLOCK);
     markBlockElementUse(pptr, MGL_RES_STORAGE_BLOCK);
     dropInactiveStructMembers(pptr);
@@ -5505,7 +6263,8 @@ static void linkProgram(GLMContext ctx, GLuint program);
 void mglLinkProgram(GLMContext ctx, GLuint program)
 {
     Program *pptr = findProgram(ctx, program);
-    glslang_program_t *old;
+    glslang_program_t *old_glsl;
+    GLuint old;
 
     if (pptr == NULL)
     {
@@ -5513,12 +6272,33 @@ void mglLinkProgram(GLMContext ctx, GLuint program)
         return;
     }
 
-    copyShadersForLink(ctx, pptr);
-    old = pptr->linked_glsl_program;
+    unsigned long long start = mglBuildTimeStart();
+
+    pptr->link_from_cache = linkFromCache(ctx, pptr);
+
+    if (!pptr->link_from_cache)
+        copyShadersForLink(ctx, pptr);
+
+    old = pptr->links_made;
+    old_glsl = pptr->linked_glsl_program;
     linkProgram(ctx, program);
 
-    if (pptr->linked_glsl_program != old)
+    if (pptr->link_from_cache)
+        mglBuildTimeAdd(MGL_BUILD_CACHED_LINK, start);
+
+    pptr->link_from_cache = GL_FALSE;
+    pptr->cache_key[0] = 0;
+
+    if (pptr->links_made != old)
     {
+        // a link from the cache leaves the old glslang program, which
+        // borrows the copies about to be freed
+        if (old_glsl && pptr->linked_glsl_program == old_glsl)
+        {
+            glslang_program_delete(old_glsl);
+            pptr->linked_glsl_program = NULL;
+        }
+
         freeGlslCopies(pptr->kept_glsl);
         memcpy(pptr->kept_glsl, pptr->link_glsl, sizeof(pptr->link_glsl));
         memset(pptr->link_glsl, 0, sizeof(pptr->link_glsl));

@@ -272,6 +272,9 @@ On a Retina screen the framebuffer has more pixels than the window has points. S
 - `MGL_LOG_LEVEL=2` (or `3`) prints what MooGL is doing to stderr.
 - `MGL_DEBUG_MSL=1` prints the Metal shader each GL shader turned into.
 - `MGL_DEBUG_CONTEXT=1` prints every function a loader asked for that MooGL lacks.
+- `MGL_BUILD_TIMES=1` prints, at exit, how long shader compiles, links, translation, Metal compiles and pipelines took.
+
+MooGL keeps what it made from each shader in `~/Library/Caches/MooGL/<program>`, so a second launch skips most of the work. Each program's folder is kept under 256 MB (`MGL_SHADER_CACHE_MAX_MB` changes it), and a new build of MooGL starts it over. `MGL_SHADER_CACHE=0` turns it off; `MGL_SHADER_CACHE_VERIFY=1` does the work anyway and reports anything that differs.
 
 ### 7. Ship it in an app bundle
 
@@ -585,10 +588,10 @@ All of OpenGL 4.6 core, plus:
 
 ## Known limits
 
-- The compatibility profile covers what old programs mostly use: `glBegin` and `glEnd`, client-side vertex arrays, quads and polygons, the matrix stacks, fixed-function lighting, `glTexEnv` (including `GL_COMBINE`), texture coordinate generation, fog, point sprites, `glPushAttrib`, front and back polygon modes, display lists, evaluators (`glMap`, `glEvalMesh`), selection with `glRenderMode(GL_SELECT)`, `glRasterPos`, `glDrawPixels`, `glBitmap`, `glCopyPixels`, the luminance and alpha texture formats, and old GLSL (1.10 to 1.30) that reads `gl_ModelViewMatrix` and the other built-ins. Missing: feedback mode (it returns nothing), the accumulation buffer, colour-index mode, and depth or stencil through `glDrawPixels` and `glCopyPixels`. Line and polygon stipple and edge flags are accepted but not drawn. `GL_APPLE_client_storage` copies the texture rather than reading the application's memory, which the extension allows.
+- The compatibility profile covers what old programs mostly use: `glBegin` and `glEnd`, client-side vertex arrays, quads and polygons, the matrix stacks, fixed-function lighting, `glTexEnv` (including `GL_COMBINE`), texture coordinate generation, fog, point sprites, `glPushAttrib`, front and back polygon modes, display lists, evaluators (`glMap`, `glEvalMesh`), selection with `glRenderMode(GL_SELECT)`, `glRasterPos`, `glDrawPixels`, `glBitmap`, `glCopyPixels`, the luminance and alpha texture formats, and old GLSL (1.10 to 1.30) that reads `gl_ModelViewMatrix` and the other built-ins. Missing: feedback mode (it returns nothing), the accumulation buffer, colour-index mode, and depth or stencil through `glDrawPixels` and `glCopyPixels`. Line and polygon stipple are accepted but not drawn. Edge flags hide wireframe edges, except in an array draw recorded into a display list. `GL_APPLE_client_storage` copies the texture rather than reading the application's memory, which the extension allows.
 - A CGL or AGL context made directly draws offscreen, into framebuffer objects, until `NSOpenGLContext` puts it in a window. AGL's Carbon windows no longer exist.
 - `moogl-dropin` changes the app, never the system: Apple's `OpenGL.framework` is sealed. It runs arm64 apps only, and makes a universal app arm64 only. An app signed again ad hoc loses its hardened runtime, and entitlements that need a team, such as iCloud or a keychain group, stop working.
-- Wide lines, up to 16 pixels as Apple's legacy contexts drew them, work in compatibility contexts only. A core context draws every line 1 pixel wide, as Apple's core contexts did. Wide lines from programs with a geometry or tessellation stage also stay 1 pixel wide.
+- Wide lines, up to 16 pixels as Apple's legacy contexts drew them, work in compatibility contexts only. A core context draws every line 1 pixel wide, as Apple's core contexts did. Lines from a geometry shader or isolines are drawn wide too; a wireframe (`glPolygonMode(GL_LINE)`) of triangles from a geometry or tessellation stage stays 1 pixel wide.
 - A CGL pbuffer is kept and described, but a context does not draw into it. Code built with `CGLMacro.h`, which calls into Apple's context structure directly, does not work.
 - Mesh shaders with per-primitive `gl_Layer`: IDKEngine's mesh-shader point shadows drop a few triangles, differently from run to run. Seven smaller tests of the same pattern pass, so it looks like a Metal driver issue. The vertex-shader path is not affected.
 - Some Minecraft shaderpacks do an explicit check for macOS and refuse to run when it's detected; this is beyond MooGL's control and the shaderpack must be changed.

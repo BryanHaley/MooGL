@@ -29,6 +29,7 @@
 #include "mgl_reflect.h"
 #include "glm_context.h"
 #include "mgl_log.h"
+#include "shader_cache.h"
 #include "mgl_es.h"
 
 const glslang_resource_t* glslang_default_resource(void);
@@ -84,6 +85,9 @@ glslang_stage_t getGLSLStage(GLuint type)
 
 void initGLSLInput(GLMContext ctx, GLuint type, const char *src, glslang_input_t *input)
 {
+    // the fields set below are not all of them, and glslang reads the rest
+    memset(input, 0, sizeof(*input));
+
     input->language = GLSLANG_SOURCE_GLSL;
     input->stage = getGLSLStage(type);
     input->client = GLSLANG_CLIENT_OPENGL;
@@ -216,18 +220,50 @@ void initGLSLInput(GLMContext ctx, GLuint type, const char *src, glslang_input_t
     input->force_default_version_and_profile = 1;
 }
 
+const char *mglShaderPreprocessed(Shader *sh)
+{
+    if (sh == NULL)
+        return NULL;
+
+    return sh->compiled_glsl_shader ? glslang_shader_get_preprocessed_code(sh->compiled_glsl_shader) : sh->pp_text;
+}
+
+bool mglShaderCompiled(Shader *sh)
+{
+    return sh && sh->log == NULL && (sh->compiled_glsl_shader || sh->pp_text);
+}
+
+static glslang_shader_t *parseText(GLMContext ctx, GLenum type, const char *text);
+
+// The shader's tree, made from its preprocessed text when the compile came
+// from the shader cache
+glslang_shader_t *mglShaderTree(GLMContext ctx, Shader *sh)
+{
+    if (sh == NULL || sh->log)
+        return NULL;
+
+    if (sh->compiled_glsl_shader == NULL && sh->pp_text && ctx)
+        sh->compiled_glsl_shader = parseText(ctx, sh->type, sh->pp_text);
+
+    return sh->compiled_glsl_shader;
+}
+
 // A copy of a compiled shader for one link to map: parsed again from the text
 // glCompileShader settled on, with the same options
 glslang_shader_t *mglCopyShaderForLink(GLMContext ctx, Shader *ptr)
 {
-    const char *text = glslang_shader_get_preprocessed_code(ptr->compiled_glsl_shader);
+    return parseText(ctx, ptr->type, mglShaderPreprocessed(ptr));
+}
+
+static glslang_shader_t *parseText(GLMContext ctx, GLenum type, const char *text)
+{
     glslang_input_t input;
     glslang_shader_t *copy;
 
     if (text == NULL)
         return NULL;
 
-    initGLSLInput(ctx, ptr->type, text, &input);
+    initGLSLInput(ctx, type, text, &input);
     copy = glslang_shader_create(&input);
 
     if (copy == NULL)
@@ -349,6 +385,8 @@ void mglFreeShader(GLMContext ctx, Shader *ptr)
     {
         glslang_shader_delete(ptr->compiled_glsl_shader);
     }
+
+    free(ptr->pp_text);
 
     if (ptr->mtl_data.library)
     {
@@ -2184,7 +2222,51 @@ void mglCompileShader(GLMContext ctx, GLuint shader)
     compileShaderObject(ctx, ptr);
 }
 
+static void compileShaderSource(GLMContext ctx, Shader *ptr);
+
 static void compileShaderObject(GLMContext ctx, Shader *ptr)
+{
+    unsigned long long start = mglBuildTimeStart();
+
+    compileShaderSource(ctx, ptr);
+    mglBuildTimeAdd(MGL_BUILD_GLSL_COMPILE, start);
+}
+
+// What glslang is handed, with every limit the compile checks against
+static bool compileCacheKey(GLMContext ctx, Shader *ptr, const glslang_input_t *in, char hex[65])
+{
+    MglHash h;
+    GLuint limits[] = {
+        ctx->state.var.max_vertex_output_components, ctx->state.var.max_tess_control_input_components,
+        ctx->state.var.max_tess_control_output_components, ctx->state.var.max_tess_evaluation_input_components,
+        ctx->state.var.max_tess_evaluation_output_components, ctx->state.var.max_geometry_input_components,
+        ctx->state.var.max_geometry_output_components, ctx->state.var.max_fragment_input_components,
+        ctx->state.var.max_uniform_buffer_bindings, ctx->state.var.max_shader_storage_buffer_bindings,
+        ctx->state.var.max_image_units,
+    };
+
+    if (!mglShaderCacheOn())
+        return false;
+
+    mglHashBegin(&h, "compile");
+    mglHashU32(&h, ptr->type);
+    mglHashU32(&h, ptr->glm_type);
+    mglHashStr(&h, in->code);
+    mglHashU32(&h, in->stage);
+    mglHashU32(&h, in->client_version);
+    mglHashU32(&h, in->target_language_version);
+    mglHashU32(&h, (uint32_t)in->default_version);
+    mglHashU32(&h, in->default_profile);
+    mglHashU32(&h, (uint32_t)in->force_default_version_and_profile);
+    mglHashU32(&h, (uint32_t)in->forward_compatible);
+    mglHashU32(&h, in->messages);
+    mglHashResource(&h, in->resource);
+    mglHashBytes(&h, limits, sizeof limits);
+    mglHashEnd(&h, hex);
+    return true;
+}
+
+static void compileShaderSource(GLMContext ctx, Shader *ptr)
 {
     glslang_input_t glsl_input;
     glslang_shader_t *glsl_shader;
@@ -2339,6 +2421,46 @@ static void compileShaderObject(GLMContext ctx, Shader *ptr)
     }
 
     initGLSLInput(ctx, ptr->type, front, &glsl_input);
+
+    // A compile that worked before is taken from the shader cache without
+    // parsing; the tree is made from the text if something needs it.
+    char compile_key[65];
+    bool keyed = compileCacheKey(ctx, ptr, &glsl_input, compile_key);
+    MglBlob cached = { 0 };
+    bool hit = keyed && mglShaderCacheGet("compile", compile_key, &cached);
+
+    if (hit && !mglShaderCacheVerify())
+    {
+        char *pp_src = mglBlobGetStr(&cached);
+        char *text = mglBlobGetStr(&cached);
+
+        if (text && !cached.bad)
+        {
+            if (ptr->compiled_glsl_shader || ptr->pp_text)
+                ptr->dirty_bits |= DIRTY_SHADER;
+            if (ptr->compiled_glsl_shader)
+                glslang_shader_delete(ptr->compiled_glsl_shader);
+
+            ptr->compiled_glsl_shader = NULL;
+            free(ptr->pp_text);
+            ptr->pp_text = text;
+            free(ptr->pp_src);
+            ptr->pp_src = pp_src;
+            free(ptr->log);
+            ptr->log = NULL;
+
+            mglBlobFree(&cached);
+            free(desub);
+            free(raised);
+            free(ended);
+            ctx->error_suppress--;
+            return;
+        }
+
+        free(pp_src);
+        free(text);
+        hit = false;
+    }
 
     glsl_shader = glslang_shader_create(&glsl_input);
     if (glsl_shader == NULL)
@@ -2608,12 +2730,35 @@ static void compileShaderObject(GLMContext ctx, Shader *ptr)
     // A program linked from the old one never reads it again: with one shader
     // per stage glslang's program borrows the shader's tree and never frees
     // it, and MGL reads the program only to know that it linked.
-    if (ptr->compiled_glsl_shader) {
-        glslang_shader_delete(ptr->compiled_glsl_shader);
+    if (ptr->compiled_glsl_shader || ptr->pp_text) {
+        if (ptr->compiled_glsl_shader)
+            glslang_shader_delete(ptr->compiled_glsl_shader);
         ptr->dirty_bits |= DIRTY_SHADER;
     }
 
     ptr->compiled_glsl_shader = glsl_shader;
+    free(ptr->pp_text);
+    ptr->pp_text = NULL;
+
+    if (keyed)
+    {
+        MglBlob b = { 0 };
+
+        mglBlobPutStr(&b, ptr->pp_src);
+        mglBlobPutStr(&b, glslang_shader_get_preprocessed_code(glsl_shader));
+
+        if (hit)
+        {
+            if (b.len != cached.len - cached.at || memcmp(b.data, cached.data + cached.at, b.len))
+                MGL_ERR("MGL: shader cache: shader %u compiled differently\n", ptr->name);
+        }
+        else
+            mglShaderCachePut("compile", compile_key, &b);
+
+        mglBlobFree(&b);
+    }
+
+    mglBlobFree(&cached);
     free(desub);
     free(raised);
     free(ended);
@@ -2658,7 +2803,7 @@ void mglGetShaderiv(GLMContext ctx, GLuint shader, GLenum pname, GLint *params)
 
         // false until a compile succeeds
         case GL_COMPILE_STATUS:
-            *params = ptr->compiled_glsl_shader && ptr->log == NULL ? GL_TRUE : GL_FALSE;
+            *params = mglShaderCompiled(ptr) ? GL_TRUE : GL_FALSE;
             break;
 
         case GL_INFO_LOG_LENGTH:

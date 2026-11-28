@@ -2045,6 +2045,7 @@ void mglCompatFree(GLMContext ctx)
     mglCompatFreeEval(ctx);
 
     free(C->imm);
+    free(C->imm_edges);
     free(C->extension_string);
     free(ctx->compat);
     ctx->compat = NULL;

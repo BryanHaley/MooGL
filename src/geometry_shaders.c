@@ -2474,6 +2474,27 @@ bool mglRewriteGeometryShader(const char *src, GeometryInfo *gi)
     if (!bufAdd(&pass, line))
         goto done;
 
+    // A line wider than a pixel is drawn as two triangles, six vertices for
+    // each pair the geometry stage wrote, pushed out along the minor axis as
+    // wide_lines.c does. mglGsWide is the viewport size and the width.
+    if (gi->out_primitive == GL_LINE_STRIP)
+    {
+        snprintf(line, sizeof(line),
+            "layout(std430, binding = %d) readonly buffer MglGsWideB { vec4 mglGsWide; };\n\n"
+            "vec4 mglGsWiden(vec4 p, vec4 q, float side)\n{\n"
+            "  float dp = p.z + p.w, dq = q.z + q.w;\n"
+            "  if (dp < 0.0 && dq >= 0.0) p = mix(p, q, dp / (dp - dq));\n"
+            "  if (dq < 0.0 && dp >= 0.0) q = mix(q, p, dq / (dq - dp));\n"
+            "  vec2 d = (q.xy / q.w - p.xy / p.w) * mglGsWide.xy;\n"
+            "  vec2 n = abs(d.x) >= abs(d.y) ? vec2(0.0, 1.0) : vec2(1.0, 0.0);\n"
+            "  p.xy += side * n * mglGsWide.z / mglGsWide.xy * p.w;\n"
+            "  return p;\n}\n\n",
+            MGL_GS_WIDE_BINDING);
+
+        if (!bufAdd(&pass, line))
+            goto done;
+    }
+
     // A varying that asked for a location keeps it -- the fragment stage may
     // have asked for the same one, and matching is by location wherever both
     // sides state it. Everything else, blocks included, is packed into what is
@@ -2664,11 +2685,18 @@ bool mglRewriteGeometryShader(const char *src, GeometryInfo *gi)
 
     // a slot the geometry shader never wrote is pushed outside the frustum,
     // where it covers nothing; it returns before reading the rest of the slot
-    if (!bufAdd(&pass, "\nvoid main()\n{\n"
-                       "  if (mglGsOut[gl_VertexID].mglValid < 0.5 || mglGsOut[gl_VertexID].mglStream != 0)\n  {\n"
+    if (!bufAdd(&pass, "\nvoid main()\n{\n  int mglV = gl_VertexID;\n  float mglSide = 0.0;\n") ||
+        (gi->out_primitive == GL_LINE_STRIP &&
+         !bufAdd(&pass, "  if (mglGsWide.z > 1.0)\n  {\n"
+                        "    int mglC = gl_VertexID % 6;\n"
+                        "    mglV = gl_VertexID / 6 * 2 + ((mglC == 2 || mglC == 3 || mglC == 5) ? 1 : 0);\n"
+                        "    mglSide = (mglC == 1 || mglC == 4 || mglC == 5) ? 1.0 : -1.0;\n"
+                        "  }\n")) ||
+        !bufAdd(&pass, "  if (mglGsOut[mglV].mglValid < 0.5 || mglGsOut[mglV].mglStream != 0 ||\n"
+                       "      (mglSide != 0.0 && mglGsOut[mglV ^ 1].mglValid < 0.5))\n  {\n"
                        "    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);\n") ||
         (gi->out_primitive == GL_POINTS && !bufAdd(&pass, "    gl_PointSize = 1.0;\n")) ||
-        !bufAdd(&pass, "    return;\n  }\n  MglGsOutV v = mglGsOut[gl_VertexID];\n"))
+        !bufAdd(&pass, "    return;\n  }\n  MglGsOutV v = mglGsOut[mglV];\n"))
         goto done;
 
     for (int i = 0; i < sc.out_count; i++)
@@ -2733,7 +2761,10 @@ bool mglRewriteGeometryShader(const char *src, GeometryInfo *gi)
             goto done;
     }
 
-    if (!bufAdd(&pass, "  gl_Position = v.mglPos;\n"))
+    if (!bufAdd(&pass, gi->out_primitive == GL_LINE_STRIP
+                       ? "  gl_Position = mglSide != 0.0 ? mglGsWiden(v.mglPos, mglGsOut[mglV ^ 1].mglPos, mglSide)"
+                         " : v.mglPos;\n"
+                       : "  gl_Position = v.mglPos;\n"))
         goto done;
 
     // Metal only accepts a point size when drawing points
@@ -4260,24 +4291,24 @@ static char *passThrough(const char *tes_src, int input, bool wide)
         "#version 430 core\nlayout(triangles) in;\nlayout(triangle_strip, max_vertices = 3) out;\n",
     };
 
+#define WIDE_STR2(x) #x
+#define WIDE_STR(x) WIDE_STR2(x)
+
     // GL draws a wide line as the pixels within width/2 of it across its minor
     // axis. A triangle in line mode draws each edge so, facing as it does.
     static const char *wide_heads[2] = {
         "#version 430 core\nlayout(lines) in;\nlayout(triangle_strip, max_vertices = 4) out;\n"
         "uniform vec4 mglWideLine;\n",
         "#version 430 core\nlayout(triangles) in;\nlayout(triangle_strip, max_vertices = 12) out;\n"
-        "uniform vec4 mglWideLine;\nuniform ivec2 mglWideShape;\n",
+        "uniform vec4 mglWideLine;\nuniform int mglWideMasked;\n"
+        "layout(std430, binding = " WIDE_STR(MGL_WIDE_HIDE_BINDING) ") readonly buffer mgl_wide_hide "
+        "{ uint mglWideHide[]; };\n",
     };
-    // The edges inside a quad or polygon that was split into triangles, a bit
-    // each, from the order compat_draw.c splits them in. mglWideShape is the
-    // mode they came from (1 quads, 2 quad strip, 3 polygon) and the count.
+    // The edges of each triangle a wireframe leaves out, a bit each (compat_draw.c).
+    // The block's name keeps it out of mglResourceIsInternal, so its GL binding is used.
     static const char *wide_hidden =
         "int mglWideHidden()\n{\n"
-        "  int mglI = gl_PrimitiveIDIn, mglN = mglWideShape.y;\n"
-        "  if (mglWideShape.x == 1) return (mglI & 1) == 0 ? 4 : 1;\n"
-        "  if (mglWideShape.x == 2) return (mglI & 1) == 0 ? 1 : 4;\n"
-        "  if (mglWideShape.x == 3) return (mglI > 0 ? 1 : 0) | (mglI < mglN - 1 ? 4 : 0);\n"
-        "  return 0;\n}\n";
+        "  return mglWideMasked != 0 ? int(mglWideHide[gl_PrimitiveIDIn]) : 0;\n}\n";
     // every name here starts with mgl, since the rewrite renames the program's varyings
     static const char *wide_pos =
         "vec4 mglWideEdge(int mglI, int mglJ, int mglE, float mglTurn)\n{\n"

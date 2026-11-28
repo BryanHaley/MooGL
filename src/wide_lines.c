@@ -46,7 +46,7 @@ GLint mglGetFragDataLocation(GLMContext ctx, GLuint program, const GLchar *name)
 GLint mglGetFragDataIndex(GLMContext ctx, GLuint program, const GLchar *name);
 GLint mglGetUniformLocation(GLMContext ctx, GLuint program, const GLchar *name);
 void mglProgramUniform4fv(GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLfloat *value);
-void mglProgramUniform2iv(GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLint *value);
+void mglProgramUniform1i(GLMContext ctx, GLuint program, GLint location, GLint v0);
 void mglEnable(GLMContext ctx, GLenum cap);
 void mglDisable(GLMContext ctx, GLenum cap);
 void mglFrontFace(GLMContext ctx, GLenum mode);
@@ -173,14 +173,14 @@ void mglWideLinesEnter(GLMContext ctx, GLenum mode, MglWideDraw *wd)
     if (ctx->compat == NULL)
         return;
 
-    GLsizei split_tris = 0;
-    GLenum split = mglCompatSplitMode(ctx, &split_tris);
+    GLintptr hide_at = 0;
+    Buffer *hide = mglCompatEdgeMasks(ctx, &hide_at);
     bool lines = mode == GL_LINES || mode == GL_LINE_STRIP || mode == GL_LINE_LOOP;
     bool triangles = (mode == GL_TRIANGLES || mode == GL_TRIANGLE_STRIP || mode == GL_TRIANGLE_FAN) &&
                      STATE_VAR(polygon_mode) == GL_LINE;
 
-    // a split quad's wireframe needs the edges inside it left out, even 1 pixel wide
-    if (!(lines && width > 1.0f) && !(triangles && (width > 1.0f || split)))
+    // a wireframe with edges left out goes this way even 1 pixel wide
+    if (!(lines && width > 1.0f) && !(triangles && (width > 1.0f || hide)))
         return;
 
     // a stage of its own already decides what is drawn, and feedback records lines
@@ -216,10 +216,16 @@ void mglWideLinesEnter(GLMContext ctx, GLenum mode, MglWideDraw *wd)
 
         if (triangles)
         {
-            GLint shape[2] = { split == GL_QUADS ? 1 : split == GL_QUAD_STRIP ? 2 : split == GL_POLYGON ? 3 : 0,
-                               split_tris };
+            BufferBaseTarget *binding = &STATE(buffer_base[_SHADER_STORAGE_BUFFER]).buffers[MGL_WIDE_HIDE_BINDING];
+            // with no masks the buffer is not read, but one is bound all the same
+            Buffer *bound = hide ? hide : mglCompatStreamBuffer(ctx);
 
-            mglProgramUniform2iv(ctx, twin->name, mglGetUniformLocation(ctx, twin->name, "mglWideShape"), 1, shape);
+            mglProgramUniform1i(ctx, twin->name, mglGetUniformLocation(ctx, twin->name, "mglWideMasked"),
+                                hide ? 1 : 0);
+            wd->hide = *binding;
+            *binding = (BufferBaseTarget){ .buffer = bound ? bound->name : 0, .offset = hide ? hide_at : 0,
+                                        .size = bound ? bound->size - (hide ? hide_at : 0) : 0, .buf = bound };
+            STATE(dirty_bits) |= DIRTY_BUFFER | DIRTY_BUFFER_BASE_STATE;
         }
 
         // Lines are never culled and face the front. A triangle's edges are
@@ -229,6 +235,7 @@ void mglWideLinesEnter(GLMContext ctx, GLenum mode, MglWideDraw *wd)
         wd->offset_fill = STATE(caps.polygon_offset_fill);
         wd->front_face = STATE_VAR(front_face);
         wd->polygon_mode = STATE_VAR(polygon_mode);
+        wd->triangles = triangles;
 
         if (lines)
             mglDisable(ctx, GL_CULL_FACE);
@@ -256,6 +263,12 @@ void mglWideLinesLeave(GLMContext ctx, MglWideDraw *wd)
 
     STATE(program) = wd->was;
     STATE(dirty_bits) |= DIRTY_PROGRAM;
+
+    if (wd->triangles)
+    {
+        STATE(buffer_base[_SHADER_STORAGE_BUFFER]).buffers[MGL_WIDE_HIDE_BINDING] = wd->hide;
+        STATE(dirty_bits) |= DIRTY_BUFFER | DIRTY_BUFFER_BASE_STATE;
+    }
 
     (wd->cull ? mglEnable : mglDisable)(ctx, GL_CULL_FACE);
     (wd->offset_fill ? mglEnable : mglDisable)(ctx, GL_POLYGON_OFFSET_FILL);

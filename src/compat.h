@@ -102,10 +102,14 @@ struct MGLCompat_t {
     // which they forward to
     struct GLMDispatchTable next;
 
-    // the quad mode the triangles being drawn were split from, and how many
-    // there are, for wireframes that leave out the edges inside
-    GLenum split_mode;
-    GLsizei split_tris;
+    // set by mglCompatDrawRecords for the draw it makes: the mode glBegin was
+    // given, and each vertex's edge flag in drawing order
+    GLenum source_mode;
+    const GLboolean *source_edges;
+    // the edges of each triangle a wireframe leaves out, a bit each, in the
+    // stream while the draw is made
+    struct Buffer_t *hide_buf;
+    GLintptr hide_offset;
 
     // --- transform ---
     GLenum matrix_mode;
@@ -180,6 +184,7 @@ struct MGLCompat_t {
     GLboolean client_storage;  // GL_UNPACK_CLIENT_STORAGE_APPLE
     GLenum begin_mode;
     GLfloat *imm;              // 16 vec4 per vertex
+    GLboolean *imm_edges;      // and its edge flag
     size_t imm_count, imm_cap;
     struct VertexArray_t *imm_vao;
     struct Buffer_t *imm_buf;  // bound to imm_vao for good
@@ -279,7 +284,8 @@ struct Program_t *mglCompatFFProgram(GLMContext ctx, GLenum mode);
 // writes the old built-in uniforms (gl_ModelViewMatrix and the rest) that
 // prog reads, and the fixed-function uniforms when prog is generated
 void mglCompatWriteBuiltins(GLMContext ctx, struct Program_t *prog);
-GLenum mglCompatSplitMode(GLMContext ctx, GLsizei *tris);
+struct Buffer_t *mglCompatEdgeMasks(GLMContext ctx, GLintptr *offset);
+struct Buffer_t *mglCompatStreamBuffer(GLMContext ctx);
 void mglCompatFreeFF(GLMContext ctx);
 
 // compat_immediate.c
@@ -287,7 +293,8 @@ void mglCompatInstallImmediate(GLMContext ctx);
 void mglCompatEmitVertex(GLMContext ctx, GLfloat x, GLfloat y, GLfloat z, GLfloat w);
 
 // draws records of 16 vec4 a vertex, the layout immediate mode keeps
-void mglCompatDrawRecords(GLMContext ctx, GLenum mode, const GLfloat *records, GLsizei count);
+void mglCompatDrawRecords(GLMContext ctx, GLenum mode, const GLfloat *records, const GLboolean *edges,
+                          GLsizei count);
 void *mglCompatStream(GLMContext ctx, size_t bytes, struct Buffer_t **buf, GLintptr *offset);
 bool mglCompatStreamReserve(GLMContext ctx, size_t bytes);
 

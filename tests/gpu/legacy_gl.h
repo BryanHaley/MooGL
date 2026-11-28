@@ -66,6 +66,7 @@ void glPopAttrib(void);
 void glPushClientAttrib(GLbitfield mask);
 void glPopClientAttrib(void);
 void glEdgeFlag(GLboolean flag);
+void glEdgeFlagPointer(GLsizei stride, const void *ptr);
 GLuint glGenLists(GLsizei range);
 void glNewList(GLuint list, GLenum mode);
 void glEndList(void);

@@ -619,6 +619,66 @@ static GLuint *lastProvoking(GLenum mode, const GLuint *v, GLsizei n, bool resta
     return ix;
 }
 
+// Bit k of a triangle's mask leaves out its edge from vertex k to k + 1 in a
+// wireframe: an edge inside a quad or polygon that was split into triangles,
+// or one whose first vertex has its edge flag off. NULL when nothing is left out.
+static GLuint *edgeMasks(GLMContext ctx, GLenum source, GLint first, GLsizei count, GLenum type,
+                         const void *indices, GLint basevertex)
+{
+    const GLubyte *flags = NULL;
+    GLsizei stride = 1, tris = count / 3;
+    bool split = source == GL_QUADS || source == GL_QUAD_STRIP || source == GL_POLYGON;
+    bool flagged = source == GL_TRIANGLES || source == GL_QUADS || source == GL_POLYGON;
+    const void *src = type ? indexData(ctx, type, indices, count) : NULL;
+
+    if (C->edge_flag_array && C->edge_flag_pointer && flagged)
+    {
+        flags = (const GLubyte *)C->edge_flag_pointer;
+        stride = C->edge_flag_stride ? C->edge_flag_stride : (GLsizei)sizeof(GLboolean);
+    }
+
+    if ((!split && !flags && !C->source_edges) || tris == 0 || (type && src == NULL))
+        return NULL;
+
+    GLuint *masks = (GLuint *)calloc((size_t)tris, sizeof(GLuint));
+    bool any = false;
+
+    if (masks == NULL)
+        return NULL;
+
+    for (GLsizei t = 0; t < tris; t++)
+    {
+        GLuint m = 0;
+
+        if (source == GL_QUADS)
+            m = (t & 1) == 0 ? 4 : 1;
+        else if (source == GL_QUAD_STRIP)
+            m = (t & 1) == 0 ? 1 : 4;
+        else if (source == GL_POLYGON)
+            m = (t > 0 ? 1 : 0) | (t < tris - 1 ? 4 : 0);
+
+        for (int k = 0; k < 3 && (flags || C->source_edges); k++)
+        {
+            GLsizei i = t * 3 + k;
+            GLint v = type ? (GLint)indexAt(src, type, i) + basevertex : first + i;
+
+            if (C->source_edges ? !C->source_edges[v] : !flags[(size_t)v * (size_t)stride])
+                m |= 1u << k;
+        }
+
+        masks[t] = m;
+        any |= m != 0;
+    }
+
+    if (!any)
+    {
+        free(masks);
+        return NULL;
+    }
+
+    return masks;
+}
+
 // One pass of a draw: quads expanded, client arrays staged, the program in place.
 static void drawOnce(GLMContext ctx, GLenum mode, GLint first, GLsizei count, GLenum type, const void *indices,
                      GLsizei instances, GLint basevertex, GLuint baseinstance)
@@ -632,7 +692,9 @@ static void drawOnce(GLMContext ctx, GLenum mode, GLint first, GLsizei count, GL
     Buffer *element_buffer = NULL;
     bool client = hasClientArrays(ctx);
     bool streamed_indices = false;
-    bool split_here = false;
+    GLenum source = C->source_mode ? C->source_mode : mode;
+    GLuint *masks = NULL;
+    size_t mask_bytes = 0;
 
     if (isLegacyMode(mode))
     {
@@ -661,9 +723,6 @@ static void drawOnce(GLMContext ctx, GLenum mode, GLint first, GLsizei count, GL
                 expanded[i] += (GLuint)first;
         }
 
-        C->split_mode = mode;
-        C->split_tris = n / 3;
-        split_here = true;
         mode = GL_TRIANGLES;
         type = GL_UNSIGNED_INT;
         indices = expanded;
@@ -716,6 +775,12 @@ static void drawOnce(GLMContext ctx, GLenum mode, GLint first, GLsizei count, GL
         }
     }
 
+    if (mode == GL_TRIANGLES && STATE_VAR(polygon_mode) == GL_LINE)
+        masks = edgeMasks(ctx, source, first, count, type, indices, basevertex);
+
+    if (masks)
+        mask_bytes = (size_t)(count / 3) * sizeof(GLuint);
+
     if (client)
     {
         if (type)
@@ -760,6 +825,9 @@ static void drawOnce(GLMContext ctx, GLenum mode, GLint first, GLsizei count, GL
         if (type && indices && STATE(vao) && STATE(vao)->element_array.buffer == NULL)
             need += (size_t)count * indexSize(type) + STREAM_ALIGN;
 
+        if (mask_bytes)
+            need += mask_bytes + STREAM_ALIGN;
+
         if (need && !mglCompatStreamReserve(ctx, need))
         {
             ctx->error_func(ctx, __FUNCTION__, GL_OUT_OF_MEMORY);
@@ -767,6 +835,20 @@ static void drawOnce(GLMContext ctx, GLenum mode, GLint first, GLsizei count, GL
         }
 
         if (!stageClientArrays(ctx, lo, hi, instances, baseinstance, &staged))
+        {
+            ctx->error_func(ctx, __FUNCTION__, GL_OUT_OF_MEMORY);
+            goto done;
+        }
+    }
+
+    else if (mask_bytes)
+    {
+        size_t need = mask_bytes + STREAM_ALIGN;
+
+        if (type && indices && STATE(vao) && STATE(vao)->element_array.buffer == NULL)
+            need += (size_t)count * indexSize(type) + STREAM_ALIGN;
+
+        if (!mglCompatStreamReserve(ctx, need))
         {
             ctx->error_func(ctx, __FUNCTION__, GL_OUT_OF_MEMORY);
             goto done;
@@ -788,6 +870,14 @@ static void drawOnce(GLMContext ctx, GLenum mode, GLint first, GLsizei count, GL
             indices = (const void *)at;
             streamed_indices = true;
         }
+    }
+
+    if (mask_bytes)
+    {
+        void *dst = mglCompatStream(ctx, mask_bytes, &C->hide_buf, &C->hide_offset);
+
+        if (dst)
+            memcpy(dst, masks, mask_bytes);
     }
 
     if (!enterProgram(ctx, mode, &ps))
@@ -821,14 +911,22 @@ done:
         STATE(vao)->element_array.buffer = element_buffer;
 
     free(expanded);
-    if (split_here)
-        C->split_mode = 0;
+    free(masks);
+    C->hide_buf = NULL;
 }
 
-GLenum mglCompatSplitMode(GLMContext ctx, GLsizei *tris)
+Buffer *mglCompatStreamBuffer(GLMContext ctx)
 {
-    *tris = C->split_tris;
-    return C->split_mode;
+    if (C->stream == NULL || C->stream->data.buffer_data == 0)
+        mglCompatStreamReserve(ctx, 0);
+
+    return C->stream;
+}
+
+Buffer *mglCompatEdgeMasks(GLMContext ctx, GLintptr *offset)
+{
+    *offset = C->hide_offset;
+    return C->hide_buf;
 }
 
 void mglCompatDrawFull(GLMContext ctx, GLenum mode, GLint first, GLsizei count, GLenum type,

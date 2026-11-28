@@ -19,6 +19,12 @@
 - Quads, quad strips and polygons in `glPolygonMode(GL_LINE)` draw their outline only, as GL
   and Apple's OpenGL do. They are split into triangles to draw, and the diagonals inside them
   were drawn too.
+- `glEdgeFlag` and `glEdgeFlagPointer` hide the wireframe edges they mark, as on Apple's
+  OpenGL. They were stored and ignored.
+- Wide lines from a geometry shader, and from isolines, in compatibility contexts.
+- A shader cache in `~/Library/Caches/MooGL`: a second launch skips glslang and SPIRV-Cross.
+  Minecraft with BetterVoxels builds its shaders in about 6 s on a second launch, down from 20.
+- `MGL_BUILD_TIMES=1` prints how long each step of building shaders took.
 - `GL_GENERATE_MIPMAP` in compatibility contexts: an upload to a 2D texture's base level makes
   its mipmaps again.
 - Plain pixels uploaded to an S3TC format are compressed on the way in, as Apple's driver does.
@@ -165,6 +171,10 @@
     each draw.
 
 ### Fixed
+- Metal's own shader cache now finds MooGL's shaders on a second launch. Their entry points
+  were named after GL shader numbers, which change between runs, so every Metal compile
+  started over; a warm Minecraft launch spent 26 s on it.
+- The test suite has a bundle id, so Metal gives it a shader cache of its own.
 - A glClear inside a scissor box now clears while glPolygonMode is GL_LINE or polygon offset
   is on. Before, the box was left as it was.
 - libmoogl no longer loads Apple's OpenGL to fill in its starting state; the values it took

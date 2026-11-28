@@ -81,11 +81,14 @@ void mglCompatEmitVertex(GLMContext ctx, GLfloat x, GLfloat y, GLfloat z, GLfloa
     {
         size_t cap = C->imm_cap ? C->imm_cap * 2 : 256;
         GLfloat *grown = (GLfloat *)realloc(C->imm, cap * IMM_STRIDE * sizeof(GLfloat));
+        GLboolean *edges = grown ? (GLboolean *)realloc(C->imm_edges, cap) : NULL;
 
-        if (grown == NULL)
+        if (grown)
+            C->imm = grown;
+        if (edges == NULL)
             return;
 
-        C->imm = grown;
+        C->imm_edges = edges;
         C->imm_cap = cap;
     }
 
@@ -99,6 +102,7 @@ void mglCompatEmitVertex(GLMContext ctx, GLfloat x, GLfloat y, GLfloat z, GLfloa
     v[2] = z;
     v[3] = w;
 
+    C->imm_edges[C->imm_count] = C->edge_flag;
     C->imm_count++;
 }
 
@@ -174,7 +178,9 @@ static void immLayout(GLMContext ctx, GLuint mask)
 }
 
 // draws count records of 16 vec4 through the immediate-mode vertex array
-void mglCompatDrawRecords(GLMContext ctx, GLenum mode, const GLfloat *records, GLsizei count)
+// edges, if not NULL, is each vertex's edge flag
+void mglCompatDrawRecords(GLMContext ctx, GLenum mode, const GLfloat *records, const GLboolean *edges,
+                          GLsizei count)
 {
     VertexArray *was = STATE(vao);
     GLuint *order = NULL;
@@ -187,7 +193,8 @@ void mglCompatDrawRecords(GLMContext ctx, GLenum mode, const GLfloat *records, G
     if (C->imm_buf == NULL && (C->imm_buf = newBuffer(ctx, GL_ARRAY_BUFFER, 0)) == NULL)
         return;
 
-    GLenum split = mode == GL_TRIANGLE_FAN ? 0 : mode;
+    GLenum source = mode;
+    GLboolean *drawn_edges = NULL;
 
     // the shapes Metal has no primitive for become a plain triangle list
     if (mode == GL_QUADS || mode == GL_QUAD_STRIP || mode == GL_POLYGON || mode == GL_TRIANGLE_FAN)
@@ -255,6 +262,14 @@ void mglCompatDrawRecords(GLMContext ctx, GLenum mode, const GLfloat *records, G
         return;
     }
 
+    // a flag only marks an edge of separate triangles, quads and polygons
+    if (edges && (source == GL_TRIANGLES || source == GL_QUADS || source == GL_POLYGON) &&
+        memchr(edges, GL_FALSE, (size_t)count) && (drawn_edges = (GLboolean *)malloc((size_t)n)))
+    {
+        for (GLsizei i = 0; i < n; i++)
+            drawn_edges[i] = edges[order ? order[i] : (GLuint)i];
+    }
+
     for (GLsizei i = 0; i < n; i++)
     {
         const GLfloat *src = records + (size_t)(order ? order[i] : (GLuint)i) * IMM_STRIDE;
@@ -293,14 +308,13 @@ void mglCompatDrawRecords(GLMContext ctx, GLenum mode, const GLfloat *records, G
 
     // glEnd itself was what a list recorded
     C->no_record++;
-    if (split && n > 0 && mode == GL_TRIANGLES)
-    {
-        C->split_mode = split;
-        C->split_tris = n / 3;
-    }
+    C->source_mode = source;
+    C->source_edges = drawn_edges;
     mglCompatDrawFull(ctx, mode, 0, n, 0, NULL, 1, 0, 0);
-    C->split_mode = 0;
+    C->source_mode = 0;
+    C->source_edges = NULL;
     C->no_record--;
+    free(drawn_edges);
 
     STATE(vao) = was;
     STATE(dirty_bits) |= DIRTY_VAO;
@@ -311,7 +325,7 @@ static void cEnd(GLMContext ctx)
     ERROR_CHECK_RETURN(C->in_begin, GL_INVALID_OPERATION);
 
     C->in_begin = GL_FALSE;
-    mglCompatDrawRecords(ctx, C->begin_mode, C->imm, (GLsizei)C->imm_count);
+    mglCompatDrawRecords(ctx, C->begin_mode, C->imm, C->imm_edges, (GLsizei)C->imm_count);
     C->imm_count = 0;
 }
 

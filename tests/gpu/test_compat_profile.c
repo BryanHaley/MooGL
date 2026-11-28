@@ -1478,6 +1478,136 @@ GPU_TEST(compat_profile, wide_lines_draw_wide)
     closeCompat(c, &t);
 }
 
+GPU_TEST(compat_profile, wide_lines_from_a_geometry_shader)
+{
+    static const char *src[3] = {
+        "#version 330\n"
+        "layout(location = 0) in vec4 p;\n"
+        "void main() { gl_Position = p; }\n",
+        "#version 330\n"
+        "layout(points) in;\n"
+        "layout(line_strip, max_vertices = 2) out;\n"
+        "void main() {\n"
+        "    gl_Position = vec4(-1.0, gl_in[0].gl_Position.y, 0.0, 1.0); EmitVertex();\n"
+        "    gl_Position = vec4(1.0, gl_in[0].gl_Position.y, 0.0, 1.0); EmitVertex();\n"
+        "    EndPrimitive();\n"
+        "}\n",
+        "#version 330\n"
+        "out vec4 o;\n"
+        "void main() { o = vec4(1.0, 0.0, 0.0, 1.0); }\n",
+    };
+    static const GLenum type[3] = { GL_VERTEX_SHADER, GL_GEOMETRY_SHADER, GL_FRAGMENT_SHADER };
+    MGLTestTarget t;
+    unsigned char edge[4], in[4], out[4];
+    GLMContext c = openCompat(&t);
+    GLint ok = 0;
+
+    CHECK(c != NULL);
+    if (!c)
+        return;
+
+    GLuint prog = glCreateProgram();
+
+    for (int i = 0; i < 3; i++)
+    {
+        GLuint sh = glCreateShader(type[i]);
+
+        glShaderSource(sh, 1, &src[i], NULL);
+        glCompileShader(sh);
+        glAttachShader(prog, sh);
+        glDeleteShader(sh);
+    }
+
+    glLinkProgram(prog);
+    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    CHECK_MSG(ok, "the geometry program did not link");
+
+    if (ok)
+    {
+        glUseProgram(prog);
+
+        // across the middle, five rows from 13 to 17
+        glLineWidth(5.0f);
+        glBegin(GL_POINTS);
+        glVertex2f(0, 0);
+        glEnd();
+
+        pixel(&t, W / 2, 13, edge);
+        pixel(&t, W / 2, 17, in);
+        pixel(&t, W / 2, 19, out);
+        CHECK_MSG(IS(edge, 255, 0, 0) && IS(in, 255, 0, 0), "width 5: rows 13 and 17: %d %d", edge[0], in[0]);
+        CHECK_MSG(IS(out, 0, 0, 0), "width 5: row 19: %d", out[0]);
+
+        glClear(GL_COLOR_BUFFER_BIT);
+        glLineWidth(1.0f);
+        glBegin(GL_POINTS);
+        glVertex2f(0, 0);
+        glEnd();
+
+        pixel(&t, W / 2, 13, edge);
+        CHECK_MSG(IS(edge, 0, 0, 0), "width 1: row 13: %d", edge[0]);
+
+        glUseProgram(0);
+    }
+
+    glDeleteProgram(prog);
+
+    // isolines go through a geometry stage MGL makes, and widen the same way
+    static const char *iso[3] = {
+        "#version 400\n"
+        "layout(location = 0) in vec4 p;\n"
+        "void main() { gl_Position = p; }\n",
+        "#version 400\n"
+        "layout(isolines) in;\n"
+        "void main() { gl_Position = mix(gl_in[0].gl_Position, gl_in[1].gl_Position, gl_TessCoord.x); }\n",
+        "#version 400\n"
+        "out vec4 o;\n"
+        "void main() { o = vec4(0.0, 1.0, 0.0, 1.0); }\n",
+    };
+    static const GLenum iso_type[3] = { GL_VERTEX_SHADER, GL_TESS_EVALUATION_SHADER, GL_FRAGMENT_SHADER };
+    static const GLfloat ends[4] = { -1, 0, 1, 0 };
+
+    prog = glCreateProgram();
+
+    for (int i = 0; i < 3; i++)
+    {
+        GLuint sh = glCreateShader(iso_type[i]);
+
+        glShaderSource(sh, 1, &iso[i], NULL);
+        glCompileShader(sh);
+        glAttachShader(prog, sh);
+        glDeleteShader(sh);
+    }
+
+    glLinkProgram(prog);
+    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    CHECK_MSG(ok, "the isoline program did not link");
+
+    if (ok)
+    {
+        glUseProgram(prog);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glLineWidth(5.0f);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, ends);
+        glPatchParameteri(GL_PATCH_VERTICES, 2);
+        glDrawArrays(GL_PATCHES, 0, 2);
+        glDisableVertexAttribArray(0);
+
+        pixel(&t, W / 2, 13, edge);
+        pixel(&t, W / 2, 17, in);
+        pixel(&t, W / 2, 19, out);
+        CHECK_MSG(IS(edge, 0, 255, 0) && IS(in, 0, 255, 0), "isolines: rows 13 and 17: %d %d", edge[1], in[1]);
+        CHECK_MSG(IS(out, 0, 0, 0), "isolines: row 19: %d", out[1]);
+
+        glUseProgram(0);
+    }
+
+    glDeleteProgram(prog);
+    CHECK_EQ_UINT(glGetError(), GL_NO_ERROR);
+    closeCompat(c, &t);
+}
+
 GPU_TEST(compat_profile, wide_lines_keep_a_programs_varyings_and_uniforms)
 {
     static const char *VS =
@@ -1582,6 +1712,63 @@ GPU_TEST(compat_profile, wide_lines_draw_polygon_mode_edges)
 
 // GL draws a quad's or polygon's outline in line mode, not the diagonals
 // it is split into triangles along
+GPU_TEST(compat_profile, edge_flags_hide_wireframe_edges)
+{
+    // the flag before a vertex marks the edge that starts there; the third hides the left edge
+    static const GLfloat tri[] = { -0.5f, -0.5f, 0.5f, -0.5f, -0.5f, 0.5f };
+    static const GLboolean flags[] = { GL_TRUE, GL_TRUE, GL_FALSE };
+    MGLTestTarget t;
+    unsigned char a[4], b[4];
+    GLMContext c = openCompat(&t);
+
+    CHECK(c != NULL);
+    if (!c)
+        return;
+
+    glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+    glColor3f(1, 0, 0);
+
+    for (int width = 1; width <= 3; width += 2)
+    {
+        glLineWidth((GLfloat)width);
+
+        glClear(GL_COLOR_BUFFER_BIT);
+        glBegin(GL_TRIANGLES);
+        glVertex2f(-0.5f, -0.5f);
+        glEdgeFlag(GL_FALSE);
+        glVertex2f(0.5f, -0.5f);
+        glEdgeFlag(GL_TRUE);
+        glVertex2f(-0.5f, 0.5f);
+        glEnd();
+
+        pixel(&t, 15, 16, a);
+        pixel(&t, 16, 16, b);
+        CHECK_MSG(IS(a, 0, 0, 0) && IS(b, 0, 0, 0), "begin width %d: hidden diagonal %d %d", width, a[0], b[0]);
+        pixel(&t, 12, 7, a);
+        pixel(&t, 12, 8, b);
+        CHECK_MSG(IS(a, 255, 0, 0) || IS(b, 255, 0, 0), "begin width %d: bottom edge %d %d", width, a[0], b[0]);
+
+        glClear(GL_COLOR_BUFFER_BIT);
+        glEnableClientState(GL_VERTEX_ARRAY);
+        glEnableClientState(GL_EDGE_FLAG_ARRAY);
+        glVertexPointer(2, GL_FLOAT, 0, tri);
+        glEdgeFlagPointer(0, flags);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glDisableClientState(GL_EDGE_FLAG_ARRAY);
+        glDisableClientState(GL_VERTEX_ARRAY);
+
+        pixel(&t, 7, 12, a);
+        pixel(&t, 8, 12, b);
+        CHECK_MSG(IS(a, 0, 0, 0) && IS(b, 0, 0, 0), "array width %d: hidden left edge %d %d", width, a[0], b[0]);
+        pixel(&t, 12, 7, a);
+        pixel(&t, 12, 8, b);
+        CHECK_MSG(IS(a, 255, 0, 0) || IS(b, 255, 0, 0), "array width %d: bottom edge %d %d", width, a[0], b[0]);
+    }
+
+    CHECK_EQ_UINT(glGetError(), GL_NO_ERROR);
+    closeCompat(c, &t);
+}
+
 GPU_TEST(compat_profile, polygon_mode_quads_leave_out_their_diagonals)
 {
     static const GLfloat strip[] = { -0.5f, -0.5f, 0.5f, -0.5f, -0.5f, 0, 0.5f, 0, -0.5f, 0.5f, 0.5f, 0.5f };
