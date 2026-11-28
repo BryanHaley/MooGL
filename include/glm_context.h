@@ -1356,7 +1356,7 @@ typedef struct ProgramPipeline_t {
 } ProgramPipeline;
 
 // How many render encoders' worth of occlusion counting a frame can hold.
-#define MGL_VISIBILITY_SLOTS 256
+#define MGL_VISIBILITY_SLOTS 65536
 
 #define MAX_QUERY_STREAMS 4
 
